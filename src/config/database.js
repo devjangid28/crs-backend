@@ -4,9 +4,7 @@ const config = require('./index');
 const poolConfig = config.db.databaseUrl
   ? {
       connectionString: config.db.databaseUrl,
-      ssl: config.server.env === 'production'
-        ? { rejectUnauthorized: false }
-        : false,
+      ssl: { rejectUnauthorized: false },
     }
   : {
       host: config.db.host,

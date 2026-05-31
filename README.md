@@ -26,16 +26,13 @@ npm install
 # 2. Copy environment file
 cp .env.example .env
 
-# 3. Edit .env with your PostgreSQL credentials
-#    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+# 3. Edit .env - set DATABASE_URL for Render PostgreSQL, or
+#    uncomment DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME for local PG
 
-# 4. Create the database
-createdb repair_management_system
-
-# 5. Run schema migration
+# 4. Run schema migration (creates tables)
 npm run migrate
 
-# 6. Start the server
+# 5. Start the server
 npm start
 ```
 
@@ -74,18 +71,20 @@ Starts with `nodemon` for auto-restart on file changes.
 
 ## Deployment on Render
 
-### 1. Create a PostgreSQL Database on Render
+### 1. PostgreSQL Database (Already Created)
 
-- Go to **Dashboard → New → PostgreSQL**
-- Name: `crs-db`
-- Region: Choose closest to your users
-- PostgreSQL Version: 16
-- Note the **Internal Database URL**
+A Render PostgreSQL instance is already running:
+- **Name:** `crs_postgres`
+- **External URL:** `postgresql://crs_postgres_user:umNl0Z9xkmpnlIcTfiuRf2tVOrGQYkM7@dpg-d8dt74po3t8c73et0n60-a.oregon-postgres.render.com/crs_postgres`
+- **Host:** `dpg-d8dt74po3t8c73et0n60-a.oregon-postgres.render.com`
+- **Port:** `5432`
+- **Database:** `crs_postgres`
+- **User:** `crs_postgres_user`
 
 ### 2. Deploy the Web Service
 
 - Go to **Dashboard → New → Web Service**
-- Connect your GitHub repository
+- Connect your GitHub repository (this repo: `crs-backend`)
 - **Root Directory:** (leave blank - the package.json is at root)
 - **Runtime:** Node
 - **Build Command:** `npm install`
@@ -96,10 +95,10 @@ Starts with `nodemon` for auto-restart on file changes.
 
 | Variable | Value |
 |----------|-------|
-| `DATABASE_URL` | Internal Database URL from step 1 |
+| `DATABASE_URL` | `postgresql://crs_postgres_user:umNl0Z9xkmpnlIcTfiuRf2tVOrGQYkM7@dpg-d8dt74po3t8c73et0n60-a.oregon-postgres.render.com/crs_postgres` |
 | `NODE_ENV` | `production` |
-| `JWT_SECRET` | A strong random string |
-| `CORS_ORIGIN` | Your frontend URL (or `*` for open) |
+| `JWT_SECRET` | `crs-repair-system-secret-key-2026` |
+| `CORS_ORIGIN` | `*` |
 
 ### 4. Deploy
 
@@ -110,7 +109,7 @@ Click **Create Web Service**. Render will build and deploy automatically.
 After deployment, verify:
 
 ```
-GET https://your-app.onrender.com/api/health
+GET https://<your-service>.onrender.com/api/health
 ```
 
 Expected response: `{ "status": "ok", "dbReady": true }`
@@ -138,15 +137,15 @@ Expected response: `{ "status": "ok", "dbReady": true }`
 - **Migration command:** `npm run migrate`
 - **SSL:** Enabled automatically in production
 
-## Migration from MySQL
+## Data Migration Status
 
-If you are migrating from an existing MySQL installation:
-
-```bash
-# 1. Ensure both MySQL and PostgreSQL are running
-# 2. Run the data migration script
-node src/migrations/migrate_data.js
-```
+All data from the original PostgreSQL instance has been migrated to the Render PostgreSQL database (`crs_postgres`):
+- ✅ 2 Users
+- ✅ 1 Customer
+- ✅ 1 Ticket
+- ✅ 1 Invoice
+- ✅ 1 Appointment
+- ✅ Store settings
 
 ## License
 

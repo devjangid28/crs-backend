@@ -5,7 +5,7 @@ node_modules/
 .env
 .env.local
 .env.production
-.env.example
+# .env.example is meant to be committed (template)
 
 # Build output
 dist/
