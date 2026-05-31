@@ -19,7 +19,7 @@ const config = {
     origin: process.env.CORS_ORIGIN || '*',
   },
   jwt: {
-    secret: process.env.JWT_SECRET || 'default-secret-change-in-production',
+    secret: process.env.JWT_SECRET,
   },
   upload: {
     dir: process.env.UPLOAD_DIR || './uploads',
