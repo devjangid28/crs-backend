@@ -89,6 +89,18 @@ const runMigrations = async () => {
       END $$;
     `);
 
+    // Fix existing admin user password hash (seed only runs for new rows)
+    await targetPool.query(`
+      UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
+      WHERE email = 'admin@gmail.com';
+    `);
+    await targetPool.query(`
+      UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
+      WHERE email = 'admin@crs.io';
+    `);
+    // Reset all sessions so users must log in again with the correct password
+    await targetPool.query(`UPDATE user_sessions SET is_valid = FALSE`);
+
     await targetPool.query(schema);
 
     console.log('Database migrations completed successfully!');
