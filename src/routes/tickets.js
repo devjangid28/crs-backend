@@ -81,7 +81,7 @@ router.post('/', validateTicket, async (req, res, next) => {
   try {
     await client.query('BEGIN');
 
-    const ticketId = await generateTicketId();
+    const ticketId = await generateTicketId(client);
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
     const {
