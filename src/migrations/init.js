@@ -69,6 +69,26 @@ const runMigrations = async () => {
 
     const schema = fs.readFileSync(schemaPath, 'utf8');
 
+    // Pre-migration: add 'owner' to user_role enum (separate transaction)
+    // This must run BEFORE the main schema to avoid PG error 55P04
+    // ("new enum values must be committed before they can be used")
+    try {
+      await targetPool.query(`ALTER TYPE user_role ADD VALUE 'owner'`);
+    } catch (e) {
+      // 'owner' already exists (fresh install or already migrated)
+    }
+
+    // Convert old user roles ('admin'→'owner', 'technician'→'staff')
+    // in a separate transaction so the new 'owner' enum value is visible
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users') THEN
+          UPDATE users SET role = 'owner' WHERE role::text = 'admin';
+          UPDATE users SET role = 'staff' WHERE role::text IN ('technician', 'user');
+        END IF;
+      END $$;
+    `);
+
     await targetPool.query(schema);
 
     console.log('Database migrations completed successfully!');

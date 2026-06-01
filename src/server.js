@@ -16,6 +16,8 @@ const attachmentRoutes = require('./routes/attachments');
 const messageRoutes = require('./routes/messages');
 const settingsRoutes = require('./routes/settings');
 const paymentRoutes = require('./routes/payments');
+const authRoutes = require('./routes/auth');
+const usersRoutes = require('./routes/users');
 
 const app = express();
 
@@ -42,6 +44,8 @@ app.use('/api/attachments', attachmentRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/users', usersRoutes);
 
 app.use(errorHandler);
 
