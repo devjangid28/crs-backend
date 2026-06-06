@@ -3,42 +3,62 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
+const parseDbUrl = (url) => {
+  const regex = /postgresql:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/(.+)/;
+  const match = url.match(regex);
+  if (!match) return null;
+  return {
+    user: decodeURIComponent(match[1]),
+    password: decodeURIComponent(match[2]),
+    host: match[3],
+    port: parseInt(match[4], 10),
+    database: match[5],
+  };
+};
+
 const runMigrations = async () => {
-  const poolConfig = process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-      }
+  const dbUrl = process.env.DATABASE_URL;
+  const dbUrlParsed = dbUrl ? parseDbUrl(dbUrl) : null;
+  const dbName = dbUrlParsed ? dbUrlParsed.database : (process.env.DB_NAME || 'repair_management_system');
+
+  // First connect to the default 'postgres' database to create the target database if needed
+  const adminConfig = dbUrlParsed
+    ? { host: dbUrlParsed.host, port: dbUrlParsed.port, user: dbUrlParsed.user, password: dbUrlParsed.password, database: 'postgres' }
     : {
         host: process.env.DB_HOST || 'localhost',
         port: parseInt(process.env.DB_PORT, 10) || 5432,
         user: process.env.DB_USER || 'postgres',
         password: process.env.DB_PASSWORD || '',
-        database: 'postgres', // Connect to default DB first to create our database
+        database: 'postgres',
       };
 
-  const pool = new Pool(poolConfig);
+  const adminPool = new Pool(adminConfig);
 
   try {
     console.log('Running database migrations...');
 
     // Create database if it doesn't exist
-    const dbName = process.env.DB_NAME || 'repair_management_system';
-    const checkDb = await pool.query(
+    const checkDb = await adminPool.query(
       `SELECT 1 FROM pg_database WHERE datname = $1`, [dbName]
     );
     if (checkDb.rows.length === 0) {
-      await pool.query(`CREATE DATABASE "${dbName}"`);
+      await adminPool.query(`CREATE DATABASE "${dbName}"`);
       console.log(`Database "${dbName}" created`);
     } else {
       console.log(`Database "${dbName}" already exists`);
     }
 
-    await pool.end();
+    await adminPool.end();
 
     // Connect to the target database
-    const targetConfig = process.env.DATABASE_URL
-      ? { connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false }
+    const targetConfig = dbUrlParsed
+      ? {
+          host: dbUrlParsed.host,
+          port: dbUrlParsed.port,
+          user: dbUrlParsed.user,
+          password: dbUrlParsed.password,
+          database: dbName,
+        }
       : {
           host: process.env.DB_HOST || 'localhost',
           port: parseInt(process.env.DB_PORT, 10) || 5432,
@@ -91,15 +111,29 @@ const runMigrations = async () => {
 
     // Fix existing admin user password hash (seed only runs for new rows)
     await targetPool.query(`
-      UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
-      WHERE email = 'admin@gmail.com';
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users') THEN
+          UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
+          WHERE email = 'admin@gmail.com';
+        END IF;
+      END $$;
     `);
     await targetPool.query(`
-      UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
-      WHERE email = 'admin@crs.io';
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users') THEN
+          UPDATE users SET password_hash = '$2b$10$gREx/VHAcisqwH5k2yc2/eirh77j5GWlNJI/xsTt5gY6twzTEpcnS'
+          WHERE email = 'admin@crs.io';
+        END IF;
+      END $$;
     `);
     // Reset all sessions so users must log in again with the correct password
-    await targetPool.query(`UPDATE user_sessions SET is_valid = FALSE`);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'user_sessions') THEN
+          UPDATE user_sessions SET is_valid = FALSE;
+        END IF;
+      END $$;
+    `);
 
     await targetPool.query(schema);
 
