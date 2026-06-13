@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
-const { generateTicketId } = require('../services/ticketIdGenerator');
+const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGenerator');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { validateTicket } = require('../middleware/validation');
 
@@ -55,6 +55,16 @@ router.get('/', async (req, res, next) => {
         totalPages: Math.ceil(total / parseInt(limit)),
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/tickets/next-id - Preview next ticket ID (without advancing sequence)
+router.get('/next-id', async (req, res, next) => {
+  try {
+    const ticketId = await peekNextTicketId();
+    res.json({ success: true, data: { ticketId } });
   } catch (err) {
     next(err);
   }
