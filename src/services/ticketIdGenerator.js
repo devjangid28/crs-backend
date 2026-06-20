@@ -11,4 +11,13 @@ const generateTicketId = async (client = null) => {
   return `TKT-${year}-${String(nextVal).padStart(6, '0')}`;
 };
 
-module.exports = { generateTicketId };
+const peekNextTicketId = async () => {
+  const year = new Date().getFullYear();
+  const result = await query(`SELECT last_value, is_called FROM ticket_id_seq`);
+  const lastValue = parseInt(result.rows[0]?.last_value) || 0;
+  const isCalled = result.rows[0]?.is_called;
+  const nextVal = isCalled ? lastValue + 1 : (lastValue || 1);
+  return `TKT-${year}-${String(nextVal).padStart(6, '0')}`;
+};
+
+module.exports = { generateTicketId, peekNextTicketId };
