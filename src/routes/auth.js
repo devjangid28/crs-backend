@@ -41,10 +41,7 @@ router.post('/login', async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    // Invalidate existing sessions for this user if any
-    await query('UPDATE user_sessions SET is_valid = FALSE WHERE user_id = $1', [user.id]);
-
-    // Create new session
+    // Create new session (existing sessions remain valid)
     const sessionToken = generateSessionToken();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + SESSION_DURATION_DAYS);

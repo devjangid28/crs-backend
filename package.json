@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.js",
+    "restart": "powershell -ExecutionPolicy Bypass -File ./restart.ps1",
     "dev": "nodemon src/server.js",
     "migrate": "node src/migrations/init.js",
     "test": "echo \"No tests configured\" && exit 0"
@@ -18,6 +19,7 @@
     "dotenv": "^16.6.1",
     "express": "^4.18.2",
     "express-validator": "^7.3.2",
+    "pdfkit": "^0.19.1",
     "pg": "^8.21.0"
   },
   "devDependencies": {

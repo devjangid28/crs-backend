@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Feedback - CRS</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; color: #1f2937; min-height: 100vh; }
+.container { max-width: 600px; margin: 0 auto; padding: 20px; }
+.header { background: linear-gradient(135deg, #6366f1, #4f46e5); color: white; padding: 30px; border-radius: 16px; margin-bottom: 24px; text-align: center; }
+.header h1 { font-size: 22px; margin-bottom: 4px; }
+.header p { font-size: 14px; opacity: 0.9; }
+.card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #374151; text-align: center; }
+.stars { display: flex; justify-content: center; gap: 8px; margin: 20px 0; }
+.star { font-size: 40px; cursor: pointer; color: #d1d5db; transition: color 0.2s; }
+.star.active, .star:hover { color: #f59e0b; }
+.form-group { margin-bottom: 16px; }
+.form-group label { font-size: 14px; font-weight: 500; color: #374151; display: block; margin-bottom: 6px; }
+.form-group textarea { width: 100%; padding: 12px; border: 2px solid #e5e7eb; border-radius: 8px; font-size: 14px; font-family: inherit; resize: vertical; min-height: 100px; }
+.form-group textarea:focus { outline: none; border-color: #6366f1; }
+.form-group .char-count { font-size: 12px; color: #9ca3af; text-align: right; margin-top: 4px; }
+.form-group .error-msg { font-size: 12px; color: #dc2626; margin-top: 4px; display: none; }
+.btn-primary { width: 100%; padding: 14px; background: #6366f1; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+.btn-primary:hover { background: #4f46e5; }
+.btn-primary:disabled { background: #9ca3af; cursor: not-allowed; }
+.loading { text-align: center; padding: 40px; color: #6b7280; }
+.error { text-align: center; padding: 40px; }
+.error h2 { color: #dc2626; margin-bottom: 8px; }
+.success { text-align: center; padding: 40px; }
+.success h2 { color: #059669; margin-bottom: 8px; }
+.success p { color: #6b7280; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div id="app">
+    <div class="loading">Loading...</div>
+  </div>
+</div>
+<script>
+const pathParts = window.location.pathname.split('/');
+const ticketId = pathParts[2];
+const token = pathParts[3];
+let selectedRating = 0;
+
+async function loadFeedback() {
+  const app = document.getElementById('app');
+  try {
+    const res = await fetch(`/api/feedback/${ticketId}/${token}`);
+    const json = await res.json();
+    if (!json.success) {
+      app.innerHTML = `<div class="error"><h2>Invalid Link</h2><p>${json.message || 'This feedback link is invalid or has expired.'}</p></div>`;
+      return;
+    }
+    const d = json.data;
+    if (d.alreadySubmitted) {
+      app.innerHTML = `
+        <div class="success">
+          <div style="font-size:64px;margin-bottom:16px">🙏</div>
+          <h2>Thank You!</h2>
+          <p style="margin-top:8px">You have already submitted your feedback.</p>
+          <p style="margin-top:4px;color:#6b7280">Your ratings: ${'⭐'.repeat(d.existingFeedback.rating)}</p>
+        </div>
+      `;
+      return;
+    }
+    app.innerHTML = `
+      <div class="header">
+        <h1>✍️ Share Your Feedback</h1>
+        <p>We value your opinion. Please rate your experience.</p>
+      </div>
+      <div class="card">
+        <h2>How was your experience?</h2>
+        <p style="text-align:center;font-size:14px;color:#6b7280;margin-bottom:8px">${d.ticket.customerName} · ${d.ticket.deviceName}</p>
+        <div class="stars" id="starContainer">
+          ${[1,2,3,4,5].map(i => `<span class="star" data-rating="${i}" onclick="setRating(${i})" onmouseover="hoverRating(${i})" onmouseout="resetRating()">★</span>`).join('')}
+        </div>
+        <p id="ratingText" style="text-align:center;font-size:14px;color:#6b7280;margin-bottom:16px">Select your rating</p>
+        <div class="form-group">
+          <label for="comment">Your Feedback</label>
+          <textarea id="comment" placeholder="Tell us about your experience (minimum 10 characters)..." oninput="updateCharCount()"></textarea>
+          <div class="char-count"><span id="charCount">0</span> characters</div>
+          <div class="error-msg" id="commentError">Comment must be at least 10 characters</div>
+        </div>
+        <button class="btn-primary" id="submitBtn" onclick="submitFeedback()">Submit Feedback</button>
+      </div>
+    `;
+  } catch (e) {
+    app.innerHTML = `<div class="error"><h2>Error</h2><p>Unable to load. Please try again.</p></div>`;
+  }
+}
+
+function setRating(r) {
+  selectedRating = r;
+  document.querySelectorAll('.star').forEach((s, i) => s.classList.toggle('active', i < r));
+  const texts = ['', 'Poor', 'Fair', 'Good', 'Very Good', 'Excellent'];
+  document.getElementById('ratingText').textContent = texts[r] || 'Select your rating';
+}
+
+function hoverRating(r) {
+  document.querySelectorAll('.star').forEach((s, i) => s.classList.toggle('active', i < r));
+}
+
+function resetRating() {
+  document.querySelectorAll('.star').forEach((s, i) => s.classList.toggle('active', i < selectedRating));
+}
+
+function updateCharCount() {
+  const comment = document.getElementById('comment');
+  document.getElementById('charCount').textContent = comment.value.length;
+}
+
+async function submitFeedback() {
+  const comment = document.getElementById('comment').value.trim();
+  const commentError = document.getElementById('commentError');
+  let valid = true;
+
+  if (selectedRating === 0) { alert('Please select a rating'); valid = false; }
+  if (comment.length < 10) { commentError.style.display = 'block'; valid = false; }
+  else { commentError.style.display = 'none'; }
+
+  if (!valid) return;
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true;
+  btn.textContent = 'Submitting...';
+
+  try {
+    const res = await fetch(`/api/feedback/${ticketId}/${token}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating: selectedRating, comment })
+    });
+    const json = await res.json();
+    if (json.success) {
+      document.getElementById('app').innerHTML = `
+        <div class="success">
+          <div style="font-size:64px;margin-bottom:16px">🎉</div>
+          <h2>Thank You for Your Feedback!</h2>
+          <p style="margin-top:8px">We appreciate your time and valuable input.</p>
+          <p style="margin-top:4px;color:#6b7280">Your ratings: ${'⭐'.repeat(selectedRating)}</p>
+        </div>
+      `;
+    } else {
+      alert(json.message || 'Failed to submit feedback');
+      btn.disabled = false;
+      btn.textContent = 'Submit Feedback';
+    }
+  } catch (e) {
+    alert('An error occurred. Please try again.');
+    btn.disabled = false;
+    btn.textContent = 'Submit Feedback';
+  }
+}
+
+loadFeedback();
+</script>
+</body>
+</html>

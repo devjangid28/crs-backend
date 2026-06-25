@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../config/database');
+const { generateInvoicePdf } = require('../services/pdfGenerator');
+const { createPdfMessage } = require('../services/messagingService');
 
 // GET /api/invoices - Get all invoices
 router.get('/', async (req, res, next) => {
@@ -89,6 +91,27 @@ router.post('/', async (req, res, next) => {
     const invoiceResult = await query('SELECT * FROM invoices WHERE id = ?', [insertId]);
     const invoice = invoiceResult.rows[0];
     invoice.items = items || [];
+
+    // Auto-generate Invoice PDF and send as message (fire-and-forget)
+    if (ticketId) {
+      setImmediate(async () => {
+        try {
+          const pdf = await generateInvoicePdf(insertId);
+          await createPdfMessage({
+            conversationId: String(ticketId),
+            ticketId,
+            customerId: null,
+            sender: 'System',
+            fileName: pdf.fileName,
+            fileSize: pdf.fileSize,
+            documentType: 'invoice',
+            event: 'Invoice generated',
+          });
+        } catch (e) {
+          console.error('Auto-generate invoice PDF failed:', e.message);
+        }
+      });
+    }
 
     res.status(201).json({ success: true, message: 'Invoice created successfully', data: invoice });
   } catch (err) {

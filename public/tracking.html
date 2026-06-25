@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Repair Tracking - CRS</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; color: #1f2937; min-height: 100vh; }
+.container { max-width: 800px; margin: 0 auto; padding: 20px; }
+.header { background: linear-gradient(135deg, #6366f1, #4f46e5); color: white; padding: 30px; border-radius: 16px; margin-bottom: 24px; text-align: center; }
+.header h1 { font-size: 24px; margin-bottom: 4px; }
+.header p { font-size: 14px; opacity: 0.9; }
+.card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #374151; border-bottom: 1px solid #e5e7eb; padding-bottom: 12px; }
+.info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.info-item { }
+.info-item .label { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
+.info-item .value { font-size: 14px; font-weight: 500; color: #1f2937; }
+.status-badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.status-New { background: #dbeafe; color: #1d4ed8; }
+.status-Pending { background: #fef3c7; color: #b45309; }
+.status-Diagnosed { background: #e0e7ff; color: #4338ca; }
+.status-In\ Progress { background: #d1fae5; color: #047857; }
+.status-Waiting\ For\ Parts { background: #fce7f3; color: #be185d; }
+.status-Completed { background: #d1fae5; color: #047857; }
+.status-Ready\ For\ Pickup { background: #dbeafe; color: #1d4ed8; }
+.status-Delivered { background: #d1fae5; color: #047857; }
+.status-Collected { background: #e0e7ff; color: #4338ca; }
+.status-Cancelled { background: #fee2e2; color: #b91c1c; }
+.timeline { position: relative; padding-left: 28px; }
+.timeline::before { content: ''; position: absolute; left: 8px; top: 4px; bottom: 4px; width: 2px; background: #e5e7eb; }
+.timeline-item { position: relative; margin-bottom: 20px; }
+.timeline-item::before { content: ''; position: absolute; left: -24px; top: 4px; width: 12px; height: 12px; border-radius: 50%; background: #6366f1; border: 2px solid white; box-shadow: 0 0 0 2px #6366f1; }
+.timeline-item .time { font-size: 11px; color: #9ca3af; }
+.timeline-item .title { font-size: 14px; font-weight: 500; color: #1f2937; }
+.timeline-item .desc { font-size: 13px; color: #6b7280; }
+.loading { text-align: center; padding: 40px; color: #6b7280; }
+.error { text-align: center; padding: 40px; color: #dc2626; }
+@media (max-width: 640px) { .info-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container">
+  <div id="app">
+    <div class="loading">Loading tracking information...</div>
+  </div>
+</div>
+<script>
+const pathParts = window.location.pathname.split('/');
+const ticketId = pathParts[2];
+const token = pathParts[3];
+
+async function loadTracking() {
+  const app = document.getElementById('app');
+  try {
+    const res = await fetch(`/api/tracking/${ticketId}/${token}`);
+    const json = await res.json();
+    if (!json.success) {
+      app.innerHTML = `<div class="error"><h2>Invalid Link</h2><p>${json.message || 'This tracking link is invalid or has expired.'}</p></div>`;
+      return;
+    }
+    const d = json.data;
+    const t = d.ticket;
+    app.innerHTML = `
+      <div class="header">
+        <h1>🔧 Repair Tracking</h1>
+        <p>Ticket: ${t.ticketId}</p>
+      </div>
+      <div class="card">
+        <h2>Device & Customer</h2>
+        <div class="info-grid">
+          <div class="info-item"><div class="label">Customer Name</div><div class="value">${t.customerName}</div></div>
+          <div class="info-item"><div class="label">Phone</div><div class="value">${t.customerPhone}</div></div>
+          <div class="info-item"><div class="label">Device</div><div class="value">${t.brand} ${t.model}</div></div>
+          <div class="info-item"><div class="label">Device Type</div><div class="value">${t.deviceType || '—'}</div></div>
+          <div class="info-item"><div class="label">Serial Number</div><div class="value">${t.serialNumber || '—'}</div></div>
+          <div class="info-item"><div class="label">Ticket Number</div><div class="value">${t.ticketId}</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Repair Status
+          <span class="status-badge status-${t.status.replace(/ /g, '\\ ')}" style="float:right">${t.status}</span>
+        </h2>
+        <div class="info-grid">
+          <div class="info-item"><div class="label">Problem</div><div class="value">${t.problemDescription || '—'}</div></div>
+          <div class="info-item"><div class="label">Estimated Cost</div><div class="value">₹${(t.estimatedCost || 0).toLocaleString('en-IN')}</div></div>
+          <div class="info-item"><div class="label">Total Amount</div><div class="value">₹${(t.totalAmount || 0).toLocaleString('en-IN')}</div></div>
+          <div class="info-item"><div class="label">Created</div><div class="value">${new Date(t.createdAt).toLocaleDateString('en-IN')}</div></div>
+        </div>
+        ${t.warranty ? `<div class="info-item" style="margin-top:12px"><div class="label">Warranty</div><div class="value">${t.warrantyPeriod || '90'} days (expires: ${t.warrantyExpiry ? new Date(t.warrantyExpiry).toLocaleDateString('en-IN') : '—'})</div></div>` : ''}
+      </div>
+      <div class="card">
+        <h2>Repair Timeline</h2>
+        ${d.statusHistory && d.statusHistory.length > 0 ? `
+        <div class="timeline">
+          ${d.statusHistory.map(h => `
+          <div class="timeline-item">
+            <div class="time">${new Date(h.changedAt).toLocaleString('en-IN')}</div>
+            <div class="title">${h.oldStatus ? h.oldStatus + ' → ' : ''}${h.newStatus}</div>
+            <div class="desc">Updated by ${h.changedBy || 'System'}</div>
+          </div>
+          `).join('')}
+        </div>
+        ` : '<p style="color:#6b7280">No status updates yet.</p>'}
+      </div>
+      ${d.invoices && d.invoices.length > 0 ? `
+      <div class="card">
+        <h2>Invoice Summary</h2>
+        ${d.invoices.map(inv => `
+        <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f3f4f6">
+          <span>${inv.invoiceId}</span>
+          <span>₹${(inv.totalAmount || 0).toLocaleString('en-IN')}</span>
+          <span class="status-badge status-${inv.status}">${inv.status}</span>
+        </div>
+        `).join('')}
+      </div>
+      ` : ''}
+    `;
+  } catch (e) {
+    app.innerHTML = `<div class="error"><h2>Error</h2><p>Unable to load tracking information. Please try again later.</p></div>`;
+  }
+}
+loadTracking();
+</script>
+</body>
+</html>

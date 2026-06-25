@@ -4,6 +4,9 @@ const { query, getConnection } = require('../config/database');
 const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGenerator');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { validateTicket } = require('../middleware/validation');
+const { generateInwardReceipt } = require('../services/pdfGenerator');
+const { createPdfMessage, createStatusEvent } = require('../services/messagingService');
+const { notifyTicketCreated } = require('../services/whatsappService');
 
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
@@ -150,6 +153,32 @@ router.post('/', validateTicket, async (req, res, next) => {
 
     const newTicket = await client.query('SELECT * FROM tickets WHERE id = $1', [insertId]);
 
+    // Auto-generate Inward Receipt PDF and send WhatsApp notification (fire-and-forget)
+    setImmediate(async () => {
+      try {
+        const pdf = await generateInwardReceipt(insertId);
+        await createPdfMessage({
+          conversationId: String(insertId),
+          ticketId: insertId,
+          customerId: customerId || null,
+          sender: 'System',
+          fileName: pdf.fileName,
+          fileSize: pdf.fileSize,
+          documentType: 'inward_receipt',
+          event: 'Receipt generated',
+        });
+      } catch (e) {
+        console.error('Auto-generate inward receipt failed:', e.message);
+      }
+      try {
+        const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
+        const store = storeRes.rows[0] || {};
+        await notifyTicketCreated(newTicket.rows[0], store);
+      } catch (e) {
+        console.error('WhatsApp notification failed:', e.message);
+      }
+    });
+
     res.status(201).json({ success: true, message: 'Ticket created successfully', data: newTicket.rows[0] });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -285,6 +314,17 @@ router.put('/:id/status', async (req, res, next) => {
     await recordStatusChange(req.params.id, oldStatus, status, changedBy || 'System', client, oldTicket.ticket_id);
 
     await client.query('COMMIT');
+
+    // Auto-create status event message (fire-and-forget)
+    if (status !== oldStatus) {
+      setImmediate(async () => {
+        try {
+          await createStatusEvent(parseInt(req.params.id), oldStatus, status, changedBy || 'System');
+        } catch (e) {
+          console.error('Auto-create status event failed:', e.message);
+        }
+      });
+    }
 
     const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'Status updated successfully', data: updated.rows[0] });

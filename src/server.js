@@ -18,6 +18,10 @@ const settingsRoutes = require('./routes/settings');
 const paymentRoutes = require('./routes/payments');
 const authRoutes = require('./routes/auth');
 const usersRoutes = require('./routes/users');
+const pdfRoutes = require('./routes/pdf');
+const publicRoutes = require('./routes/public');
+const orderRoutes = require('./routes/orders');
+const testWhatsAppRoutes = require('./routes/testWhatsApp');
 
 const app = express();
 
@@ -46,15 +50,51 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
-
+app.use('/api/pdf', pdfRoutes);
+app.use('/api', publicRoutes);
+app.use('/api/orders', orderRoutes);
+app.use('/api', testWhatsAppRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
-app.use(express.static(frontendDist));
+app.use(express.static(frontendDist, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    } else if (/\.(js|css|svg|png|jpg|jpeg|gif|ico|woff2?|ttf|eot)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'public, immutable, max-age=31536000');
+    }
+  }
+}));
+
+// Serve public/ directory for customer-facing pages
+app.use(express.static(path.join(__dirname, '..', 'public'), {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+  }
+}));
+
+// Customer-facing routes (server-rendered pages)
+const publicDir = path.join(__dirname, '..', 'public');
+app.get('/track/:ticketId/:token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(publicDir, 'tracking.html'));
+});
+app.get('/collect/:ticketId/:token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(publicDir, 'collection.html'));
+});
+app.get('/feedback/:ticketId/:token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(publicDir, 'feedback.html'));
+});
 
 // SPA fallback: serve index.html for all non-API routes
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return;
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.sendFile(path.join(frontendDist, 'index.html'));
 });
 

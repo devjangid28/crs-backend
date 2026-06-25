@@ -25,6 +25,13 @@ const config = {
   upload: {
     dir: process.env.UPLOAD_DIR || './uploads',
   },
+  whatsapp: {
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+    businessAccountId: process.env.WHATSAPP_BUSINESS_ACCOUNT_ID,
+    accessToken: process.env.WHATSAPP_ACCESS_TOKEN,
+    enabled: process.env.WHATSAPP_ENABLED === 'true',
+    templateName: process.env.WHATSAPP_TEMPLATE_NAME || 'ticket_created',
+  },
 };
 
 module.exports = config;
