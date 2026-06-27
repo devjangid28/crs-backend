@@ -106,7 +106,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       issueCategory, customIssueCategory, problemDescription, issue, solutionDescription,
       secondaryName, secondaryPhone, secondaryEmail,
       accessories, bodyDamage, body_damage, dataBackup, data_backup,
-      estimatedCost, advancePayment, priority, location, warranty, company,
+      estimatedCost, estimatedPrice, advancePayment, priority, location, warranty, company,
       status = 'New'
     } = req.body;
 
@@ -130,7 +130,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       secondary_email: secondaryEmail || null,
       accessories: accessories || null,
       body_damage: bodyDamage || body_damage || 'No', data_backup: dataBackup || data_backup || 'No',
-      estimated_cost: estimatedCost || 0, advance_payment: advancePayment || 0,
+      estimated_cost: estimatedCost || 0, estimated_price: estimatedPrice || 0, advance_payment: advancePayment || 0,
       priority: priority || 'Medium', asset_location: location || 'In Shop',
       warranty: warranty ? true : false, company: company || null,
       status, created_at: now, updated_at: now
@@ -225,6 +225,7 @@ router.put('/:id', async (req, res, next) => {
       accessories: 'accessories', bodyDamage: 'body_damage', body_damage: 'body_damage',
       dataBackup: 'data_backup', data_backup: 'data_backup',
       estimatedCost: 'estimated_cost',
+      estimatedPrice: 'estimated_price',
       advancePayment: 'advance_payment', priority: 'priority',
       location: 'asset_location', warranty: 'warranty', company: 'company',
       status: 'status', customerId: 'customer_id'

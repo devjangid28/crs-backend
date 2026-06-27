@@ -47,8 +47,11 @@ function isEnabled() {
 
 async function saveMessagesRecord(text, context, providerMessageId) {
   try {
-    const convId = context.ticketId != null ? String(context.ticketId) : (context.orderId != null ? String(context.orderId) : 'wa_' + (context.phone || 'unknown'));
-    wa.info('saveMessagesRecord', { convId, ticketId: context.ticketId, customerId: context.customerId });
+    const convId = context.conversationId
+      || (context.ticketId != null ? String(context.ticketId) : null)
+      || (context.orderId != null ? String(context.orderId) : null)
+      || ('wa_' + (context.phone || 'unknown'));
+    wa.info('saveMessagesRecord', { convId, ticketId: context.ticketId, customerId: context.customerId, providerMessageId });
     await createTextMessage({
       conversationId: convId,
       ticketId: context.ticketId || null,
@@ -256,10 +259,16 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
 }
 
 async function sendTicketTemplate(ticket, store) {
+  const estimatedPrice = ticket.estimated_price || '0';
+  const formattedPrice = typeof estimatedPrice === 'number'
+    ? `₹${estimatedPrice.toLocaleString('en-IN')}`
+    : `₹${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+
   const params = [
     ticket.customer_name || 'Valued Customer',
     ticket.ticket_id || '',
     `${ticket.device_type || ''} ${ticket.brand || ''} ${ticket.model || ''}`.trim() || 'Device',
+    formattedPrice,
   ];
 
   wa.info('sendTicketTemplate', {
@@ -268,6 +277,7 @@ async function sendTicketTemplate(ticket, store) {
     phone: ticket.customer_phone,
     ticketDbId: ticket.id,
     params,
+    estimatedPrice: formattedPrice,
     templateName: config.whatsapp.templateName,
   });
 
@@ -287,6 +297,11 @@ async function sendWelcome(phone, customerName, storeName, context) {
 }
 
 async function sendTicketDetails(phone, ticket, store) {
+  const estimatedPrice = ticket.estimated_price || '0';
+  const formattedPrice = typeof estimatedPrice === 'number'
+    ? `₹${estimatedPrice.toLocaleString('en-IN')}`
+    : `₹${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+
   const lines = [
     `*Ticket Confirmation*`,
     ``,
@@ -296,6 +311,7 @@ async function sendTicketDetails(phone, ticket, store) {
   ];
   if (ticket.serial_number) lines.push(`Serial: ${ticket.serial_number}`);
   lines.push(`Issue: ${ticket.problem_description || ticket.issue_category || ''}`);
+  lines.push(`Estimated Price: ${formattedPrice}`);
   lines.push(`Status: ${ticket.status || 'New'}`);
   lines.push(`Date: ${new Date(ticket.created_at).toLocaleString('en-IN')}`);
   if (ticket.estimated_completion_date) {
@@ -353,6 +369,32 @@ async function notifyTicketCreated(ticket, store) {
   return { template: result };
 }
 
+async function sendOrderTemplate(order, store) {
+  const params = [
+    order.customer_name || 'Valued Customer',
+    order.order_number || '',
+    `${order.device_type || ''} ${order.brand || ''} ${order.model || ''}`.trim() || 'Device',
+  ];
+
+  wa.info('sendOrderTemplate', {
+    customerName: order.customer_name,
+    orderNumber: order.order_number,
+    phone: order.mobile_number,
+    orderDbId: order.id,
+    params,
+    templateName: config.whatsapp.orderTemplateName,
+  });
+
+  if (!order.mobile_number) {
+    wa.error('sendOrderTemplate: no customer phone', new Error('Missing phone'), { orderId: order.id });
+    return { success: false, error: 'No customer phone' };
+  }
+
+  const phone = order.mobile_number;
+  const context = { orderId: order.id };
+  return sendTemplateMessage(phone, config.whatsapp.orderTemplateName, params, context);
+}
+
 async function notifyOrderCreated(order, store) {
   wa.info('notifyOrderCreated called', {
     orderId: order.id,
@@ -366,20 +408,29 @@ async function notifyOrderCreated(order, store) {
     return { success: false, error: 'No customer phone' };
   }
 
+  // Try order_created template first; fallback to free-text if template not approved
+  const templateResult = await sendOrderTemplate(order, store);
+  if (templateResult.success) {
+    return { template: templateResult };
+  }
+
+  wa.warn('notifyOrderCreated: template failed, falling back to free-text', { error: templateResult.error });
   const ctx = { orderId: order.id };
   const welcome = await sendWelcome(phone, order.customer_name, store?.company_name, ctx);
   const details = await sendOrderDetails(phone, order, store);
-  return { welcome, details };
+  return { welcome, details, templateFallback: true };
 }
 
 module.exports = {
   sendTextMessage,
   sendTemplateMessage,
   sendTicketTemplate,
+  sendOrderTemplate,
   sendWelcome,
   sendTicketDetails,
   sendOrderDetails,
   notifyTicketCreated,
   notifyOrderCreated,
+  isEnabled,
   formatPhone,
 };

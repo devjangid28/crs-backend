@@ -121,4 +121,32 @@ async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'Sy
   });
 }
 
-module.exports = { createSystemMessage, createTextMessage, createPdfMessage, createLinkMessage, createStatusEvent };
+async function storeIncomingMessage({ from, waId, text, profileName }) {
+  const convId = 'wa_' + from;
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+  // Try to match phone number to an existing customer
+  let customerId = null;
+  try {
+    const cleanPhone = from.replace(/^0+/, '');
+    const customerRes = await query(
+      `SELECT id FROM customers WHERE phone LIKE $1 OR phone LIKE $2 OR phone LIKE $3 LIMIT 1`,
+      [`%${from}`, `%${cleanPhone}`, `${cleanPhone}%`]
+    );
+    if (customerRes.rows.length > 0) {
+      customerId = customerRes.rows[0].id;
+    }
+  } catch (e) {
+    // Silent fail on lookup
+  }
+
+  const result = await query(
+    `INSERT INTO messages (conversation_id, sender, customer_id, type, text, status, created_at)
+     VALUES ($1, 'Customer', $2, 'text', $3, 'delivered', $4) RETURNING id`,
+    [convId, customerId, text, now]
+  );
+
+  return { id: result.rows[0].id, customerId, convId };
+}
+
+module.exports = { createSystemMessage, createTextMessage, createPdfMessage, createLinkMessage, createStatusEvent, storeIncomingMessage };

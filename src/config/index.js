@@ -31,6 +31,7 @@ const config = {
     accessToken: process.env.WHATSAPP_ACCESS_TOKEN,
     enabled: process.env.WHATSAPP_ENABLED === 'true',
     templateName: process.env.WHATSAPP_TEMPLATE_NAME || 'ticket_created',
+    orderTemplateName: process.env.WHATSAPP_ORDER_TEMPLATE_NAME || 'order_created',
   },
 };
 

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query } = require('../config/database');
 const { createTextMessage, createPdfMessage, createLinkMessage, createStatusEvent } = require('../services/messagingService');
+const { sendTextMessage, isEnabled } = require('../services/whatsappService');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 const { simulateDelivery, SIMULATION_PREFIX } = require('../services/simulationService');
@@ -23,7 +24,39 @@ router.get('/', authenticate, async (req, res, next) => {
 // POST /api/messages - Send a text message (auth-protected)
 router.post('/', authenticate, async (req, res, next) => {
   try {
-    const { conversationId, ticketId, customerId, sender, text } = req.body;
+    const { conversationId, ticketId, customerId, sender, text, phone } = req.body;
+
+    // Send via WhatsApp if enabled and phone provided
+    let providerMessageId = null;
+    if (isEnabled() && phone) {
+      try {
+        const waResult = await sendTextMessage(phone, text, { conversationId, ticketId, customerId });
+        if (waResult.success) {
+          providerMessageId = waResult.messageId;
+        } else {
+          console.error('WhatsApp send failed (non-fatal):', waResult.error);
+        }
+      } catch (waErr) {
+        console.error('WhatsApp send exception (non-fatal):', waErr.message);
+      }
+    }
+
+    // Check if sendTextMessage already saved this message (via saveMessagesRecord)
+    let msgResult;
+    if (providerMessageId && conversationId) {
+      const existing = await query(
+        'SELECT id FROM messages WHERE conversation_id = $1 AND text = $2 ORDER BY created_at DESC LIMIT 1',
+        [conversationId, text]
+      );
+      if (existing.rows.length > 0) {
+        // Update the message created by saveMessagesRecord with sender info
+        await query('UPDATE messages SET sender = $1, status = $2 WHERE id = $3',
+          [sender || req.user?.full_name || 'Staff', 'sent', existing.rows[0].id]);
+        msgResult = await query('SELECT * FROM messages WHERE id = $1', [existing.rows[0].id]);
+        return res.status(201).json({ success: true, data: msgResult.rows[0] });
+      }
+    }
+
     const msg = await createTextMessage({
       conversationId: conversationId || `CONV-${Date.now()}`,
       ticketId: ticketId || null,
@@ -32,7 +65,7 @@ router.post('/', authenticate, async (req, res, next) => {
       text: text || '',
     });
 
-    const msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
+    msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
 
     await logAudit({
       action: actions.MESSAGE_SENT,
@@ -81,7 +114,15 @@ router.get('/conversations', authenticate, async (req, res, next) => {
 // POST /api/messages/pdf - Send a PDF message (auth-protected)
 router.post('/pdf', authenticate, async (req, res, next) => {
   try {
-    const { conversationId, ticketId, customerId, sender, fileName, fileSize, documentType, event } = req.body;
+    const { conversationId, ticketId, customerId, sender, fileName, fileSize, documentType, event, phone } = req.body;
+
+    // Send WhatsApp notification with link if phone provided
+    if (isEnabled() && phone) {
+      const waText = `*${documentType || 'Document'}*\n\n${fileName || 'document'}\n\nPlease check your CRS portal for details.`;
+      sendTextMessage(phone, waText, { conversationId, ticketId, customerId }).catch(e =>
+        console.error('WhatsApp PDF notification failed:', e.message)
+      );
+    }
     const msg = await createPdfMessage({
       conversationId: conversationId || `CONV-${Date.now()}`,
       ticketId: ticketId || null,

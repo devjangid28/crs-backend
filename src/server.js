@@ -22,6 +22,7 @@ const pdfRoutes = require('./routes/pdf');
 const publicRoutes = require('./routes/public');
 const orderRoutes = require('./routes/orders');
 const testWhatsAppRoutes = require('./routes/testWhatsApp');
+const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
 
 const app = express();
 
@@ -54,6 +55,7 @@ app.use('/api/pdf', pdfRoutes);
 app.use('/api', publicRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api', testWhatsAppRoutes);
+app.use('/api/whatsapp', whatsappWebhookRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -95,7 +97,11 @@ app.get('/feedback/:ticketId/:token', (req, res) => {
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return;
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.sendFile(path.join(frontendDist, 'index.html'));
+  try {
+    res.sendFile(path.join(frontendDist, 'index.html'));
+  } catch (e) {
+    res.status(503).json({ success: false, message: 'Frontend not built yet. Run: npm run build' });
+  }
 });
 
 app.use(errorHandler);

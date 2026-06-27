@@ -110,4 +110,36 @@ router.get('/test-whatsapp-log-file', (req, res) => {
   }
 });
 
+// POST /api/test-whatsapp-incoming - Simulate an incoming webhook message
+router.post('/test-whatsapp-incoming', async (req, res) => {
+  try {
+    const { from, text, profileName } = req.body;
+    if (!from) {
+      return res.status(400).json({ success: false, message: 'from (phone number) is required' });
+    }
+
+    const { storeIncomingMessage } = require('../services/messagingService');
+
+    wa.info('=== TEST INCOMING WEBHOOK ===', { from, text, profileName });
+
+    const result = await storeIncomingMessage({
+      from,
+      waId: 'test_' + Date.now(),
+      text: text || 'Test message from WhatsApp',
+      profileName: profileName || 'Test Customer',
+    });
+
+    wa.info('=== TEST INCOMING RESULT ===', result);
+
+    res.json({
+      success: true,
+      data: result,
+      message: `Simulated incoming message from ${from}. Refresh the Messaging page to see it.`,
+    });
+  } catch (err) {
+    wa.error('Test incoming endpoint error', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
