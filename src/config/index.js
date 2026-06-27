@@ -32,6 +32,20 @@ const config = {
     enabled: process.env.WHATSAPP_ENABLED === 'true',
     templateName: process.env.WHATSAPP_TEMPLATE_NAME || 'ticket_created',
     orderTemplateName: process.env.WHATSAPP_ORDER_TEMPLATE_NAME || 'order_created',
+    templatePending: process.env.WHATSAPP_TEMPLATE_PENDING || 'ticket_pending',
+    templateInProgress: process.env.WHATSAPP_TEMPLATE_IN_PROGRESS || 'ticket_in_progress',
+    templateReadyForPickup: process.env.WHATSAPP_TEMPLATE_READY_FOR_PICKUP || 'ticket_ready_for_pickup',
+    templateCompleted: process.env.WHATSAPP_TEMPLATE_COMPLETED || 'ticket_completed',
+    templateCancelled: process.env.WHATSAPP_TEMPLATE_CANCELLED || 'ticket_cancelled',
+    templateLanguages: Object.freeze({
+      'ticket_created': 'en_GB',
+      'ticket_pending': 'en_GB',
+      'ticket_completed': 'en_GB',
+      'ticket_cancelled': 'en',
+      'ticket_in_progress': 'en',
+      'ticket_ready_for_pickup': 'en_IN',
+      'order_created': 'en_GB',
+    }),
   },
 };
 

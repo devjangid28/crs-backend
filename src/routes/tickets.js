@@ -5,8 +5,8 @@ const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGene
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { validateTicket } = require('../middleware/validation');
 const { generateInwardReceipt } = require('../services/pdfGenerator');
-const { createPdfMessage, createStatusEvent } = require('../services/messagingService');
-const { notifyTicketCreated } = require('../services/whatsappService');
+const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
+const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage } = require('../services/whatsappService');
 
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
@@ -153,8 +153,13 @@ router.post('/', validateTicket, async (req, res, next) => {
 
     const newTicket = await client.query('SELECT * FROM tickets WHERE id = $1', [insertId]);
 
-    // Auto-generate Inward Receipt PDF and send WhatsApp notification (fire-and-forget)
+    // Auto-create conversation and send WhatsApp notification (fire-and-forget)
     setImmediate(async () => {
+      try {
+        await getOrCreateConversation(insertId, customerId || null, phone);
+      } catch (e) {
+        console.error('Auto-create conversation failed:', e.message);
+      }
       try {
         const pdf = await generateInwardReceipt(insertId);
         await createPdfMessage({
@@ -173,7 +178,17 @@ router.post('/', validateTicket, async (req, res, next) => {
       try {
         const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
         const store = storeRes.rows[0] || {};
-        await notifyTicketCreated(newTicket.rows[0], store);
+        const waResult = await notifyTicketCreated(newTicket.rows[0], store);
+        if (!waResult?.template?.success) {
+          const errMsg = waResult?.template?.error || waResult?.template?.reason || 'Unknown error';
+          console.error('WhatsApp template send failed:', errMsg, JSON.stringify(waResult));
+          // Fallback: send a plain text message if template fails
+          if (phone) {
+            const ticketData = newTicket.rows[0];
+            const fallbackText = `*Ticket Created*\n\nCustomer: ${ticketData.customer_name || 'N/A'}\nTicket: ${ticketData.ticket_id || ticketData.id}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
+            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: customerId || null, phone, sender: 'System' });
+          }
+        }
       } catch (e) {
         console.error('WhatsApp notification failed:', e.message);
       }
@@ -205,7 +220,9 @@ router.put('/:id', async (req, res, next) => {
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     updates.updated_at = now;
 
+    let statusChanged = false;
     if (updates.status && updates.status !== oldTicket.status) {
+      statusChanged = true;
       await recordStatusChange(req.params.id, oldTicket.status, updates.status, updates.changedBy || 'System', client, oldTicket.ticket_id);
     }
 
@@ -258,6 +275,33 @@ router.put('/:id', async (req, res, next) => {
 
     const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
 
+    // Handle status change event and WhatsApp template (fire-and-forget)
+    if (statusChanged) {
+      setImmediate(async () => {
+        try {
+          await createStatusEvent(parseInt(req.params.id), oldTicket.status, updates.status, updates.changedBy || 'System');
+        } catch (e) {
+          console.error('Auto-create status event failed:', e.message);
+        }
+        try {
+          const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
+          const store = storeRes.rows[0] || {};
+          const waResult = await sendTicketStatusTemplate(updated.rows[0], updates.status, store);
+          if (!waResult.success) {
+            console.error('Status change WhatsApp template failed:', waResult.error || waResult.reason || JSON.stringify(waResult));
+            // Fallback: send text notification
+            const ticketData = updated.rows[0];
+            if (ticketData.customer_phone) {
+              const fallbackText = `*Status Update: ${updates.status}*\n\nTicket: ${ticketData.ticket_id || ticketData.id}\nCustomer: ${ticketData.customer_name || 'N/A'}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
+              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System' });
+            }
+          }
+        } catch (e) {
+          console.error('Send status template failed:', e.message);
+        }
+      });
+    }
+
     res.json({ success: true, message: 'Ticket updated successfully', data: updated.rows[0] });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -301,7 +345,7 @@ router.put('/:id/status', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Status is required' });
     }
 
-    const existing = await client.query('SELECT status, ticket_id FROM tickets WHERE id = $1', [req.params.id]);
+    const existing = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ success: false, message: 'Ticket not found' });
@@ -316,7 +360,9 @@ router.put('/:id/status', async (req, res, next) => {
 
     await client.query('COMMIT');
 
-    // Auto-create status event message (fire-and-forget)
+    const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
+
+    // Handle status change: create event and send WhatsApp template (fire-and-forget)
     if (status !== oldStatus) {
       setImmediate(async () => {
         try {
@@ -324,10 +370,24 @@ router.put('/:id/status', async (req, res, next) => {
         } catch (e) {
           console.error('Auto-create status event failed:', e.message);
         }
+        try {
+          const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
+          const store = storeRes.rows[0] || {};
+          const waResult = await sendTicketStatusTemplate(updated.rows[0], status, store);
+          if (!waResult.success) {
+            console.error('Status change WhatsApp template failed:', waResult.error || waResult.reason || JSON.stringify(waResult));
+            const ticketData = updated.rows[0];
+            if (ticketData.customer_phone) {
+              const fallbackText = `*Status Update: ${status}*\n\nTicket: ${ticketData.ticket_id || ticketData.id}\nCustomer: ${ticketData.customer_name || 'N/A'}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
+              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System' });
+            }
+          }
+        } catch (e) {
+          console.error('Send status template failed:', e.message);
+        }
       });
     }
 
-    const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'Status updated successfully', data: updated.rows[0] });
   } catch (err) {
     await client.query('ROLLBACK');

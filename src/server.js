@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const http = require('http');
+const { Server } = require('socket.io');
 const config = require('./config/index');
 const { pool, query, waitForPool } = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
@@ -25,6 +27,39 @@ const testWhatsAppRoutes = require('./routes/testWhatsApp');
 const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
 
 const app = express();
+const server = http.createServer(app);
+
+// Socket.IO setup
+const io = new Server(server, {
+  cors: {
+    origin: config.cors.origin,
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
+
+io.on('connection', (socket) => {
+  console.log('Socket.IO client connected:', socket.id);
+
+  socket.on('join_conversation', (conversationId) => {
+    socket.join(`conv:${conversationId}`);
+    console.log(`Socket ${socket.id} joined conversation: ${conversationId}`);
+  });
+
+  socket.on('leave_conversation', (conversationId) => {
+    socket.leave(`conv:${conversationId}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Socket.IO client disconnected:', socket.id);
+  });
+});
+
+// Make io accessible to routes
+app.set('io', io);
+
+// Pass io to webhook
+whatsappWebhookRoutes.setSocketIO(io);
 
 app.use(cors({ origin: config.cors.origin, credentials: true }));
 app.use(express.json({ limit: '50mb' }));
@@ -56,6 +91,12 @@ app.use('/api', publicRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api', testWhatsAppRoutes);
 app.use('/api/whatsapp', whatsappWebhookRoutes);
+
+// Server-side Socket.IO helper - emit events via routes
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -120,9 +161,10 @@ const PORT = config.server.port;
   }
 })();
 
-const server = app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT} in ${config.server.env} mode`);
   console.log(`API available at http://localhost:${PORT}/api`);
+  console.log(`Socket.IO available on same port`);
 });
 
 process.on('unhandledRejection', (err) => {
@@ -133,4 +175,4 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err.message);
 });
 
-module.exports = server;
+module.exports = { app, server, io };

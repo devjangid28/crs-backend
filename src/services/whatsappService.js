@@ -1,6 +1,6 @@
 const config = require('../config');
 const { query } = require('../config/database');
-const { createTextMessage } = require('./messagingService');
+const { createTextMessage, createTemplateMessage, createPdfMessage } = require('./messagingService');
 const { wa } = require('./logger');
 
 const API_VERSION = 'v21.0';
@@ -21,45 +21,55 @@ function formatPhone(phone) {
   }
   const original = phone;
   let cleaned = phone.replace(/[\s\-\+\(\)]/g, '');
-  wa.info('formatPhone: after cleaning', { original, cleaned });
 
   if (cleaned.startsWith('00')) cleaned = cleaned.slice(2);
   if (cleaned.startsWith('91') && cleaned.length > 10) {
-    wa.info('formatPhone: valid with country code', { result: cleaned });
     return cleaned;
   }
   if (cleaned.startsWith('0')) cleaned = cleaned.slice(1);
   if (cleaned.length === 10) {
-    const result = '91' + cleaned;
-    wa.info('formatPhone: added country code', { result });
-    return result;
+    return '91' + cleaned;
   }
-  wa.warn('formatPhone: could not format', { original, cleaned });
   return null;
 }
 
 function isEnabled() {
-  const enabled = !!(config.whatsapp.enabled &&
+  return !!(config.whatsapp.enabled &&
     config.whatsapp.phoneNumberId &&
     config.whatsapp.accessToken);
-  return enabled;
 }
 
-async function saveMessagesRecord(text, context, providerMessageId) {
+async function saveMessagesRecord(text, context, providerMessageId, messageType = 'text') {
   try {
     const convId = context.conversationId
       || (context.ticketId != null ? String(context.ticketId) : null)
       || (context.orderId != null ? String(context.orderId) : null)
       || ('wa_' + (context.phone || 'unknown'));
-    wa.info('saveMessagesRecord', { convId, ticketId: context.ticketId, customerId: context.customerId, providerMessageId });
-    await createTextMessage({
-      conversationId: convId,
-      ticketId: context.ticketId || null,
-      customerId: context.customerId || null,
-      sender: 'System',
-      text: text,
-    });
-    wa.info('saveMessagesRecord: success');
+
+    if (messageType === 'template') {
+      await createTemplateMessage({
+        conversationId: convId,
+        ticketId: context.ticketId || null,
+        customerId: context.customerId || null,
+        sender: context.sender || 'System',
+        templateName: context.templateName || 'unknown',
+        text: text,
+        providerMessageId,
+        phone: context.phone || null,
+        status: 'sent',
+      });
+    } else {
+      await createTextMessage({
+        conversationId: convId,
+        ticketId: context.ticketId || null,
+        customerId: context.customerId || null,
+        sender: context.sender || 'System',
+        text: text,
+        providerMessageId,
+        phone: context.phone || null,
+        status: 'sent',
+      });
+    }
   } catch (e) {
     wa.error('saveMessagesRecord failed', e, { convId: context.ticketId });
   }
@@ -82,7 +92,6 @@ async function logMessage(recipientPhone, messageBody, status, providerMessageId
         status === 'sent' ? new Date().toISOString().slice(0, 19).replace('T', ' ') : null,
       ]
     );
-    wa.info('logMessage: inserted', { recipientPhone, status, messageType, ticketId });
   } catch (e) {
     wa.error('logMessage failed', e, { recipientPhone, status, ticketId });
   }
@@ -101,7 +110,6 @@ async function callWhatsAppApi(payload) {
     url,
     tokenPrefix: token?.substring(0, 20) + '...',
   });
-  wa.payload('request body', payload);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
@@ -123,57 +131,40 @@ async function callWhatsAppApi(payload) {
     try {
       data = await response.json();
     } catch (parseErr) {
-      wa.error('callWhatsAppApi: failed to parse JSON response', parseErr, { status: response.status, statusText: response.statusText });
       return { success: false, error: `HTTP ${response.status}: Non-JSON response` };
     }
 
-    wa.response(`HTTP ${response.status}`, response.status, data);
-
     if (!response.ok) {
-      const errorCode = data?.error?.code || 0;
       const errorMessage = data?.error?.message || 'Unknown API error';
-      const errorType = data?.error?.type || '';
-      const fbtrace = data?.error?.fbtrace_id || '';
-
-      wa.error('callWhatsAppApi: API returned error', new Error(errorMessage), {
-        httpStatus: response.status,
-        errorCode,
-        errorType,
-        fbtrace,
-        fullResponse: data,
+      wa.error('WhatsApp API error response', {
+        status: response.status,
+        statusText: response.statusText,
+        error: data?.error,
+        fullResponse: JSON.stringify(data).slice(0, 2000),
       });
-
-      return { success: false, error: errorMessage, code: errorCode, type: errorType };
+      return { success: false, error: errorMessage, code: data?.error?.code, type: data?.error?.type, details: data?.error?.error_data || data?.error?.details };
     }
 
     const msgId = data?.messages?.[0]?.id;
-    wa.info('callWhatsAppApi: success', { messageId: msgId, fullResponse: data });
-
     return { success: true, messageId: msgId, data };
   } catch (err) {
     clearTimeout(timeout);
-
     if (err.name === 'AbortError') {
-      wa.error('callWhatsAppApi: request timed out after 30s', err);
       return { success: false, error: 'Request timed out after 30 seconds' };
     }
-
-    wa.error('callWhatsAppApi: fetch failed', err, { url });
     return { success: false, error: err.message };
   }
 }
 
-async function sendTextMessage(to, text, context = {}) {
-  wa.info('sendTextMessage called', { to, textPreview: text?.slice(0, 60), context });
+async function sendTextMessage(to, text, context = {}, options = {}) {
+  wa.info('sendTextMessage called', { to, textPreview: text?.slice(0, 60), context, options });
 
   if (!isEnabled()) {
-    wa.warn('sendTextMessage: WhatsApp disabled, would send', { to, text: text?.slice(0, 60) });
     return { success: false, skipped: true };
   }
 
   const phone = formatPhone(to);
   if (!phone) {
-    wa.error('sendTextMessage: invalid phone', new Error('Invalid phone number'), { original: to });
     return { success: false, error: 'Invalid phone number' };
   }
 
@@ -188,7 +179,9 @@ async function sendTextMessage(to, text, context = {}) {
 
   if (result.success) {
     await logMessage(phone, text, 'sent', result.messageId, null, context.ticketId, 'text');
-    await saveMessagesRecord(text, context, result.messageId);
+    if (!options.skipSave) {
+      await saveMessagesRecord(text, { ...context, phone }, result.messageId, 'text');
+    }
   } else {
     await logMessage(phone, text, 'failed', null, result.error, context.ticketId, 'text');
   }
@@ -197,28 +190,19 @@ async function sendTextMessage(to, text, context = {}) {
 }
 
 async function sendTemplateMessage(to, templateName, params, context = {}) {
-  wa.info('sendTemplateMessage called', {
-    to,
-    templateName,
-    params,
-    context,
-  });
+  wa.info('sendTemplateMessage called', { to, templateName, params, context });
 
   if (!isEnabled()) {
-    wa.warn('sendTemplateMessage: WhatsApp disabled, would send template', { to, templateName, params });
     return { success: false, skipped: true };
   }
 
   const phone = formatPhone(to);
   if (!phone) {
-    wa.error('sendTemplateMessage: invalid phone', new Error('Invalid phone number'), { original: to });
     return { success: false, error: 'Invalid phone number' };
   }
 
   const bodyParams = (params || []).map(p => ({ type: 'text', text: String(p) }));
   const displayText = `[Template: ${templateName}] ` + (params || []).join(' | ');
-
-  wa.info('sendTemplateMessage: formatted', { phone, templateName, bodyParams, displayText });
 
   const payload = {
     messaging_product: 'whatsapp',
@@ -226,7 +210,7 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
     type: 'template',
     template: {
       name: templateName,
-      language: { code: 'en' },
+      language: { code: config.whatsapp.templateLanguages[templateName] || 'en_GB' },
       components: [
         {
           type: 'body',
@@ -236,23 +220,46 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
     },
   };
 
-  wa.payload('template request payload', payload);
+  const result = await callWhatsAppApi(payload);
+
+  if (result.success) {
+    await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template');
+    await saveMessagesRecord(displayText, { ...context, phone, templateName, sender: context.sender || 'System' }, result.messageId, 'template');
+  } else {
+    await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template');
+  }
+
+  return result;
+}
+
+async function sendMediaMessage(to, mediaUrl, mediaType, caption, context = {}) {
+  wa.info('sendMediaMessage called', { to, mediaUrl, mediaType, caption });
+
+  if (!isEnabled()) {
+    return { success: false, skipped: true };
+  }
+
+  const phone = formatPhone(to);
+  if (!phone) {
+    return { success: false, error: 'Invalid phone number' };
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: mediaType,
+    [mediaType]: {
+      link: mediaUrl,
+      caption: caption || '',
+    },
+  };
 
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
-    wa.info('sendTemplateMessage: API success', { phone, templateName, messageId: result.messageId });
-    await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template');
-    await saveMessagesRecord(displayText, context, result.messageId);
+    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'sent', result.messageId, null, context.ticketId, mediaType);
   } else {
-    wa.error('sendTemplateMessage: API failed', new Error(result.error), {
-      phone,
-      templateName,
-      code: result.code,
-      type: result.type,
-      fullResult: result,
-    });
-    await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template');
+    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'failed', null, result.error, context.ticketId, mediaType);
   }
 
   return result;
@@ -261,8 +268,8 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
 async function sendTicketTemplate(ticket, store) {
   const estimatedPrice = ticket.estimated_price || '0';
   const formattedPrice = typeof estimatedPrice === 'number'
-    ? `₹${estimatedPrice.toLocaleString('en-IN')}`
-    : `₹${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    ? `\u20B9${estimatedPrice.toLocaleString('en-IN')}`
+    : `\u20B9${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
   const params = [
     ticket.customer_name || 'Valued Customer',
@@ -271,24 +278,44 @@ async function sendTicketTemplate(ticket, store) {
     formattedPrice,
   ];
 
-  wa.info('sendTicketTemplate', {
-    customerName: ticket.customer_name,
-    ticketId: ticket.ticket_id,
-    phone: ticket.customer_phone,
-    ticketDbId: ticket.id,
-    params,
-    estimatedPrice: formattedPrice,
-    templateName: config.whatsapp.templateName,
-  });
-
   if (!ticket.customer_phone) {
-    wa.error('sendTicketTemplate: no customer phone', new Error('Missing phone'), { ticketId: ticket.id });
     return { success: false, error: 'No customer phone' };
   }
 
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone: ticket.customer_phone, sender: 'System' };
+  const result = await sendTemplateMessage(ticket.customer_phone, config.whatsapp.templateName, params, context);
+  return result;
+}
+
+async function sendTicketStatusTemplate(ticket, newStatus, store) {
+  const templateMap = {
+    'Pending': config.whatsapp.templatePending,
+    'In Progress': config.whatsapp.templateInProgress,
+    'Ready for Pickup': config.whatsapp.templateReadyForPickup,
+    'Completed': config.whatsapp.templateCompleted,
+    'Cancelled': config.whatsapp.templateCancelled,
+  };
+
+  const templateName = templateMap[newStatus];
+  if (!templateName) {
+    wa.info('sendTicketStatusTemplate: no template mapped for status', { newStatus });
+    return { success: false, skipped: true, reason: 'No template mapped for status: ' + newStatus };
+  }
+
   const phone = ticket.customer_phone;
-  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone };
-  return sendTemplateMessage(phone, config.whatsapp.templateName, params, context);
+  if (!phone) {
+    return { success: false, error: 'No customer phone on ticket' };
+  }
+
+  const params = [
+    ticket.customer_name || 'Valued Customer',
+    ticket.ticket_id || '',
+    `${ticket.device_type || ''} ${ticket.brand || ''} ${ticket.model || ''}`.trim() || 'Device',
+  ];
+
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone, templateName, sender: 'System' };
+  const result = await sendTemplateMessage(phone, templateName, params, context);
+  return result;
 }
 
 async function sendWelcome(phone, customerName, storeName, context) {
@@ -299,8 +326,8 @@ async function sendWelcome(phone, customerName, storeName, context) {
 async function sendTicketDetails(phone, ticket, store) {
   const estimatedPrice = ticket.estimated_price || '0';
   const formattedPrice = typeof estimatedPrice === 'number'
-    ? `₹${estimatedPrice.toLocaleString('en-IN')}`
-    : `₹${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    ? `\u20B9${estimatedPrice.toLocaleString('en-IN')}`
+    : `\u20B9${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
   const lines = [
     `*Ticket Confirmation*`,
@@ -322,7 +349,7 @@ async function sendTicketDetails(phone, ticket, store) {
   if (store?.phone) lines.push(`Contact: ${store.phone}`);
   lines.push(``);
   lines.push(`We will notify you of all status updates.`);
-  const context = { ticketId: ticket.id, customerId: ticket.customer_id };
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, sender: 'System' };
   return sendTextMessage(phone, lines.join('\n'), context);
 }
 
@@ -346,27 +373,18 @@ async function sendOrderDetails(phone, order, store) {
   if (store?.phone) lines.push(`Contact: ${store.phone}`);
   lines.push(``);
   lines.push(`We will notify you of all status updates.`);
-  const context = { orderId: order.id };
+  const context = { orderId: order.id, sender: 'System' };
   return sendTextMessage(phone, lines.join('\n'), context);
 }
 
 async function notifyTicketCreated(ticket, store) {
-  wa.info('notifyTicketCreated called', {
-    ticketId: ticket.id,
-    ticketNumber: ticket.ticket_id,
-    customerPhone: ticket.customer_phone,
-    customerName: ticket.customer_name,
-  });
-
   const phone = ticket.customer_phone;
   if (!phone) {
-    wa.error('notifyTicketCreated: no customer phone', new Error('Missing phone'), { ticketId: ticket.id });
     return { success: false, error: 'No customer phone' };
   }
 
   const result = await sendTicketTemplate(ticket, store);
-  wa.info('notifyTicketCreated result', result);
-  return { template: result };
+  return { success: result.success, template: result };
 }
 
 async function sendOrderTemplate(order, store) {
@@ -376,46 +394,26 @@ async function sendOrderTemplate(order, store) {
     `${order.device_type || ''} ${order.brand || ''} ${order.model || ''}`.trim() || 'Device',
   ];
 
-  wa.info('sendOrderTemplate', {
-    customerName: order.customer_name,
-    orderNumber: order.order_number,
-    phone: order.mobile_number,
-    orderDbId: order.id,
-    params,
-    templateName: config.whatsapp.orderTemplateName,
-  });
-
   if (!order.mobile_number) {
-    wa.error('sendOrderTemplate: no customer phone', new Error('Missing phone'), { orderId: order.id });
     return { success: false, error: 'No customer phone' };
   }
 
-  const phone = order.mobile_number;
-  const context = { orderId: order.id };
-  return sendTemplateMessage(phone, config.whatsapp.orderTemplateName, params, context);
+  const context = { orderId: order.id, sender: 'System' };
+  return sendTemplateMessage(order.mobile_number, config.whatsapp.orderTemplateName, params, context);
 }
 
 async function notifyOrderCreated(order, store) {
-  wa.info('notifyOrderCreated called', {
-    orderId: order.id,
-    customerPhone: order.mobile_number,
-    customerName: order.customer_name,
-  });
-
   const phone = order.mobile_number;
   if (!phone) {
-    wa.error('notifyOrderCreated: no customer phone', new Error('Missing phone'), { orderId: order.id });
     return { success: false, error: 'No customer phone' };
   }
 
-  // Try order_created template first; fallback to free-text if template not approved
   const templateResult = await sendOrderTemplate(order, store);
   if (templateResult.success) {
     return { template: templateResult };
   }
 
-  wa.warn('notifyOrderCreated: template failed, falling back to free-text', { error: templateResult.error });
-  const ctx = { orderId: order.id };
+  const ctx = { orderId: order.id, sender: 'System' };
   const welcome = await sendWelcome(phone, order.customer_name, store?.company_name, ctx);
   const details = await sendOrderDetails(phone, order, store);
   return { welcome, details, templateFallback: true };
@@ -424,7 +422,9 @@ async function notifyOrderCreated(order, store) {
 module.exports = {
   sendTextMessage,
   sendTemplateMessage,
+  sendMediaMessage,
   sendTicketTemplate,
+  sendTicketStatusTemplate,
   sendOrderTemplate,
   sendWelcome,
   sendTicketDetails,
