@@ -3,7 +3,7 @@ const router = express.Router();
 const path = require('path');
 const fs = require('fs');
 const { query } = require('../config/database');
-const { generateInwardReceipt, generateInvoicePdf, generateOrderPdf } = require('../services/pdfGenerator');
+const { generateInwardReceipt, generateInvoicePdf, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 
@@ -147,7 +147,7 @@ router.get('/download/invoice/:invoiceId', async (req, res, next) => {
 router.post('/generate-order/:orderId', authenticate, async (req, res, next) => {
   try {
     const orderId = parseInt(req.params.orderId);
-    const pdf = await generateOrderPdf(orderId);
+    const pdf = await generateOrderPdfFromHTML(orderId);
 
     res.json({
       success: true,

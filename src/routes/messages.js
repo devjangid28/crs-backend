@@ -8,7 +8,7 @@ const {
   saveCustomerContact, updateMessageStatus,
 } = require('../services/messagingService');
 const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled } = require('../services/whatsappService');
-const { generateInwardReceiptFromHTML, generateOrderPdf } = require('../services/pdfGenerator');
+const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 const { simulateDelivery } = require('../services/simulationService');
@@ -249,7 +249,7 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       entityId = ticketId;
       entityType = 'inward';
     } else if (documentType === 'order' && orderId) {
-      pdf = await generateOrderPdf(orderId);
+      pdf = await generateOrderPdfFromHTML(orderId);
       entityId = orderId;
       entityType = 'order';
     } else {
