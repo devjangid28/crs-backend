@@ -31,6 +31,7 @@ async function createSystemMessage({
 async function createTextMessage({
   conversationId,
   ticketId,
+  orderId,
   customerId,
   sender = 'Staff',
   text = '',
@@ -41,9 +42,9 @@ async function createTextMessage({
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   const result = await query(
-    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, text, status, provider_message_id, phone, created_at)
-     VALUES ($1, $2, $3, $4, 'text', $5, $6, $7, $8, $9) RETURNING id`,
-    [conversationId, sender, customerId, ticketId, text, status, providerMessageId, phone, now]
+    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, text, status, provider_message_id, phone, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'text', $6, $7, $8, $9, $10) RETURNING id`,
+    [conversationId, sender, customerId, ticketId, orderId, text, status, providerMessageId, phone, now]
   );
 
   return result.rows[0];
@@ -52,6 +53,7 @@ async function createTextMessage({
 async function createTemplateMessage({
   conversationId,
   ticketId,
+  orderId,
   customerId,
   sender = 'System',
   templateName,
@@ -63,9 +65,9 @@ async function createTemplateMessage({
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   const result = await query(
-    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, template_name, text, status, provider_message_id, phone, created_at)
-     VALUES ($1, $2, $3, $4, 'template', $5, $6, $7, $8, $9, $10) RETURNING id`,
-    [conversationId, sender, customerId, ticketId, templateName, text, status, providerMessageId, phone, now]
+    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, template_name, text, status, provider_message_id, phone, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'template', $6, $7, $8, $9, $10, $11) RETURNING id`,
+    [conversationId, sender, customerId, ticketId, orderId, templateName, text, status, providerMessageId, phone, now]
   );
 
   return result.rows[0];
@@ -74,6 +76,7 @@ async function createTemplateMessage({
 async function createPdfMessage({
   conversationId,
   ticketId,
+  orderId,
   customerId,
   sender = 'Staff',
   fileName,
@@ -87,9 +90,9 @@ async function createPdfMessage({
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   const result = await query(
-    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, event, file_name, file_size, document_type, status, provider_message_id, phone, created_at)
-     VALUES ($1, $2, $3, $4, 'file', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-    [conversationId, sender, customerId, ticketId, event, fileName, fileSize, documentType, status, providerMessageId, phone, now]
+    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, event, file_name, file_size, document_type, status, provider_message_id, phone, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+    [conversationId, sender, customerId, ticketId, orderId, event, fileName, fileSize, documentType, status, providerMessageId, phone, now]
   );
 
   return result.rows[0];
@@ -98,6 +101,7 @@ async function createPdfMessage({
 async function createLinkMessage({
   conversationId,
   ticketId,
+  orderId,
   customerId,
   sender = 'Staff',
   linkType,
@@ -111,9 +115,9 @@ async function createLinkMessage({
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   const result = await query(
-    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, link_type, link_url, text, description, status, provider_message_id, phone, created_at)
-     VALUES ($1, $2, $3, $4, 'link', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-    [conversationId, sender, customerId, ticketId, linkType, linkUrl, text, description, status, providerMessageId, phone, now]
+    `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, link_type, link_url, text, description, status, provider_message_id, phone, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'link', $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+    [conversationId, sender, customerId, ticketId, orderId, linkType, linkUrl, text, description, status, providerMessageId, phone, now]
   );
 
   return result.rows[0];
@@ -262,16 +266,27 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
     searchJoin = `
     LEFT JOIN tickets t ON m.ticket_id = t.id
     LEFT JOIN customers c ON m.customer_id::text = c.id::text
+    LEFT JOIN orders o ON m.order_id = o.id
     `;
     whereClause += ` AND (
       m.conversation_id ILIKE $${params.length + 1}
       OR t.ticket_id ILIKE $${params.length + 1}
       OR t.customer_name ILIKE $${params.length + 1}
       OR t.customer_phone ILIKE $${params.length + 1}
+      OR o.order_number ILIKE $${params.length + 1}
+      OR o.customer_name ILIKE $${params.length + 1}
+      OR o.mobile_number ILIKE $${params.length + 1}
       OR c.name ILIKE $${params.length + 1}
       OR c.phone ILIKE $${params.length + 1}
     )`;
     params.push(`%${search}%`);
+  }
+
+  let typeFilterClause = '';
+  if (filter === 'tickets') {
+    typeFilterClause = ' AND m.ticket_id IS NOT NULL';
+  } else if (filter === 'orders') {
+    typeFilterClause = ' AND m.order_id IS NOT NULL';
   }
 
   const sql = `
@@ -279,6 +294,7 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
            m.conversation_id,
            m.customer_id,
            m.ticket_id,
+           m.order_id,
            m.phone,
            m.created_at as last_message_at,
            (SELECT text FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_text,
@@ -287,16 +303,32 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
            (SELECT COUNT(*) FROM messages WHERE conversation_id = m.conversation_id AND is_read = false AND sender = 'Customer') as unread_count,
            (SELECT t2.customer_name FROM tickets t2 WHERE t2.id = m.ticket_id::integer LIMIT 1) as ticket_customer_name,
            (SELECT t2.customer_phone FROM tickets t2 WHERE t2.id = m.ticket_id::integer LIMIT 1) as ticket_customer_phone,
+           (SELECT o2.customer_name FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_name,
+           (SELECT o2.mobile_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_phone,
+           (SELECT o2.order_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_number,
            (SELECT c2.name FROM customers c2 WHERE c2.id::text = m.customer_id::text LIMIT 1) as saved_customer_name,
            (SELECT c2.phone FROM customers c2 WHERE c2.id::text = m.customer_id::text LIMIT 1) as saved_customer_phone
     FROM messages m
     ${searchJoin}
-    ${whereClause}
+    ${whereClause}${typeFilterClause}
     ORDER BY m.conversation_id, m.created_at DESC
   `;
 
   const result = await query(sql, params);
   const conversations = result.rows;
+
+  // Add conversation_type to each conversation
+  conversations.forEach(c => {
+    if (c.order_id) {
+      c.conversation_type = 'order';
+    } else if (c.ticket_id) {
+      c.conversation_type = 'ticket';
+    } else if (c.conversation_id && c.conversation_id.startsWith('wa_')) {
+      c.conversation_type = 'whatsapp';
+    } else {
+      c.conversation_type = 'ticket';
+    }
+  });
 
   if (filter === 'customers') {
     return conversations.filter(c => c.conversation_id && !c.conversation_id.startsWith('wa_'));

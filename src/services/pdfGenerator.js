@@ -1,9 +1,13 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const puppeteer = require('puppeteer');
 const { query } = require('../config/database');
+const { generateInwardReceiptHtml } = require('./inwardPdfHtml');
+const { populateInwardTemplate } = require('./inwardTemplateService');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs');
+if (!fs.existsSync(PDF_DIR)) fs.mkdirSync(PDF_DIR, { recursive: true });
 
 function formatDate(d) {
   if (!d) return '';
@@ -23,8 +27,11 @@ async function generateInwardReceipt(ticketId) {
   const cRes = await query('SELECT * FROM store_settings LIMIT 1');
   const store = cRes.rows[0] || {};
 
+  const dir = path.join(PDF_DIR, 'inward');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
   const fileName = `Inward_Receipt_${t.ticket_id}.pdf`;
-  const filePath = path.join(PDF_DIR, 'inward', fileName);
+  const filePath = path.join(dir, fileName);
 
   const doc = new PDFDocument({ margin: 40, size: 'A4' });
   const stream = fs.createWriteStream(filePath);
@@ -42,11 +49,8 @@ async function generateInwardReceipt(ticketId) {
     y += 16;
   }
 
-  function sectionBody(px) {
-    px = px || 8;
-    const pad = px;
-    const top = y;
-    return { top, pad };
+  function sectionBody() {
+    return y;
   }
 
   function endSection(bodyTop, bodyPad, h) {
@@ -249,8 +253,11 @@ async function generateInvoicePdf(invoiceId) {
   const cRes = await query('SELECT * FROM store_settings LIMIT 1');
   const store = cRes.rows[0] || {};
 
+  const dir = path.join(PDF_DIR, 'invoices');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
   const fileName = `Invoice_${inv.invoice_id}.pdf`;
-  const filePath = path.join(PDF_DIR, 'invoices', fileName);
+  const filePath = path.join(dir, fileName);
 
   const doc = new PDFDocument({ margin: 50, size: 'A4' });
   const stream = fs.createWriteStream(filePath);
@@ -427,8 +434,11 @@ async function generateOrderPdf(orderId) {
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];
 
+  const dir = path.join(PDF_DIR, 'orders');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
   const fileName = `Order_Inward_${order.order_number}.pdf`;
-  const filePath = path.join(PDF_DIR, 'orders', fileName);
+  const filePath = path.join(dir, fileName);
 
   const doc = new PDFDocument({ margin: 40, size: 'A4' });
   const stream = fs.createWriteStream(filePath);
@@ -446,10 +456,8 @@ async function generateOrderPdf(orderId) {
     y += 16;
   }
 
-  function sectionBody(px) {
-    px = px || 8;
-    const top = y;
-    return { top };
+  function sectionBody() {
+    return y;
   }
 
   function endSection(bodyTop) {
@@ -631,4 +639,42 @@ async function generateOrderPdf(orderId) {
   });
 }
 
-module.exports = { generateInwardReceipt, generateInvoicePdf, generateOrderPdf };
+async function generateInwardReceiptFromHTML(ticketId) {
+  const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
+  if (tRes.rows.length === 0) throw new Error('Ticket not found');
+  const ticket = tRes.rows[0];
+
+  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
+  const store = cRes.rows[0] || {};
+
+  const dir = path.join(PDF_DIR, 'inward');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const fileName = `Inward_Receipt_${ticket.ticket_id}.pdf`;
+  const filePath = path.join(dir, fileName);
+
+  let html = populateInwardTemplate(ticket, store);
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.pdf({
+      path: filePath,
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '0', bottom: '0', left: '0', right: '0' },
+    });
+  } finally {
+    await browser.close();
+  }
+
+  const stats = fs.statSync(filePath);
+  return { filePath, fileName, fileSize: stats.size, receiptNumber: `RCPT-${ticket.ticket_id}` };
+}
+
+module.exports = { generateInwardReceipt, generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdf };

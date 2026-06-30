@@ -50,6 +50,7 @@ async function saveMessagesRecord(text, context, providerMessageId, messageType 
       await createTemplateMessage({
         conversationId: convId,
         ticketId: context.ticketId || null,
+        orderId: context.orderId || null,
         customerId: context.customerId || null,
         sender: context.sender || 'System',
         templateName: context.templateName || 'unknown',
@@ -62,6 +63,7 @@ async function saveMessagesRecord(text, context, providerMessageId, messageType 
       await createTextMessage({
         conversationId: convId,
         ticketId: context.ticketId || null,
+        orderId: context.orderId || null,
         customerId: context.customerId || null,
         sender: context.sender || 'System',
         text: text,
@@ -75,14 +77,15 @@ async function saveMessagesRecord(text, context, providerMessageId, messageType 
   }
 }
 
-async function logMessage(recipientPhone, messageBody, status, providerMessageId, errorMessage, ticketId, messageType) {
+async function logMessage(recipientPhone, messageBody, status, providerMessageId, errorMessage, ticketId, messageType, orderId) {
   try {
     await query(
       `INSERT INTO whatsapp_message_log
-       (ticket_id, message_type, recipient_phone, message_body, status, provider_message_id, error_message, sent_at, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+       (ticket_id, order_id, message_type, recipient_phone, message_body, status, provider_message_id, error_message, sent_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
       [
         ticketId || null,
+        orderId || null,
         messageType || 'text',
         recipientPhone,
         messageBody,
@@ -94,6 +97,89 @@ async function logMessage(recipientPhone, messageBody, status, providerMessageId
     );
   } catch (e) {
     wa.error('logMessage failed', e, { recipientPhone, status, ticketId });
+  }
+}
+
+const fs = require('fs');
+
+async function uploadMedia(filePath, mimeType = 'application/pdf') {
+  const baseUrl = getBaseUrl();
+  if (!baseUrl) {
+    return { success: false, error: 'Phone Number ID not configured' };
+  }
+
+  const url = `${baseUrl}/media`;
+  const token = config.whatsapp.accessToken;
+
+  if (!fs.existsSync(filePath)) {
+    return { success: false, error: 'File not found at: ' + filePath };
+  }
+
+  const stats = fs.statSync(filePath);
+  wa.info('uploadMedia: starting upload', {
+    filePath,
+    fileSize: stats.size,
+    mimeType,
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileName = filePath.split('\\').pop().split('/').pop();
+
+    const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+    let body = '';
+    body += `--${boundary}\r\n`;
+    body += `Content-Disposition: form-data; name="messaging_product"\r\n\r\n`;
+    body += `whatsapp\r\n`;
+    body += `--${boundary}\r\n`;
+    body += `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n`;
+    body += `Content-Type: ${mimeType}\r\n\r\n`;
+
+    const bodyBuffer = Buffer.concat([
+      Buffer.from(body, 'utf-8'),
+      fileBuffer,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8'),
+    ]);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      },
+      body: bodyBuffer,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (parseErr) {
+      return { success: false, error: `HTTP ${response.status}: Non-JSON response` };
+    }
+
+    if (!response.ok) {
+      const errorMessage = data?.error?.message || 'Unknown upload error';
+      wa.error('WhatsApp media upload error', {
+        status: response.status,
+        error: data?.error,
+        fullResponse: JSON.stringify(data).slice(0, 2000),
+      });
+      return { success: false, error: errorMessage, code: data?.error?.code };
+    }
+
+    const mediaId = data?.id;
+    wa.info('uploadMedia: success', { mediaId });
+    return { success: true, mediaId };
+  } catch (err) {
+    clearTimeout(timeout);
+    wa.error('uploadMedia: exception', err);
+    return { success: false, error: err.message };
   }
 }
 
@@ -178,12 +264,12 @@ async function sendTextMessage(to, text, context = {}, options = {}) {
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
-    await logMessage(phone, text, 'sent', result.messageId, null, context.ticketId, 'text');
+    await logMessage(phone, text, 'sent', result.messageId, null, context.ticketId, 'text', context.orderId);
     if (!options.skipSave) {
       await saveMessagesRecord(text, { ...context, phone }, result.messageId, 'text');
     }
   } else {
-    await logMessage(phone, text, 'failed', null, result.error, context.ticketId, 'text');
+    await logMessage(phone, text, 'failed', null, result.error, context.ticketId, 'text', context.orderId);
   }
 
   return result;
@@ -223,10 +309,10 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
-    await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template');
+    await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template', context.orderId);
     await saveMessagesRecord(displayText, { ...context, phone, templateName, sender: context.sender || 'System' }, result.messageId, 'template');
   } else {
-    await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template');
+    await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template', context.orderId);
   }
 
   return result;
@@ -257,9 +343,9 @@ async function sendMediaMessage(to, mediaUrl, mediaType, caption, context = {}) 
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
-    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'sent', result.messageId, null, context.ticketId, mediaType);
+    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'sent', result.messageId, null, context.ticketId, mediaType, context.orderId);
   } else {
-    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'failed', null, result.error, context.ticketId, mediaType);
+    await logMessage(phone, `[${mediaType}] ${caption || mediaUrl}`, 'failed', null, result.error, context.ticketId, mediaType, context.orderId);
   }
 
   return result;
@@ -388,10 +474,14 @@ async function notifyTicketCreated(ticket, store) {
 }
 
 async function sendOrderTemplate(order, store) {
+  const totalAmt = parseFloat(order.total_amount || 0);
+  const formattedPrice = `\u20B9${totalAmt.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+
   const params = [
     order.customer_name || 'Valued Customer',
     order.order_number || '',
     `${order.device_type || ''} ${order.brand || ''} ${order.model || ''}`.trim() || 'Device',
+    formattedPrice,
   ];
 
   if (!order.mobile_number) {
@@ -402,27 +492,85 @@ async function sendOrderTemplate(order, store) {
   return sendTemplateMessage(order.mobile_number, config.whatsapp.orderTemplateName, params, context);
 }
 
+async function sendDocumentFile(to, filePath, caption, context = {}) {
+  wa.info('sendDocumentFile called', { to, filePath, caption });
+
+  if (!isEnabled()) {
+    return { success: false, skipped: true };
+  }
+
+  const phone = formatPhone(to);
+  if (!phone) {
+    return { success: false, error: 'Invalid phone number' };
+  }
+
+  // Upload the file to WhatsApp servers first
+  const uploadResult = await uploadMedia(filePath, 'application/pdf');
+  if (!uploadResult.success) {
+    wa.error('sendDocumentFile: media upload failed', { error: uploadResult.error });
+    await logMessage(phone, `[document] upload failed: ${uploadResult.error}`, 'failed', null, uploadResult.error, context.ticketId, 'document', context.orderId);
+    return { success: false, error: 'Media upload failed: ' + uploadResult.error };
+  }
+
+  const mediaId = uploadResult.mediaId;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'document',
+    document: {
+      id: mediaId,
+      caption: caption || '',
+      filename: filePath.split('\\').pop().split('/').pop(),
+    },
+  };
+
+  const result = await callWhatsAppApi(payload);
+
+  if (result.success) {
+    await logMessage(phone, `[document] ${caption || filePath}`, 'sent', result.messageId, null, context.ticketId, 'document', context.orderId);
+  } else {
+    await logMessage(phone, `[document] ${caption || filePath}`, 'failed', null, result.error, context.ticketId, 'document', context.orderId);
+  }
+
+  return result;
+}
+
 async function notifyOrderCreated(order, store) {
   const phone = order.mobile_number;
   if (!phone) {
+    wa.error('notifyOrderCreated: no customer phone', { orderId: order.id, orderNumber: order.order_number });
     return { success: false, error: 'No customer phone' };
   }
 
   const templateResult = await sendOrderTemplate(order, store);
   if (templateResult.success) {
+    wa.info('order_created template sent successfully', { orderId: order.id, orderNumber: order.order_number, messageId: templateResult.messageId });
     return { template: templateResult };
   }
+
+  wa.error('order_created template send failed, falling back to text messages', {
+    orderId: order.id,
+    orderNumber: order.order_number,
+    error: templateResult.error,
+    code: templateResult.code,
+    type: templateResult.type,
+    details: templateResult.details,
+    fullResponse: templateResult,
+  });
 
   const ctx = { orderId: order.id, sender: 'System' };
   const welcome = await sendWelcome(phone, order.customer_name, store?.company_name, ctx);
   const details = await sendOrderDetails(phone, order, store);
-  return { welcome, details, templateFallback: true };
+  return { welcome, details, templateFallback: true, templateError: templateResult.error };
 }
 
 module.exports = {
   sendTextMessage,
   sendTemplateMessage,
   sendMediaMessage,
+  uploadMedia,
+  sendDocumentFile,
   sendTicketTemplate,
   sendTicketStatusTemplate,
   sendOrderTemplate,

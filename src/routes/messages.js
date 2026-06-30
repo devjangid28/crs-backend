@@ -7,7 +7,8 @@ const {
   markConversationRead, getConversationsWithDetails,
   saveCustomerContact, updateMessageStatus,
 } = require('../services/messagingService');
-const { sendTextMessage, isEnabled } = require('../services/whatsappService');
+const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled } = require('../services/whatsappService');
+const { generateInwardReceiptFromHTML, generateOrderPdf } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 const { simulateDelivery } = require('../services/simulationService');
@@ -208,6 +209,157 @@ router.post('/pdf', authenticate, async (req, res, next) => {
     res.status(201).json({
       success: true,
       data: msgResult.rows[0],
+      waError: waError || undefined,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /api/messages/send-document - Generate PDF and send via WhatsApp Document API
+router.post('/send-document', authenticate, async (req, res, next) => {
+  try {
+    const { documentType, ticketId, orderId, customerId, phone } = req.body;
+    if (!documentType || (!ticketId && !orderId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'documentType and either ticketId or orderId are required'
+      });
+    }
+
+    // Resolve phone if needed
+    let resolvedPhone = phone;
+    if (!resolvedPhone && ticketId) {
+      const tRes = await query('SELECT customer_phone FROM tickets WHERE id = $1', [ticketId]);
+      if (tRes.rows.length > 0) resolvedPhone = tRes.rows[0].customer_phone;
+    }
+    if (!resolvedPhone && orderId) {
+      const oRes = await query('SELECT mobile_number FROM orders WHERE id = $1', [orderId]);
+      if (oRes.rows.length > 0) resolvedPhone = oRes.rows[0].mobile_number;
+    }
+
+    if (!resolvedPhone && isEnabled()) {
+      return res.status(400).json({ success: false, message: 'Customer phone is required to send document' });
+    }
+
+    // Generate PDF
+    let pdf;
+    let entityId;
+    let entityType;
+    if (documentType === 'inward' && ticketId) {
+      pdf = await generateInwardReceiptFromHTML(ticketId);
+      entityId = ticketId;
+      entityType = 'inward';
+    } else if (documentType === 'order' && orderId) {
+      pdf = await generateOrderPdf(orderId);
+      entityId = orderId;
+      entityType = 'order';
+    } else {
+      return res.status(400).json({ success: false, message: 'Invalid documentType/id combination' });
+    }
+
+    // Construct public URL for the PDF
+    const baseUrl = process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 5000}`;
+    let publicUrl;
+    if (entityType === 'inward') {
+      publicUrl = `${baseUrl}/api/pdf/download/inward/${entityId}`;
+    } else {
+      publicUrl = `${baseUrl}/api/pdf/download/order/${entityId}`;
+    }
+
+    // Build conversation ID (match same pattern used by message log for consistency)
+    let convId;
+    if (ticketId) {
+      const conv = await getOrCreateConversation(ticketId, customerId, resolvedPhone);
+      if (conv) convId = conv.conversationId;
+    }
+    if (!convId && orderId) {
+      convId = String(orderId);
+    }
+    if (!convId) {
+      convId = `CONV-${Date.now()}`;
+    }
+
+    // Send via WhatsApp Document API
+    let providerMessageId = null;
+    let waError = null;
+    if (isEnabled() && resolvedPhone) {
+      try {
+        const caption = documentType === 'inward'
+          ? `*Inward Receipt*\nYour service receipt is attached.`
+          : `*Order Form*\nYour order details are attached.`;
+        const waResult = await sendDocumentFile(resolvedPhone, pdf.filePath, caption, {
+          conversationId: convId,
+          ticketId: ticketId || null,
+          orderId: orderId || null,
+          customerId: customerId || null,
+        });
+        if (waResult.success) {
+          providerMessageId = waResult.messageId || null;
+        } else if (!waResult.skipped) {
+          waError = waResult.error || 'WhatsApp API returned unsuccessful';
+          console.error('WhatsApp document send failed:', waError, JSON.stringify(waResult));
+        }
+      } catch (waErr) {
+        waError = waErr.message;
+        console.error('WhatsApp document send exception:', waErr.message);
+      }
+    }
+
+    // Record the document send in the messages table so it appears in the chat
+    const msgStatus = providerMessageId ? 'sent' : (isEnabled() ? 'failed' : 'sending');
+    const msg = await createPdfMessage({
+      conversationId: convId,
+      ticketId: ticketId || null,
+      orderId: orderId || null,
+      customerId: customerId || null,
+      sender: req.user?.full_name || 'Staff',
+      fileName: pdf.fileName,
+      fileSize: String(pdf.fileSize || ''),
+      documentType: documentType === 'inward' ? 'Inward Receipt' : 'Order Form',
+      event: documentType === 'inward' ? 'inward_receipt' : 'order_form',
+      providerMessageId,
+      phone: resolvedPhone,
+      status: msgStatus,
+    });
+
+    // Simulation for dev mode (no WhatsApp)
+    if (!isEnabled() && msg) {
+      query('UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2', ['delivered', msg.id]).catch(e => console.error('Simulation status update failed:', e.message));
+      setImmediate(() => {
+        simulateDelivery({
+          conversationId: convId,
+          ticketId: ticketId || null,
+          customerId: customerId || null,
+          itemType: 'PDF',
+          itemName: `${documentType}: ${pdf.fileName}`,
+          performedBy: req.user?.full_name || 'Staff',
+        }).catch(e => console.error('Simulation event failed:', e.message));
+      });
+    }
+
+    // Log audit
+    await logAudit({
+      action: actions.MESSAGE_SENT,
+      ticketId: ticketId || null,
+      entityType: 'document',
+      entityId: pdf.fileName || 'unknown',
+      performedBy: req.user?.full_name || 'Staff',
+      details: {
+        documentType,
+        fileName: pdf.fileName,
+        fileSize: pdf.fileSize,
+        sent: !!providerMessageId,
+        waError: waError || null,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        fileName: pdf.fileName,
+        fileSize: pdf.fileSize,
+        downloadUrl: publicUrl,
+        providerMessageId,
+      },
       waError: waError || undefined,
     });
   } catch (err) { next(err); }

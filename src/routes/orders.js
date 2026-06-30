@@ -210,9 +210,12 @@ router.post('/', async (req, res, next) => {
       try {
         const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
         const store = storeRes.rows[0] || {};
-        await notifyOrderCreated(newOrder.rows[0], store);
+        const result = await notifyOrderCreated(newOrder.rows[0], store);
+        if (!result?.template?.success) {
+          console.error('WhatsApp order_created template failed:', JSON.stringify({ error: result?.templateError, fallback: result?.templateFallback }));
+        }
       } catch (e) {
-        console.error('WhatsApp notification failed:', e.message);
+        console.error('WhatsApp notification error:', e.stack || e.message);
       }
     });
 
