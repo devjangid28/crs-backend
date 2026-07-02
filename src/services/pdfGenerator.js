@@ -182,7 +182,7 @@ async function generateInwardReceipt(ticketId) {
 
   // ── DEVICE CONDITION ──
   const condBodyTop = y;
-  const estCost = parseFloat(t.estimated_cost || t.estimatedCost || 0);
+  const estCost = parseFloat(t.estimated_price || t.estimatedPrice || t.estimated_cost || t.estimatedCost || 0);
   doc.rect(ml, y, pw, 20).stroke('#D9D9D9');
   doc.fontSize(6.5).font('Helvetica-Bold').fillColor('#888');
   doc.text('BODY DAMAGE', ml + 8, y + 3, { width: pw / 3 - 12 });

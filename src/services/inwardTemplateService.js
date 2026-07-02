@@ -155,7 +155,7 @@ function populateInwardTemplate(ticket, settings) {
     `$1${ticket.data_backup || 'NO'}`
   );
 
-  const estCost = parseFloat(ticket.estimated_cost || ticket.estimatedCost || 0);
+  const estCost = parseFloat(ticket.estimated_price || ticket.estimatedPrice || ticket.estimated_cost || ticket.estimatedCost || 0);
   html = html.replace(
     /(ESTIMATE PRICE\s*:<\/span>)/,
     `$1${estCost > 0 ? ' \u20B9' + estCost.toFixed(2) : ''}`

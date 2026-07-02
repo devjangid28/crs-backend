@@ -5,7 +5,7 @@ function fmt(d) {
 }
 
 function generateInwardReceiptHtml(ticket, settings) {
-  const estCost = parseFloat(ticket.estimated_cost || ticket.estimatedCost || 0);
+  const estCost = parseFloat(ticket.estimated_price || ticket.estimatedPrice || ticket.estimated_cost || ticket.estimatedCost || 0);
   const address = ticket.customer_address || ticket.service_address || '';
   const city = ticket.city || '';
   const pincode = ticket.pincode || '';
