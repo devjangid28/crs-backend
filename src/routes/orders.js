@@ -1,7 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
-const { notifyOrderCreated, getConversationIdFromPhone } = require('../services/whatsappService');
+const { notifyOrderCreated, sendDocumentFile, getConversationIdFromPhone } = require('../services/whatsappService');
+const { generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { createPdfMessage } = require('../services/messagingService');
 
 async function getStoreInfo(storeId) {
   if (storeId) {
@@ -245,6 +247,36 @@ router.post('/', async (req, res, next) => {
         }
       } catch (e) {
         console.error('WhatsApp notification error:', e.stack || e.message);
+      }
+    });
+
+    // Auto-send orderform PDF after 30 seconds (fire-and-forget)
+    setImmediate(async () => {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 30000));
+        const orderData = newOrder.rows[0];
+        const phone = orderData.mobile_number;
+        const custConvId = getConversationIdFromPhone(phone);
+        const pdf = await generateOrderPdfFromHTML(orderId);
+        await createPdfMessage({
+          conversationId: custConvId,
+          orderId: orderId,
+          sender: 'System',
+          fileName: pdf.fileName,
+          fileSize: pdf.fileSize,
+          documentType: 'order_form',
+          event: 'Order form generated',
+          phone: phone,
+        });
+        if (phone && pdf.filePath) {
+          sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
+            orderId: orderId,
+            conversationId: custConvId,
+            sender: 'System',
+          }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+        }
+      } catch (e) {
+        console.error('Auto-generate order form failed:', e.message);
       }
     });
 

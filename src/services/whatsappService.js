@@ -19,17 +19,16 @@ function formatPhone(phone) {
     wa.warn('formatPhone: empty input', { input: phone });
     return null;
   }
-  const original = phone;
-  let cleaned = phone.replace(/[\s\-\+\(\)]/g, '');
+  let cleaned = phone.replace(/[\s\-\+\(\)]/g, '').replace(/^0+/, '');
+  if (!cleaned) return null;
 
-  if (cleaned.startsWith('00')) cleaned = cleaned.slice(2);
-  if (cleaned.startsWith('91') && cleaned.length > 10) {
+  if (cleaned.length === 12 && cleaned.startsWith('91')) {
     return cleaned;
   }
-  if (cleaned.startsWith('0')) cleaned = cleaned.slice(1);
   if (cleaned.length === 10) {
     return '91' + cleaned;
   }
+  wa.warn('formatPhone: unexpected length', { input: phone, cleaned, len: cleaned.length });
   return null;
 }
 
@@ -38,7 +37,11 @@ function normalizePhone(phone) {
   let cleaned = phone.replace(/[^\d]/g, '').replace(/^0+/, '');
   if (!cleaned) return null;
   if (cleaned.length === 10) cleaned = '91' + cleaned;
-  return cleaned;
+  if (cleaned.length === 12 && cleaned.startsWith('91')) {
+    return cleaned;
+  }
+  wa.warn('normalizePhone: unexpected format', { input: phone, cleaned, len: cleaned.length });
+  return null;
 }
 
 function getConversationIdFromPhone(phone) {
@@ -249,6 +252,7 @@ async function callWhatsAppApi(payload) {
     }
 
     const msgId = data?.messages?.[0]?.id;
+    wa.info('callWhatsAppApi: success', { messageId: msgId, to: payload.to, type: payload.type });
     return { success: true, messageId: msgId, data };
   } catch (err) {
     clearTimeout(timeout);
@@ -281,11 +285,13 @@ async function sendTextMessage(to, text, context = {}, options = {}) {
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
+    wa.info('sendTextMessage: success', { to: phone, messageId: result.messageId });
     await logMessage(phone, text, 'sent', result.messageId, null, context.ticketId, 'text', context.orderId);
     if (!options.skipSave) {
       await saveMessagesRecord(text, { ...context, phone }, result.messageId, 'text');
     }
   } else {
+    wa.error('sendTextMessage: failed', { to: phone, error: result.error, code: result.code });
     await logMessage(phone, text, 'failed', null, result.error, context.ticketId, 'text', context.orderId);
   }
 
@@ -326,9 +332,11 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
+    wa.info('sendTemplateMessage: success', { to: phone, templateName, messageId: result.messageId });
     await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template', context.orderId);
     await saveMessagesRecord(displayText, { ...context, phone, templateName, sender: context.sender || 'System' }, result.messageId, 'template');
   } else {
+    wa.error('sendTemplateMessage: failed', { to: phone, templateName, error: result.error, code: result.code });
     await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template', context.orderId);
   }
 
@@ -369,16 +377,13 @@ async function sendMediaMessage(to, mediaUrl, mediaType, caption, context = {}) 
 }
 
 async function sendTicketTemplate(ticket, store) {
-  const estimatedPrice = ticket.estimated_price || '0';
-  const formattedPrice = typeof estimatedPrice === 'number'
-    ? `\u20B9${estimatedPrice.toLocaleString('en-IN')}`
-    : `\u20B9${parseFloat(estimatedPrice).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-
+  const estPrice = parseFloat(ticket.estimated_price ?? ticket.estimatedPrice ?? ticket.estimated_cost ?? ticket.estimatedCost);
+  const priceDisplay = (estPrice > 0) ? estPrice.toFixed(2) : 'N/A';
   const params = [
     ticket.customer_name || 'Valued Customer',
     ticket.ticket_id || '',
     `${ticket.device_type || ''} ${ticket.brand || ''} ${ticket.model || ''}`.trim() || 'Device',
-    formattedPrice,
+    priceDisplay,
   ];
 
   if (!ticket.customer_phone) {
@@ -546,8 +551,10 @@ async function sendDocumentFile(to, filePath, caption, context = {}) {
   const result = await callWhatsAppApi(payload);
 
   if (result.success) {
+    wa.info('sendDocumentFile: sent successfully', { to: phone, caption, messageId: result.messageId, ticketId: context.ticketId });
     await logMessage(phone, `[document] ${caption || filePath}`, 'sent', result.messageId, null, context.ticketId, 'document', context.orderId);
   } else {
+    wa.error('sendDocumentFile: failed', { to: phone, caption, error: result.error, code: result.code, ticketId: context.ticketId });
     await logMessage(phone, `[document] ${caption || filePath}`, 'failed', null, result.error, context.ticketId, 'document', context.orderId);
   }
 

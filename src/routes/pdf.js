@@ -4,10 +4,28 @@ const path = require('path');
 const fs = require('fs');
 const { query } = require('../config/database');
 const { generateInwardReceipt, generateInvoicePdf, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { populateOrderTemplate } = require('../services/orderTemplateService');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs');
+
+async function getStoreData(storeId) {
+  let store;
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) store = sRes.rows[0];
+  }
+  if (!store) {
+    const defRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+    if (defRes.rows.length > 0) store = defRes.rows[0];
+  }
+  if (!store) {
+    const cRes = await query('SELECT * FROM store_settings LIMIT 1');
+    store = cRes.rows[0] || {};
+  }
+  return store;
+}
 
 // POST /api/pdf/generate-inward/:ticketId - Generate inward receipt PDF
 router.post('/generate-inward/:ticketId', authenticate, async (req, res, next) => {
@@ -177,6 +195,36 @@ router.get('/download/order/:orderId', async (req, res, next) => {
     }
 
     res.download(filePath, fileName);
+  } catch (err) { next(err); }
+});
+
+// GET /api/pdf/orderform-html/:orderId - Get populated orderform.html for browser printing
+router.get('/orderform-html/:orderId', async (req, res, next) => {
+  try {
+    const orderId = parseInt(req.params.orderId);
+    const oRes = await query(
+      `SELECT o.*, COALESCE(json_agg(json_build_object(
+        'id', oc.id, 'component_name', oc.component_name,
+        'description', oc.description, 'warranty', oc.warranty,
+        'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
+        'remarks', oc.remarks, 'status', oc.status
+      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+      FROM orders o
+      LEFT JOIN order_components oc ON oc.order_id = o.id
+      WHERE o.id = $1
+      GROUP BY o.id`,
+      [orderId]
+    );
+    if (oRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Order not found' });
+    const order = oRes.rows[0];
+
+    const store = await getStoreData(order.store_id);
+
+    const components = order.components || [];
+    const html = populateOrderTemplate(order, components, store);
+
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
   } catch (err) { next(err); }
 });
 

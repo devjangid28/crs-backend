@@ -93,25 +93,26 @@ router.post('/', async (req, res, next) => {
     invoice.items = items || [];
 
     // Auto-generate Invoice PDF and send as message (fire-and-forget)
-    if (ticketId) {
-      setImmediate(async () => {
-        try {
-          const pdf = await generateInvoicePdf(insertId);
-          await createPdfMessage({
-            conversationId: String(ticketId),
-            ticketId,
-            customerId: null,
-            sender: 'System',
-            fileName: pdf.fileName,
-            fileSize: pdf.fileSize,
-            documentType: 'invoice',
-            event: 'Invoice generated',
-          });
-        } catch (e) {
-          console.error('Auto-generate invoice PDF failed:', e.message);
-        }
-      });
-    }
+    // DISABLED: Invoice PDF and WhatsApp message generation removed to prevent automatic invoice sending.
+    // if (ticketId) {
+    //   setImmediate(async () => {
+    //     try {
+    //       const pdf = await generateInvoicePdf(insertId);
+    //       await createPdfMessage({
+    //         conversationId: String(ticketId),
+    //         ticketId,
+    //         customerId: null,
+    //         sender: 'System',
+    //         fileName: pdf.fileName,
+    //         fileSize: pdf.fileSize,
+    //         documentType: 'invoice',
+    //         event: 'Invoice generated',
+    //       });
+    //     } catch (e) {
+    //       console.error('Auto-generate invoice PDF failed:', e.message);
+    //     }
+    //   });
+    // }
 
     res.status(201).json({ success: true, message: 'Invoice created successfully', data: invoice });
   } catch (err) {

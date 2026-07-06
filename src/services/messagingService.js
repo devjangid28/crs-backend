@@ -141,7 +141,10 @@ function normalizePhone(phone) {
   let cleaned = phone.replace(/[^\d]/g, '').replace(/^0+/, '');
   if (!cleaned) return null;
   if (cleaned.length === 10) cleaned = '91' + cleaned;
-  return cleaned;
+  if (cleaned.length === 12 && cleaned.startsWith('91')) {
+    return cleaned;
+  }
+  return null;
 }
 
 async function getCustomerPhone(phone) {

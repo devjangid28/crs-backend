@@ -15,9 +15,9 @@ async function getStoreInfo(storeId) {
 const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGenerator');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { validateTicket } = require('../middleware/validation');
-const { generateInwardReceipt } = require('../services/pdfGenerator');
+const { generateInwardReceiptFromHTML } = require('../services/pdfGenerator');
 const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
-const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
+const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendDocumentFile, getConversationIdFromPhone } = require('../services/whatsappService');
 
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
@@ -186,22 +186,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       } catch (e) {
         console.error('Auto-create conversation failed:', e.message);
       }
-      try {
-        const pdf = await generateInwardReceipt(insertId);
-        await createPdfMessage({
-          conversationId: custConvId,
-          ticketId: insertId,
-          customerId: customerId || null,
-          sender: 'System',
-          fileName: pdf.fileName,
-          fileSize: pdf.fileSize,
-          documentType: 'inward_receipt',
-          event: 'Receipt generated',
-          phone: phone,
-        });
-      } catch (e) {
-        console.error('Auto-generate inward receipt failed:', e.message);
-      }
+      // Send template message first
       try {
         const store = await getStoreInfo(newTicket.rows[0]?.store_id);
         const waResult = await notifyTicketCreated(newTicket.rows[0], store);
@@ -217,6 +202,32 @@ router.post('/', validateTicket, async (req, res, next) => {
         }
       } catch (e) {
         console.error('WhatsApp notification failed:', e.message);
+      }
+      // Wait 30 seconds before sending the PDF receipt
+      try {
+        await new Promise(resolve => setTimeout(resolve, 30000));
+        const pdf = await generateInwardReceiptFromHTML(insertId);
+        await createPdfMessage({
+          conversationId: custConvId,
+          ticketId: insertId,
+          customerId: customerId || null,
+          sender: 'System',
+          fileName: pdf.fileName,
+          fileSize: pdf.fileSize,
+          documentType: 'inward_receipt',
+          event: 'Receipt generated',
+          phone: phone,
+        });
+        // Auto-send the PDF document via WhatsApp
+        if (phone && pdf.filePath) {
+          sendDocumentFile(phone, pdf.filePath, `Inward Receipt - ${pdf.receiptNumber || ''}`, {
+            ticketId: insertId,
+            conversationId: custConvId,
+            sender: 'System',
+          }).catch(e => console.error('Auto-send inward receipt PDF failed:', e.message));
+        }
+      } catch (e) {
+        console.error('Auto-generate inward receipt failed:', e.message);
       }
     });
 

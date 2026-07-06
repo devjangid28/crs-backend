@@ -120,16 +120,6 @@ function populateOrderTemplate(order, components, settings) {
     /(<div[^>]*id="serialNumber"[^>]*>)[^<]*(<\/div>)/,
     '$1' + (order.serial_number || '') + '$2'
   );
-  html = html.replace(
-    /(<div[^>]*id="serviceType"[^>]*>)[^<]*(<\/div>)/,
-    '$1Repair' + '$2'
-  );
-
-  // ── PROBLEM DETAILS ──
-  html = html.replace(
-    /(<div[^>]*id="customerComplaint"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + (order.problem_description || order.order_note || '') + '$2'
-  );
 
   // ── COMPONENTS TABLE ──
   if (components && components.length > 0) {
