@@ -63,9 +63,10 @@ router.post('/webhook', async (req, res) => {
               profileName,
             });
 
-            // Emit socket event for real-time update
+            // Emit socket event for real-time update (room + global)
             if (io) {
               const newMsg = await query('SELECT * FROM messages WHERE id = $1', [result.id]);
+              io.to('conv:' + result.convId).emit('new_message', { message: newMsg.rows[0], conversationId: result.convId });
               io.emit('new_message', { message: newMsg.rows[0], conversationId: result.convId });
             }
           } catch (dbErr) {
@@ -80,35 +81,56 @@ router.post('/webhook', async (req, res) => {
           statusesProcessed++;
           wa.info('webhook: status update', { messageId: status.id, status: status.status, recipientId: status.recipient_id });
 
-          try {
-            // Try to update by provider_message_id first
-            let updateResult = await query(
-              `UPDATE messages SET status = $1 WHERE provider_message_id = $2 RETURNING conversation_id`,
-              [status.status, status.id]
-            );
+            try {
+              // Extract error details from Meta status callback
+              const errors = status.errors || [];
+              const errorMessage = errors.length > 0 ? errors.map(e => e.title || e.message || JSON.stringify(e)).join('; ') : null;
+              const waStatus = status.status;
 
-            if (updateResult.rowCount === 0) {
-              // Fallback: try matching by conversation_id with recipient_id
-              updateResult = await query(
-                `UPDATE messages SET status = $1
-                 WHERE conversation_id LIKE $2
-                 ORDER BY created_at DESC LIMIT 1
-                 RETURNING conversation_id`,
-                [status.status, `%${status.recipient_id}%`]
-              );
-            }
+              // For failed status, also log the error
+              let updateResult;
+              if (waStatus === 'failed' && errorMessage) {
+                updateResult = await query(
+                  `UPDATE messages SET status = $1, error_message = $2 WHERE provider_message_id = $3 RETURNING conversation_id`,
+                  [waStatus, errorMessage, status.id]
+                );
+              } else {
+                updateResult = await query(
+                  `UPDATE messages SET status = $1 WHERE provider_message_id = $2 RETURNING conversation_id`,
+                  [waStatus, status.id]
+                );
+              }
 
-            if (updateResult.rowCount > 0 && io) {
-              const convId = updateResult.rows[0].conversation_id;
-              io.emit('message_status', {
-                conversationId: convId,
-                providerMessageId: status.id,
-                status: status.status,
-              });
+              if (updateResult.rowCount === 0) {
+                // Fallback: match by recipient_id in conversation_id
+                const recipientClean = status.recipient_id ? status.recipient_id.replace(/[^\d]/g, '') : '';
+                const convIdPattern = '%' + recipientClean + '%';
+                updateResult = await query(
+                  `UPDATE messages SET status = $1
+                   WHERE id = (
+                     SELECT id FROM messages
+                     WHERE conversation_id LIKE $2
+                     ORDER BY created_at DESC LIMIT 1
+                   )
+                   RETURNING conversation_id`,
+                  [waStatus, convIdPattern]
+                );
+              }
+
+              if (updateResult.rowCount > 0 && io) {
+                const convId = updateResult.rows[0].conversation_id;
+                const payload = {
+                  conversationId: convId,
+                  providerMessageId: status.id,
+                  status: waStatus,
+                  error: errorMessage || undefined,
+                };
+                io.to('conv:' + convId).emit('message_status', payload);
+                io.emit('message_status', payload);
+              }
+            } catch (updateErr) {
+              wa.error('webhook: status UPDATE failed', updateErr, { status: status.status });
             }
-          } catch (updateErr) {
-            wa.error('webhook: status UPDATE failed', updateErr, { status: status.status });
-          }
         }
       }
     }

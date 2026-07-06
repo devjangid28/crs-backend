@@ -7,7 +7,7 @@ const {
   markConversationRead, getConversationsWithDetails,
   saveCustomerContact, updateMessageStatus,
 } = require('../services/messagingService');
-const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled } = require('../services/whatsappService');
+const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
@@ -54,7 +54,7 @@ router.post('/', authenticate, async (req, res, next) => {
     let { conversationId, ticketId, customerId, sender, text, phone } = req.body;
     phone = await resolvePhone(phone, ticketId);
 
-    let convId = conversationId;
+    let convId = conversationId || getConversationIdFromPhone(phone);
     if (!convId && ticketId) {
       const conv = await getOrCreateConversation(ticketId, customerId, phone);
       if (conv) convId = conv.conversationId;
@@ -74,6 +74,8 @@ router.post('/', authenticate, async (req, res, next) => {
           providerMessageId = waResult.messageId;
         } else {
           waError = waResult.error || 'WhatsApp API returned unsuccessful';
+          waError += waResult.details ? ' | Details: ' + JSON.stringify(waResult.details) : '';
+          waError += waResult.code ? ' | Code: ' + waResult.code : '';
           console.error('WhatsApp send failed:', waError, JSON.stringify(waResult));
         }
       } catch (waErr) {
@@ -83,8 +85,9 @@ router.post('/', authenticate, async (req, res, next) => {
     }
 
     const status = providerMessageId ? 'sent' : (isEnabled() ? 'failed' : 'sending');
+    const finalConvId = convId || getConversationIdFromPhone(phone) || `CONV-${Date.now()}`;
     const msg = await createTextMessage({
-      conversationId: convId || `CONV-${Date.now()}`,
+      conversationId: finalConvId,
       ticketId: ticketId || null,
       customerId: customerId || null,
       sender: sender || req.user?.full_name || 'Staff',
@@ -95,6 +98,21 @@ router.post('/', authenticate, async (req, res, next) => {
     });
 
     const msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
+
+    const io = req.app?.get('io') || req.io;
+
+    // Emit message_status for failures so frontend can show error
+    if (io && waError) {
+      const failPayload = { conversationId: finalConvId, providerMessageId, status: 'failed', error: waError, messageId: msg.id };
+      io.to('conv:' + finalConvId).emit('message_status', failPayload);
+      io.emit('message_status', failPayload);
+    }
+
+    // Emit socket event for real-time updates (room + global)
+    if (io) {
+      io.to('conv:' + finalConvId).emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId, waError: waError || undefined });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId, waError: waError || undefined });
+    }
 
     await logAudit({
       action: actions.MESSAGE_SENT,
@@ -109,7 +127,7 @@ router.post('/', authenticate, async (req, res, next) => {
       query('UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2', ['delivered', msg.id]).catch(e => console.error('Simulation status update failed:', e.message));
       setImmediate(() => {
         simulateDelivery({
-          conversationId: convId || `CONV-${Date.now()}`,
+          conversationId: finalConvId,
           ticketId: ticketId || null,
           customerId: customerId || null,
           itemType: 'Text Message',
@@ -149,7 +167,7 @@ router.post('/pdf', authenticate, async (req, res, next) => {
     let { conversationId, ticketId, customerId, sender, fileName, fileSize, documentType, event, phone } = req.body;
     phone = await resolvePhone(phone, ticketId);
 
-    let convId = conversationId;
+    let convId = conversationId || getConversationIdFromPhone(phone);
     if (!convId && ticketId) {
       const conv = await getOrCreateConversation(ticketId, customerId, phone);
       if (conv) convId = conv.conversationId;
@@ -174,9 +192,10 @@ router.post('/pdf', authenticate, async (req, res, next) => {
       }
     }
 
+    const finalConvId = convId || getConversationIdFromPhone(phone) || `CONV-${Date.now()}`;
     const msgStatus = pdfProviderMessageId ? 'sent' : (isEnabled() ? 'failed' : 'sending');
     const msg = await createPdfMessage({
-      conversationId: convId || `CONV-${Date.now()}`,
+      conversationId: finalConvId,
       ticketId: ticketId || null,
       customerId: customerId || null,
       sender: sender || 'Staff',
@@ -191,12 +210,19 @@ router.post('/pdf', authenticate, async (req, res, next) => {
 
     const msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
 
+    // Emit socket event for real-time updates (room + global)
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.to('conv:' + finalConvId).emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId });
+    }
+
     // Simulation: mark as delivered + create simulated event
     if (!isEnabled()) {
       query('UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2', ['delivered', msg.id]).catch(e => console.error('Simulation status update failed:', e.message));
       setImmediate(() => {
         simulateDelivery({
-          conversationId: convId || `CONV-${Date.now()}`,
+          conversationId: finalConvId,
           ticketId: ticketId || null,
           customerId: customerId || null,
           itemType: 'PDF',
@@ -265,17 +291,14 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       publicUrl = `${baseUrl}/api/pdf/download/order/${entityId}`;
     }
 
-    // Build conversation ID (match same pattern used by message log for consistency)
-    let convId;
-    if (ticketId) {
+    // Build conversation ID using phone-based format for consistency
+    let convId = getConversationIdFromPhone(resolvedPhone);
+    if (!convId && ticketId) {
       const conv = await getOrCreateConversation(ticketId, customerId, resolvedPhone);
       if (conv) convId = conv.conversationId;
     }
-    if (!convId && orderId) {
-      convId = String(orderId);
-    }
     if (!convId) {
-      convId = `CONV-${Date.now()}`;
+      convId = getConversationIdFromPhone(resolvedPhone) || `CONV-${Date.now()}`;
     }
 
     // Send via WhatsApp Document API
@@ -320,6 +343,14 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       phone: resolvedPhone,
       status: msgStatus,
     });
+
+    // Emit socket event for real-time updates (room + global)
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      const msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
+      io.to('conv:' + convId).emit('new_message', { message: msgResult.rows[0], conversationId: convId });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: convId });
+    }
 
     // Simulation for dev mode (no WhatsApp)
     if (!isEnabled() && msg) {
@@ -371,7 +402,7 @@ router.post('/link', authenticate, async (req, res, next) => {
     let { conversationId, ticketId, customerId, sender, linkType, linkUrl, text, description, phone } = req.body;
     phone = await resolvePhone(phone, ticketId);
 
-    let convId = conversationId;
+    let convId = conversationId || getConversationIdFromPhone(phone);
     if (!convId && ticketId) {
       const conv = await getOrCreateConversation(ticketId, customerId, phone);
       if (conv) convId = conv.conversationId;
@@ -396,9 +427,10 @@ router.post('/link', authenticate, async (req, res, next) => {
       }
     }
 
+    const finalConvId = convId || getConversationIdFromPhone(phone) || `CONV-${Date.now()}`;
     const msgStatus = linkProviderMessageId ? 'sent' : (isEnabled() ? 'failed' : 'sending');
     const msg = await createLinkMessage({
-      conversationId: convId || `CONV-${Date.now()}`,
+      conversationId: finalConvId,
       ticketId: ticketId || null,
       customerId: customerId || null,
       sender: sender || 'Staff',
@@ -413,12 +445,19 @@ router.post('/link', authenticate, async (req, res, next) => {
 
     const msgResult = await query('SELECT * FROM messages WHERE id = $1', [msg.id]);
 
+    // Emit socket event for real-time updates (room + global)
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.to('conv:' + finalConvId).emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId });
+    }
+
     // Simulation: mark as delivered + create simulated event
     if (!isEnabled()) {
       query('UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2', ['delivered', msg.id]).catch(e => console.error('Simulation status update failed:', e.message));
       setImmediate(() => {
         simulateDelivery({
-          conversationId: convId || `CONV-${Date.now()}`,
+          conversationId: finalConvId,
           ticketId: ticketId || null,
           customerId: customerId || null,
           itemType: 'Link',
@@ -444,6 +483,12 @@ router.post('/read', authenticate, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'conversationId is required' });
     }
     const count = await markConversationRead(conversationId);
+    // Emit socket event to update unread counts (room + global)
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.to('conv:' + conversationId).emit('conversation_read', { conversationId, markedRead: count });
+      io.emit('conversation_read', { conversationId, markedRead: count });
+    }
     res.json({ success: true, data: { markedRead: count } });
   } catch (err) { next(err); }
 });
@@ -477,7 +522,7 @@ router.post('/upload', authenticate, async (req, res, next) => {
 
     const stats = fs.statSync(filePath);
 
-    let convId = conversationId;
+    let convId = conversationId || getConversationIdFromPhone(phone);
     if (!convId && ticketId) {
       const conv = await getOrCreateConversation(ticketId, customerId, phone);
       if (conv) convId = conv.conversationId;
@@ -495,6 +540,13 @@ router.post('/upload', authenticate, async (req, res, next) => {
     );
 
     const msgResult = await query('SELECT * FROM messages WHERE id = $1', [result.rows[0].id]);
+
+    // Emit socket event for real-time updates (room + global)
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.to('conv:' + convId).emit('new_message', { message: msgResult.rows[0], conversationId: convId });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: convId });
+    }
 
     res.status(201).json({
       success: true,

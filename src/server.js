@@ -23,6 +23,7 @@ const usersRoutes = require('./routes/users');
 const pdfRoutes = require('./routes/pdf');
 const publicRoutes = require('./routes/public');
 const orderRoutes = require('./routes/orders');
+const storeRoutes = require('./routes/stores');
 const testWhatsAppRoutes = require('./routes/testWhatsApp');
 const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
 
@@ -89,6 +90,7 @@ app.use('/api/users', usersRoutes);
 app.use('/api/pdf', pdfRoutes);
 app.use('/api', publicRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/stores', storeRoutes);
 app.use('/api', testWhatsAppRoutes);
 app.use('/api/whatsapp', whatsappWebhookRoutes);
 

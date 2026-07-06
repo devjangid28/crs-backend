@@ -1,12 +1,23 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
+
+async function getStoreInfo(storeId) {
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) return sRes.rows[0];
+  }
+  const dRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+  if (dRes.rows.length > 0) return dRes.rows[0];
+  const fRes = await query('SELECT * FROM store_settings LIMIT 1');
+  return fRes.rows[0] || {};
+}
 const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGenerator');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { validateTicket } = require('../middleware/validation');
 const { generateInwardReceipt } = require('../services/pdfGenerator');
 const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
-const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage } = require('../services/whatsappService');
+const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
 
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
@@ -103,10 +114,11 @@ router.post('/', validateTicket, async (req, res, next) => {
       email, customerEmail, serviceAddress,
       addressLine2, city, state, postcode, pincode, country,
       deviceType, brand, model, serialNumber, serialIMEI, imei, macAddress, password,
-      issueCategory, customIssueCategory, problemDescription, issue, solutionDescription,
+      issueCategory, customIssueCategory, problemDescription, issue,
       secondaryName, secondaryPhone, secondaryEmail,
       accessories, bodyDamage, body_damage, dataBackup, data_backup,
       estimatedCost, estimatedPrice, advancePayment, priority, location, warranty, company,
+      storeId,
       status = 'New'
     } = req.body;
 
@@ -114,6 +126,18 @@ router.post('/', validateTicket, async (req, res, next) => {
     const emailAddr = email || customerEmail;
     const problemDesc = problemDescription || issue;
     const postCode = postcode || pincode;
+
+    // Resolve store_id: prefer provided storeId, then default store, then first active store
+    let resolvedStoreId = storeId || null;
+    if (!resolvedStoreId) {
+      const defStore = await client.query('SELECT id FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+      if (defStore.rows.length > 0) {
+        resolvedStoreId = defStore.rows[0].id;
+      } else {
+        const firstStore = await client.query('SELECT id FROM stores WHERE is_active = true ORDER BY id ASC LIMIT 1');
+        if (firstStore.rows.length > 0) resolvedStoreId = firstStore.rows[0].id;
+      }
+    }
 
     const fields = {
       ticket_id: ticketId, customer_id: customerId || null,
@@ -125,7 +149,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       serial_number: serialNumber || null, serial_imei: serialIMEI || null,
       imei: imei || null, mac_address: macAddress || null, device_password: password || null,
       issue_category: issueCategory, custom_issue_category: customIssueCategory || null,
-      problem_description: problemDesc, solution_description: solutionDescription,
+      problem_description: problemDesc,
       secondary_name: secondaryName || null, secondary_phone: secondaryPhone || null,
       secondary_email: secondaryEmail || null,
       accessories: accessories || null,
@@ -133,6 +157,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       estimated_cost: estimatedCost || 0, estimated_price: estimatedPrice || 0, advance_payment: advancePayment || 0,
       priority: priority || 'Medium', asset_location: location || 'In Shop',
       warranty: warranty ? true : false, company: company || null,
+      store_id: resolvedStoreId,
       status, created_at: now, updated_at: now
     };
 
@@ -154,6 +179,7 @@ router.post('/', validateTicket, async (req, res, next) => {
     const newTicket = await client.query('SELECT * FROM tickets WHERE id = $1', [insertId]);
 
     // Auto-create conversation and send WhatsApp notification (fire-and-forget)
+    const custConvId = getConversationIdFromPhone(phone);
     setImmediate(async () => {
       try {
         await getOrCreateConversation(insertId, customerId || null, phone);
@@ -163,7 +189,7 @@ router.post('/', validateTicket, async (req, res, next) => {
       try {
         const pdf = await generateInwardReceipt(insertId);
         await createPdfMessage({
-          conversationId: String(insertId),
+          conversationId: custConvId,
           ticketId: insertId,
           customerId: customerId || null,
           sender: 'System',
@@ -171,13 +197,13 @@ router.post('/', validateTicket, async (req, res, next) => {
           fileSize: pdf.fileSize,
           documentType: 'inward_receipt',
           event: 'Receipt generated',
+          phone: phone,
         });
       } catch (e) {
         console.error('Auto-generate inward receipt failed:', e.message);
       }
       try {
-        const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
-        const store = storeRes.rows[0] || {};
+        const store = await getStoreInfo(newTicket.rows[0]?.store_id);
         const waResult = await notifyTicketCreated(newTicket.rows[0], store);
         if (!waResult?.template?.success) {
           const errMsg = waResult?.template?.error || waResult?.template?.reason || 'Unknown error';
@@ -186,7 +212,7 @@ router.post('/', validateTicket, async (req, res, next) => {
           if (phone) {
             const ticketData = newTicket.rows[0];
             const fallbackText = `*Ticket Created*\n\nCustomer: ${ticketData.customer_name || 'N/A'}\nTicket: ${ticketData.ticket_id || ticketData.id}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
-            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: customerId || null, phone, sender: 'System' });
+            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: customerId || null, phone, sender: 'System', conversationId: custConvId });
           }
         }
       } catch (e) {
@@ -236,7 +262,7 @@ router.put('/:id', async (req, res, next) => {
       serialNumber: 'serial_number', serialIMEI: 'serial_imei', imei: 'imei', macAddress: 'mac_address',
       password: 'device_password',
       issueCategory: 'issue_category', customIssueCategory: 'custom_issue_category',
-      problemDescription: 'problem_description', issue: 'problem_description', solutionDescription: 'solution_description',
+      problemDescription: 'problem_description', issue: 'problem_description',
       secondaryName: 'secondary_name', secondaryPhone: 'secondary_phone',
       secondaryEmail: 'secondary_email',
       accessories: 'accessories', bodyDamage: 'body_damage', body_damage: 'body_damage',
@@ -245,6 +271,7 @@ router.put('/:id', async (req, res, next) => {
       estimatedPrice: 'estimated_price',
       advancePayment: 'advance_payment', priority: 'priority',
       location: 'asset_location', warranty: 'warranty', company: 'company',
+      storeId: 'store_id',
       status: 'status', customerId: 'customer_id'
     };
 
@@ -284,16 +311,16 @@ router.put('/:id', async (req, res, next) => {
           console.error('Auto-create status event failed:', e.message);
         }
         try {
-          const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
-          const store = storeRes.rows[0] || {};
+          const store = await getStoreInfo(updated.rows[0]?.store_id);
           const waResult = await sendTicketStatusTemplate(updated.rows[0], updates.status, store);
           if (!waResult.success) {
             console.error('Status change WhatsApp template failed:', waResult.error || waResult.reason || JSON.stringify(waResult));
             // Fallback: send text notification
             const ticketData = updated.rows[0];
             if (ticketData.customer_phone) {
+              const convId = getConversationIdFromPhone(ticketData.customer_phone);
               const fallbackText = `*Status Update: ${updates.status}*\n\nTicket: ${ticketData.ticket_id || ticketData.id}\nCustomer: ${ticketData.customer_name || 'N/A'}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
-              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System' });
+              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System', conversationId: convId });
             }
           }
         } catch (e) {
@@ -371,15 +398,15 @@ router.put('/:id/status', async (req, res, next) => {
           console.error('Auto-create status event failed:', e.message);
         }
         try {
-          const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
-          const store = storeRes.rows[0] || {};
+          const store = await getStoreInfo(updated.rows[0]?.store_id);
           const waResult = await sendTicketStatusTemplate(updated.rows[0], status, store);
           if (!waResult.success) {
             console.error('Status change WhatsApp template failed:', waResult.error || waResult.reason || JSON.stringify(waResult));
             const ticketData = updated.rows[0];
             if (ticketData.customer_phone) {
+              const convId = getConversationIdFromPhone(ticketData.customer_phone);
               const fallbackText = `*Status Update: ${status}*\n\nTicket: ${ticketData.ticket_id || ticketData.id}\nCustomer: ${ticketData.customer_name || 'N/A'}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
-              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System' });
+              await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System', conversationId: convId });
             }
           }
         } catch (e) {

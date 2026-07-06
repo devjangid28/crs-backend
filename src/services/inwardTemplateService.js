@@ -136,11 +136,6 @@ function populateInwardTemplate(ticket, settings) {
   );
 
   html = html.replace(
-    /(SOLUTION\s*:<\/span>\s*)[^<]*(?=<)/,
-    `$1${ticket.solution_description || ''}`
-  );
-
-  html = html.replace(
     /(ACCESSORY LIST\s*:<\/span>)/,
     `$1 ${ticket.accessories || ''}`
   );
@@ -159,6 +154,13 @@ function populateInwardTemplate(ticket, settings) {
   html = html.replace(
     /(ESTIMATE PRICE\s*:<\/span>)/,
     `$1${estCost > 0 ? ' \u20B9' + estCost.toFixed(2) : ''}`
+  );
+
+  // Replace footer company name with store name
+  const footerName = companyName || 'REPAIR SHOP';
+  html = html.replace(
+    /(<div class="footer-right">)[^<]*(<br>)/,
+    `$1${footerName}$2`
   );
 
   return html;

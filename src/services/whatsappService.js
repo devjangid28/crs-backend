@@ -33,6 +33,21 @@ function formatPhone(phone) {
   return null;
 }
 
+function normalizePhone(phone) {
+  if (!phone) return null;
+  let cleaned = phone.replace(/[^\d]/g, '').replace(/^0+/, '');
+  if (!cleaned) return null;
+  if (cleaned.length === 10) cleaned = '91' + cleaned;
+  return cleaned;
+}
+
+function getConversationIdFromPhone(phone) {
+  if (!phone) return null;
+  const cleaned = normalizePhone(phone);
+  if (!cleaned) return null;
+  return 'cust_' + cleaned;
+}
+
 function isEnabled() {
   return !!(config.whatsapp.enabled &&
     config.whatsapp.phoneNumberId &&
@@ -41,7 +56,9 @@ function isEnabled() {
 
 async function saveMessagesRecord(text, context, providerMessageId, messageType = 'text') {
   try {
+    const phoneBasedConvId = getConversationIdFromPhone(context.phone);
     const convId = context.conversationId
+      || phoneBasedConvId
       || (context.ticketId != null ? String(context.ticketId) : null)
       || (context.orderId != null ? String(context.orderId) : null)
       || ('wa_' + (context.phone || 'unknown'));
@@ -368,7 +385,7 @@ async function sendTicketTemplate(ticket, store) {
     return { success: false, error: 'No customer phone' };
   }
 
-  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone: ticket.customer_phone, sender: 'System' };
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone: ticket.customer_phone, sender: 'System', conversationId: getConversationIdFromPhone(ticket.customer_phone) };
   const result = await sendTemplateMessage(ticket.customer_phone, config.whatsapp.templateName, params, context);
   return result;
 }
@@ -399,14 +416,15 @@ async function sendTicketStatusTemplate(ticket, newStatus, store) {
     `${ticket.device_type || ''} ${ticket.brand || ''} ${ticket.model || ''}`.trim() || 'Device',
   ];
 
-  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone, templateName, sender: 'System' };
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone, templateName, sender: 'System', conversationId: getConversationIdFromPhone(phone) };
   const result = await sendTemplateMessage(phone, templateName, params, context);
   return result;
 }
 
 async function sendWelcome(phone, customerName, storeName, context) {
   const text = `Thank you for choosing ${storeName || 'Bluechip Computer System'}.\n\nWe sincerely appreciate your trust and confidence in our services.\n\nYour request has been successfully registered, and our technical team will begin processing it shortly.\n\nWe will keep you informed about every important update regarding your repair/order through WhatsApp.\n\nThank you for your continued support.`;
-  return sendTextMessage(phone, text, context);
+  const ctx = { ...context, conversationId: context.conversationId || getConversationIdFromPhone(phone) };
+  return sendTextMessage(phone, text, ctx);
 }
 
 async function sendTicketDetails(phone, ticket, store) {
@@ -435,7 +453,7 @@ async function sendTicketDetails(phone, ticket, store) {
   if (store?.phone) lines.push(`Contact: ${store.phone}`);
   lines.push(``);
   lines.push(`We will notify you of all status updates.`);
-  const context = { ticketId: ticket.id, customerId: ticket.customer_id, sender: 'System' };
+  const context = { ticketId: ticket.id, customerId: ticket.customer_id, sender: 'System', conversationId: getConversationIdFromPhone(phone) };
   return sendTextMessage(phone, lines.join('\n'), context);
 }
 
@@ -459,7 +477,7 @@ async function sendOrderDetails(phone, order, store) {
   if (store?.phone) lines.push(`Contact: ${store.phone}`);
   lines.push(``);
   lines.push(`We will notify you of all status updates.`);
-  const context = { orderId: order.id, sender: 'System' };
+  const context = { orderId: order.id, sender: 'System', conversationId: getConversationIdFromPhone(phone) };
   return sendTextMessage(phone, lines.join('\n'), context);
 }
 
@@ -488,7 +506,7 @@ async function sendOrderTemplate(order, store) {
     return { success: false, error: 'No customer phone' };
   }
 
-  const context = { orderId: order.id, sender: 'System' };
+  const context = { orderId: order.id, sender: 'System', conversationId: getConversationIdFromPhone(order.mobile_number) };
   return sendTemplateMessage(order.mobile_number, config.whatsapp.orderTemplateName, params, context);
 }
 
@@ -581,4 +599,5 @@ module.exports = {
   notifyOrderCreated,
   isEnabled,
   formatPhone,
+  getConversationIdFromPhone,
 };

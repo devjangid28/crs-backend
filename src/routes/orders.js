@@ -1,7 +1,18 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
-const { notifyOrderCreated } = require('../services/whatsappService');
+const { notifyOrderCreated, getConversationIdFromPhone } = require('../services/whatsappService');
+
+async function getStoreInfo(storeId) {
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) return sRes.rows[0];
+  }
+  const dRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+  if (dRes.rows.length > 0) return dRes.rows[0];
+  const fRes = await query('SELECT * FROM store_settings LIMIT 1');
+  return fRes.rows[0] || {};
+}
 
 // Generate order number: ORD-YYYYMMDD-NNNN
 async function generateOrderNumber(client) {
@@ -59,7 +70,9 @@ router.get('/', async (req, res, next) => {
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const dataSql = `SELECT o.*, COALESCE(json_agg(json_build_object(
       'id', oc.id, 'component_name', oc.component_name,
-      'quantity', oc.quantity, 'remarks', oc.remarks, 'status', oc.status
+      'description', oc.description, 'warranty', oc.warranty,
+      'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
+      'remarks', oc.remarks, 'status', oc.status
     )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
     FROM orders o
     LEFT JOIN order_components oc ON oc.order_id = o.id
@@ -111,7 +124,9 @@ router.get('/:id', async (req, res, next) => {
     const result = await query(
       `SELECT o.*, COALESCE(json_agg(json_build_object(
         'id', oc.id, 'component_name', oc.component_name,
-        'quantity', oc.quantity, 'remarks', oc.remarks, 'status', oc.status
+        'description', oc.description, 'warranty', oc.warranty,
+        'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
+        'remarks', oc.remarks, 'status', oc.status
       )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
@@ -140,16 +155,24 @@ router.post('/', async (req, res, next) => {
       customerName, mobileNumber, address, orderDate, deviceType,
       desktopType, brand, model, serialNumber, problemDescription, orderNote,
       serviceAmount = 0, partsAmount = 0, additionalCharges = 0,
-      discount = 0, advancePayment = 0, paymentType = 'Cash', deliveryDate, createdBy, components = []
+      discount = 0, advancePayment = 0, paymentType = 'Cash',
+      deliveryDate, createdBy, components = [], storeId
     } = req.body;
 
     const serviceAmt = parseFloat(serviceAmount) || 0;
     const partsAmt = parseFloat(partsAmount) || 0;
     const additional = parseFloat(additionalCharges) || 0;
     const disc = parseFloat(discount) || 0;
-    const totalAmount = serviceAmt + partsAmt + additional - disc;
+
+    // Calculate component totals
+    const componentsTotal = Array.isArray(components) ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
+    const subtotal = serviceAmt + componentsTotal;
+    const gstRate = 0.18;
+    const gstAmount = subtotal * gstRate;
+    const grandTotal = subtotal + gstAmount - disc;
+
     const advance = parseFloat(advancePayment) || 0;
-    const remainingBalance = totalAmount - advance;
+    const remainingBalance = grandTotal - advance;
 
     let paymentStatus = 'Unpaid';
     if (advance > 0 && remainingBalance === 0) paymentStatus = 'Paid';
@@ -164,15 +187,17 @@ router.post('/', async (req, res, next) => {
         device_type, desktop_type, brand, model, serial_number,
         problem_description, order_note, delivery_date, service_amount, parts_amount,
         additional_charges, discount, total_amount, advance_payment,
-        remaining_balance, payment_status, payment_type, created_by, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+        remaining_balance, payment_status, payment_type, created_by,
+        store_id, subtotal, gst_amount, grand_total, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
       RETURNING id`,
       [
         orderNumber, customerName, mobileNumber, address, orderDateVal,
         deviceType, desktopType || null, brand || null, model || null, serialNumber || null,
         problemDescription || null, orderNote || null, deliveryDate || null,
-        serviceAmt, partsAmt, additional, disc, totalAmount,
-        advance, remainingBalance, paymentStatus, paymentType, createdBy || null, now, now
+        serviceAmt, partsAmt, additional, disc, grandTotal,
+        advance, remainingBalance, paymentStatus, paymentType, createdBy || null,
+        storeId || null, subtotal, gstAmount, grandTotal, now, now
       ]
     );
 
@@ -182,10 +207,13 @@ router.post('/', async (req, res, next) => {
     if (Array.isArray(components) && components.length > 0) {
       for (const comp of components) {
         await client.query(
-          `INSERT INTO order_components (order_id, component_name, quantity, remarks, status)
-           VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO order_components (order_id, component_name, description, warranty, quantity, price, amount, remarks, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [
-            orderId, comp.componentName, comp.quantity || 1,
+            orderId, comp.componentName,
+            comp.description || null, comp.warranty || null,
+            comp.quantity || 1, parseFloat(comp.price) || 0,
+            parseFloat(comp.amount) || 0,
             comp.remarks || null, comp.status || 'present'
           ]
         );
@@ -197,7 +225,9 @@ router.post('/', async (req, res, next) => {
     const newOrder = await client.query(
       `SELECT o.*, COALESCE(json_agg(json_build_object(
         'id', oc.id, 'component_name', oc.component_name,
-        'quantity', oc.quantity, 'remarks', oc.remarks, 'status', oc.status
+        'description', oc.description, 'warranty', oc.warranty,
+        'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
+        'remarks', oc.remarks, 'status', oc.status
       )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
@@ -208,8 +238,7 @@ router.post('/', async (req, res, next) => {
 
     setImmediate(async () => {
       try {
-        const storeRes = await query('SELECT * FROM store_settings LIMIT 1');
-        const store = storeRes.rows[0] || {};
+        const store = await getStoreInfo(newOrder.rows[0]?.store_id);
         const result = await notifyOrderCreated(newOrder.rows[0], store);
         if (!result?.template?.success) {
           console.error('WhatsApp order_created template failed:', JSON.stringify({ error: result?.templateError, fallback: result?.templateFallback }));
@@ -248,9 +277,17 @@ router.put('/:id', async (req, res, next) => {
     const partsAmt = parseFloat(updates.partsAmount ?? existing.rows[0].parts_amount) || 0;
     const additional = parseFloat(updates.additionalCharges ?? existing.rows[0].additional_charges) || 0;
     const disc = parseFloat(updates.discount ?? existing.rows[0].discount) || 0;
-    const totalAmount = serviceAmt + partsAmt + additional - disc;
+
+    // Calculate enhanced financials from components
+    const comps = Array.isArray(updates.components) ? updates.components : [];
+    const componentsTotal = comps.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0);
+    const subtotal = serviceAmt + componentsTotal;
+    const gstRate = 0.18;
+    const gstAmount = subtotal * gstRate;
+    const grandTotal = subtotal + gstAmount - disc;
+
     const advance = parseFloat(updates.advancePayment ?? existing.rows[0].advance_payment) || 0;
-    const remainingBalance = totalAmount - advance;
+    const remainingBalance = grandTotal - advance;
 
     let paymentStatus = 'Unpaid';
     if (advance > 0 && remainingBalance === 0) paymentStatus = 'Paid';
@@ -271,14 +308,16 @@ router.put('/:id', async (req, res, next) => {
       problemDescription: 'problem_description',
       orderNote: 'order_note',
       createdBy: 'created_by',
+      storeId: 'store_id',
     };
 
     const setClauses = ['service_amount = $1', 'parts_amount = $2', 'additional_charges = $3',
       'discount = $4', 'total_amount = $5', 'advance_payment = $6',
-      'remaining_balance = $7', 'payment_status = $8', 'updated_at = $9'];
-    const updateValues = [serviceAmt, partsAmt, additional, disc, totalAmount,
-      advance, remainingBalance, paymentStatus, now];
-    let paramIdx = 10;
+      'remaining_balance = $7', 'payment_status = $8', 'updated_at = $9',
+      'subtotal = $10', 'gst_amount = $11', 'grand_total = $12'];
+    const updateValues = [serviceAmt, partsAmt, additional, disc, grandTotal,
+      advance, remainingBalance, paymentStatus, now, subtotal, gstAmount, grandTotal];
+    let paramIdx = 13;
 
     for (const [frontField, dbField] of Object.entries(fieldMapping)) {
       if (updates[frontField] !== undefined) {
@@ -299,10 +338,15 @@ router.put('/:id', async (req, res, next) => {
       await client.query('DELETE FROM order_components WHERE order_id = $1', [req.params.id]);
       for (const comp of updates.components) {
         await client.query(
-          `INSERT INTO order_components (order_id, component_name, quantity, remarks, status)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [req.params.id, comp.componentName, comp.quantity || 1,
-           comp.remarks || null, comp.status || 'present']
+          `INSERT INTO order_components (order_id, component_name, description, warranty, quantity, price, amount, remarks, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            req.params.id, comp.componentName,
+            comp.description || null, comp.warranty || null,
+            comp.quantity || 1, parseFloat(comp.price) || 0,
+            parseFloat(comp.amount) || 0,
+            comp.remarks || null, comp.status || 'present'
+          ]
         );
       }
     }
@@ -312,7 +356,9 @@ router.put('/:id', async (req, res, next) => {
     const updated = await client.query(
       `SELECT o.*, COALESCE(json_agg(json_build_object(
         'id', oc.id, 'component_name', oc.component_name,
-        'quantity', oc.quantity, 'remarks', oc.remarks, 'status', oc.status
+        'description', oc.description, 'warranty', oc.warranty,
+        'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
+        'remarks', oc.remarks, 'status', oc.status
       )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id

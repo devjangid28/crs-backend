@@ -20,13 +20,41 @@ function formatCurrency(amount) {
   return '₹' + (parseFloat(amount) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 });
 }
 
+function normalizeStoreData(store) {
+  if (!store || Object.keys(store).length === 0) return {};
+  // Map stores table fields to store_settings-style fields and vice versa
+  store.company_name = store.company_name || store.store_name || 'REPAIR SHOP';
+  store.store_name = store.store_name || store.company_name || '';
+  store.gst_vat = store.gst_vat || store.gst_number || '';
+  store.gst_number = store.gst_number || store.gst_vat || '';
+  store.tagline = store.tagline || '';
+  store.terms_conditions = store.terms_conditions || '';
+  return store;
+}
+
+async function getStoreData(storeId) {
+  let store;
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) store = sRes.rows[0];
+  }
+  if (!store) {
+    const defRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+    if (defRes.rows.length > 0) store = defRes.rows[0];
+  }
+  if (!store) {
+    const cRes = await query('SELECT * FROM store_settings LIMIT 1');
+    store = cRes.rows[0] || {};
+  }
+  return normalizeStoreData(store);
+}
+
 async function generateInwardReceipt(ticketId) {
   const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
   if (tRes.rows.length === 0) throw new Error('Ticket not found');
   const t = tRes.rows[0];
 
-  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-  const store = cRes.rows[0] || {};
+  const store = await getStoreData(t.store_id);
 
   const dir = path.join(PDF_DIR, 'inward');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -162,12 +190,6 @@ async function generateInwardReceipt(ticketId) {
   doc.text(t.problem_description || t.issue || '', ml + 8, y + 9, { width: pw - 16 });
   const piH = doc.heightOfString(t.problem_description || t.issue || '', { width: pw - 16 }) + 12;
   y += Math.max(22, piH);
-  doc.fontSize(6.5).font('Helvetica-Bold').fillColor('#888');
-  doc.text('SOLUTION', ml + 8, y, { width: pw - 16 });
-  doc.fontSize(8).font('Helvetica').fillColor('#333');
-  doc.text(t.repair_description || t.solution_description || '', ml + 8, y + 9, { width: pw - 16 });
-  const psH = doc.heightOfString(t.repair_description || t.solution_description || '', { width: pw - 16 }) + 12;
-  y += Math.max(22, psH);
   endSection(probBodyTop, 8);
 
   // ── ACCESSORIES ──
@@ -251,8 +273,7 @@ async function generateInvoicePdf(invoiceId) {
   const tRes = inv.ticket_id ? await query('SELECT * FROM tickets WHERE id = $1', [inv.ticket_id]) : { rows: [] };
   const ticket = tRes.rows[0] || {};
 
-  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-  const store = cRes.rows[0] || {};
+  const store = await getStoreData(ticket?.store_id);
 
   const dir = path.join(PDF_DIR, 'invoices');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -429,8 +450,7 @@ async function generateOrderPdf(orderId) {
   if (oRes.rows.length === 0) throw new Error('Order not found');
   const order = oRes.rows[0];
 
-  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-  const store = cRes.rows[0] || {};
+  const store = await getStoreData(order.store_id);
 
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];
@@ -645,8 +665,7 @@ async function generateInwardReceiptFromHTML(ticketId) {
   if (tRes.rows.length === 0) throw new Error('Ticket not found');
   const ticket = tRes.rows[0];
 
-  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-  const store = cRes.rows[0] || {};
+  const store = await getStoreData(ticket.store_id);
 
   const dir = path.join(PDF_DIR, 'inward');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -683,8 +702,7 @@ async function generateOrderPdfFromHTML(orderId) {
   if (oRes.rows.length === 0) throw new Error('Order not found');
   const order = oRes.rows[0];
 
-  const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-  const store = cRes.rows[0] || {};
+  const store = await getStoreData(order.store_id);
 
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];

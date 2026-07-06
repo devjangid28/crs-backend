@@ -70,12 +70,6 @@ function generateInwardReceiptHtml(ticket, settings) {
       </div>
     </div>
 
-    <div class="row" style="min-height:20px;">
-      <div class="cell" style="width:100%;flex-direction:column;align-items:flex-start;padding:5px 8px;">
-        <span class="label">SOLUTION :${ticket.solution_description || 'RESET'}</span>
-      </div>
-    </div>
-
     <div class="row" style="min-height:14px;">
       <div class="cell" style="width:30%;flex-direction:column;align-items:flex-start;padding:2px 8px;">
         <span class="label">ACCESSORY LIST : ${ticket.accessories || ''}</span>

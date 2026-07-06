@@ -134,9 +134,10 @@ function populateOrderTemplate(order, components, settings) {
   // ── COMPONENTS TABLE ──
   if (components && components.length > 0) {
     let rows = '';
-    components.forEach(function(c) {
-      const statusClass = c.status === 'present' ? 'status-present' : '';
-      rows += '<tr><td>' + (c.component_name || '') + '</td><td>' + (c.quantity || 1) + '</td><td class="' + statusClass + '">' + (c.status || 'present') + '</td><td>' + (c.remarks || '') + '</td></tr>';
+    components.forEach(function(c, idx) {
+      const amount = parseFloat(c.amount || 0).toFixed(2);
+      const price = parseFloat(c.price || 0).toFixed(2);
+      rows += '<tr><td>' + (idx + 1) + '</td><td>' + (c.component_name || '') + '</td><td>' + (c.description || '') + '</td><td>' + (c.warranty || '') + '</td><td>' + (c.quantity || 1) + '</td><td>' + price + '</td><td>' + amount + '</td></tr>';
     });
     html = html.replace(
       /<tbody id="componentsTable">[\s\S]*?<\/tbody>/,
@@ -145,6 +146,11 @@ function populateOrderTemplate(order, components, settings) {
   }
 
   // ── PAYMENT SUMMARY ──
+  const componentsTotal = components ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
+  const subtotal = (parseFloat(order.service_amount) || 0) + componentsTotal;
+  const gstAmount = subtotal * 0.18;
+  const grandTotal = subtotal + gstAmount - (parseFloat(order.discount) || 0);
+
   html = html.replace(
     /(<div[^>]*id="serviceAmount"[^>]*>)[^<]*(<\/div>)/,
     '$1' + fmtCurrency(order.service_amount || 0) + '$2'
@@ -168,6 +174,29 @@ function populateOrderTemplate(order, components, settings) {
   html = html.replace(
     /(<div[^>]*id="paymentStatus"[^>]*>)[^<]*(<\/div>)/,
     '$1' + (order.payment_status || 'Unpaid') + '$2'
+  );
+
+  // New enhanced financial fields
+  const gstFormatted = gstAmount.toFixed(2);
+  const subtotalFormatted = subtotal.toFixed(2);
+  const componentsTotalFormatted = componentsTotal.toFixed(2);
+  const grandTotalFormatted = grandTotal.toFixed(2);
+
+  html = html.replace(
+    /(<div[^>]*id="componentsTotal"[^>]*>)[^<]*(<\/div>)/,
+    '$1' + fmtCurrency(componentsTotal) + '$2'
+  );
+  html = html.replace(
+    /(<div[^>]*id="subtotalAmount"[^>]*>)[^<]*(<\/div>)/,
+    '$1' + fmtCurrency(subtotal) + '$2'
+  );
+  html = html.replace(
+    /(<div[^>]*id="gstAmount"[^>]*>)[^<]*(<\/div>)/,
+    '$1' + fmtCurrency(gstAmount) + '$2'
+  );
+  html = html.replace(
+    /(<div[^>]*id="grandTotal"[^>]*>)[^<]*(<\/div>)/,
+    '$1' + fmtCurrency(grandTotal) + '$2'
   );
 
   // ── SERVICE CENTER NAME IN FOOTER ──

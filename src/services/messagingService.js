@@ -136,6 +136,46 @@ const EVENT_MAP = {
   'Cancelled': { event: 'cancelled', text: 'Cancelled', description: 'Repair has been cancelled.' },
 };
 
+function normalizePhone(phone) {
+  if (!phone) return null;
+  let cleaned = phone.replace(/[^\d]/g, '').replace(/^0+/, '');
+  if (!cleaned) return null;
+  if (cleaned.length === 10) cleaned = '91' + cleaned;
+  return cleaned;
+}
+
+async function getCustomerPhone(phone) {
+  const cleaned = normalizePhone(phone);
+  if (!cleaned) return null;
+  return 'cust_' + cleaned;
+}
+
+async function findConversationByPhone(phone) {
+  const convId = await getCustomerPhone(phone);
+  if (!convId) return null;
+  const existing = await query('SELECT conversation_id FROM messages WHERE conversation_id = $1 LIMIT 1', [convId]);
+  return existing.rows.length > 0 ? convId : null;
+}
+
+async function findExistingConversation(phone) {
+  if (!phone) return null;
+  const cleanPhone = normalizePhone(phone);
+  if (!cleanPhone) return null;
+  const convId = 'cust_' + cleanPhone;
+  const existing = await query('SELECT conversation_id FROM messages WHERE conversation_id = $1 LIMIT 1', [convId]);
+  if (existing.rows.length > 0) return convId;
+
+  // Try finding by phone in messages table (without 91 prefix)
+  const shortPhone = cleanPhone.replace(/^91/, '');
+  const phoneMatch = await query(
+    'SELECT conversation_id FROM messages WHERE phone = $1 OR phone = $2 OR phone LIKE $3 LIMIT 1',
+    [cleanPhone, shortPhone, `%${shortPhone}`]
+  );
+  if (phoneMatch.rows.length > 0) return phoneMatch.rows[0].conversation_id;
+
+  return null;
+}
+
 async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'System') {
   const tRes = await query('SELECT id, customer_id, customer_name, customer_phone FROM tickets WHERE id = $1', [ticketId]);
   if (tRes.rows.length === 0) return null;
@@ -144,7 +184,7 @@ async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'Sy
   const eventInfo = EVENT_MAP[newStatus];
   if (!eventInfo) return null;
 
-  const conversationId = String(t.id);
+  const conversationId = await findExistingConversation(t.customer_phone) || ('cust_' + (normalizePhone(t.customer_phone) || 'unknown'));
 
   return createSystemMessage({
     conversationId,
@@ -159,13 +199,14 @@ async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'Sy
 }
 
 async function storeIncomingMessage({ from, waId, text, profileName }) {
-  const convId = 'wa_' + from;
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const normalizedFrom = normalizePhone(from);
+  const cleanFrom = (normalizedFrom || from).replace(/[^\d]/g, '').replace(/^0+/, '');
+  const convId = 'cust_' + (normalizedFrom || cleanFrom);
 
   let customerId = null;
   try {
-    const cleanPhone = from.replace(/^0+/, '');
-    const suffixes = [from, cleanPhone, from.replace(/^91/, ''), '91' + cleanPhone.replace(/^91/, '')];
+    const suffixes = [from, cleanFrom, from.replace(/^91/, ''), '91' + cleanFrom.replace(/^91/, '')];
     for (const s of [...new Set(suffixes)]) {
       const customerRes = await query(
         `SELECT id FROM customers WHERE phone LIKE $1 OR phone LIKE $2 LIMIT 1`,
@@ -180,13 +221,18 @@ async function storeIncomingMessage({ from, waId, text, profileName }) {
     // Silent
   }
 
+  // Use existing conversation if it exists
+  const existingConv = await findExistingConversation(from);
+
+  const finalConvId = existingConv || convId;
+
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, type, text, status, provider_message_id, phone, is_read, created_at)
      VALUES ($1, 'Customer', $2, 'text', $3, 'delivered', $4, $5, false, $6) RETURNING id`,
-    [convId, customerId, text, waId, from, now]
+    [finalConvId, customerId, text, waId, cleanFrom, now]
   );
 
-  return { id: result.rows[0].id, customerId, convId };
+  return { id: result.rows[0].id, customerId, convId: finalConvId };
 }
 
 async function getOrCreateConversation(ticketId, customerId, customerPhone) {
@@ -194,7 +240,9 @@ async function getOrCreateConversation(ticketId, customerId, customerPhone) {
   if (tRes.rows.length === 0) return null;
   const ticket = tRes.rows[0];
 
-  const convId = String(ticketId);
+  // Use normalized phone-based conversation ID for single conversation per customer
+  const normalizedPhone = normalizePhone(customerPhone);
+  const convId = 'cust_' + (normalizedPhone || customerPhone || '').replace(/[^\d]/g, '');
 
   const existingConv = await query(
     'SELECT conversation_id FROM messages WHERE conversation_id = $1 LIMIT 1',
@@ -301,8 +349,8 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
            (SELECT type FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_type,
            (SELECT sender FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_sender,
            (SELECT COUNT(*) FROM messages WHERE conversation_id = m.conversation_id AND is_read = false AND sender = 'Customer') as unread_count,
-           (SELECT t2.customer_name FROM tickets t2 WHERE t2.id = m.ticket_id::integer LIMIT 1) as ticket_customer_name,
-           (SELECT t2.customer_phone FROM tickets t2 WHERE t2.id = m.ticket_id::integer LIMIT 1) as ticket_customer_phone,
+           (SELECT t2.customer_name FROM tickets t2 WHERE t2.id = m.ticket_id LIMIT 1) as ticket_customer_name,
+           (SELECT t2.customer_phone FROM tickets t2 WHERE t2.id = m.ticket_id LIMIT 1) as ticket_customer_phone,
            (SELECT o2.customer_name FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_name,
            (SELECT o2.mobile_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_phone,
            (SELECT o2.order_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_number,
@@ -321,20 +369,20 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
   conversations.forEach(c => {
     if (c.order_id) {
       c.conversation_type = 'order';
+    } else if (c.conversation_id && c.conversation_id.startsWith('cust_')) {
+      c.conversation_type = 'customer';
     } else if (c.ticket_id) {
       c.conversation_type = 'ticket';
-    } else if (c.conversation_id && c.conversation_id.startsWith('wa_')) {
-      c.conversation_type = 'whatsapp';
     } else {
       c.conversation_type = 'ticket';
     }
   });
 
   if (filter === 'customers') {
-    return conversations.filter(c => c.conversation_id && !c.conversation_id.startsWith('wa_'));
+    return conversations.filter(c => c.conversation_type === 'customer' || c.conversation_type === 'ticket');
   }
   if (filter === 'team') {
-    return conversations.filter(c => c.conversation_id && c.conversation_id.startsWith('wa_'));
+    return conversations.filter(c => c.conversation_type === 'customer');
   }
   if (filter === 'unread') {
     return conversations;
@@ -376,7 +424,7 @@ async function updateMessageStatus(providerMessageId, status) {
 
 async function getConversationByPhone(phone) {
   const cleanPhone = phone.replace(/[^\d]/g, '');
-  const convId = 'wa_' + cleanPhone;
+  const convId = 'cust_' + cleanPhone;
   const result = await query(
     'SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
     [convId]
@@ -400,5 +448,8 @@ module.exports = {
   saveCustomerContact,
   updateMessageStatus,
   getConversationByPhone,
+  findConversationByPhone,
+  findExistingConversation,
+  getCustomerPhone,
   EVENT_MAP,
 };
