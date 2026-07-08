@@ -10,6 +10,17 @@ const { authenticate } = require('../middleware/auth');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs');
 
+function normalizeStoreData(store) {
+  if (!store || Object.keys(store).length === 0) return {};
+  store.company_name = store.company_name || store.store_name || 'REPAIR SHOP';
+  store.store_name = store.store_name || store.company_name || '';
+  store.gst_vat = store.gst_vat || store.gst_number || '';
+  store.gst_number = store.gst_number || store.gst_vat || '';
+  store.tagline = store.tagline || '';
+  store.terms_conditions = store.terms_conditions || '';
+  return store;
+}
+
 async function getStoreData(storeId) {
   let store;
   if (storeId) {
@@ -24,7 +35,7 @@ async function getStoreData(storeId) {
     const cRes = await query('SELECT * FROM store_settings LIMIT 1');
     store = cRes.rows[0] || {};
   }
-  return store;
+  return normalizeStoreData(store);
 }
 
 // POST /api/pdf/generate-inward/:ticketId - Generate inward receipt PDF

@@ -103,22 +103,18 @@ function populateOrderTemplate(order, components, settings) {
   );
 
   // ── DEVICE DETAILS ──
-  let deviceBrand = order.brand || '';
-  if (order.device_type) {
-    deviceBrand = order.device_type + (deviceBrand ? ' (' + deviceBrand + ')' : '');
-  }
+  const deviceBrand = order.brand || '';
+  const modelStr = order.model || '---';
+  const serialStr = order.serial_number || '';
+  const modelSerial = modelStr + (serialStr ? ' / ' + serialStr : '');
 
   html = html.replace(
-    /(<div[^>]*id="deviceBrand"[^>]*>)[^<]*(<\/div>)/,
+    /(<td[^>]*id="deviceBrand"[^>]*>)[^<]*(<\/td>)/,
     '$1' + deviceBrand + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="deviceModel"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + (order.model || '---') + '$2'
-  );
-  html = html.replace(
-    /(<div[^>]*id="serialNumber"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + (order.serial_number || '') + '$2'
+    /(<td[^>]*id="modelSerial"[^>]*>)[^<]*(<\/td>)/,
+    '$1' + modelSerial + '$2'
   );
 
   // ── COMPONENTS TABLE ──
@@ -135,71 +131,99 @@ function populateOrderTemplate(order, components, settings) {
     );
   }
 
-  // ── PAYMENT SUMMARY ──
+  // ── FINANCIAL CALCULATIONS ──
   const componentsTotal = components ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
-  const subtotal = (parseFloat(order.service_amount) || 0) + componentsTotal;
-  const gstAmount = subtotal * 0.18;
-  const grandTotal = subtotal + gstAmount - (parseFloat(order.discount) || 0);
+  const serviceAmt = parseFloat(order.service_amount) || 0;
+  const disc = parseFloat(order.discount) || 0;
+  const subtotal = serviceAmt + componentsTotal;
+  const gstRate = 0.18;
+  const gstAmount = subtotal * gstRate;
+  const amountBeforeDiscount = subtotal + gstAmount;
+  const grandTotal = amountBeforeDiscount - disc;
+  const advance = parseFloat(order.advance_payment) || 0;
+  const remainingBalance = Math.max(0, grandTotal - advance);
 
+  // ── PAYMENT SUMMARY (left column — values) ──
   html = html.replace(
-    /(<div[^>]*id="serviceAmount"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(order.service_amount || 0) + '$2'
+    /(<[^>]*\sid="serviceAmount"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + fmtCurrency(serviceAmt) + '$2'
+  );
+  const advanceMode = order.advance_payment_mode || '';
+  const advanceLabel = advance > 0
+    ? fmtCurrency(advance) + (advanceMode ? ' (' + advanceMode + ')' : '')
+    : fmtCurrency(advance);
+  html = html.replace(
+    /(<[^>]*\sid="advancePaid"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + advanceLabel + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="partsAmount"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(order.parts_amount || 0) + '$2'
+    /(<[^>]*\sid="totalAmount"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + fmtCurrency(grandTotal) + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="advancePaid"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(order.advance_payment || 0) + '$2'
-  );
-  html = html.replace(
-    /(<div[^>]*id="totalAmount"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(order.total_amount || 0) + '$2'
-  );
-  html = html.replace(
-    /(<div[^>]*id="discountAmount"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(order.discount || 0) + '$2'
-  );
-  html = html.replace(
-    /(<div[^>]*id="paymentStatus"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + (order.payment_status || 'Unpaid') + '$2'
-  );
-
-  // New enhanced financial fields
-  const gstFormatted = gstAmount.toFixed(2);
-  const subtotalFormatted = subtotal.toFixed(2);
-  const componentsTotalFormatted = componentsTotal.toFixed(2);
-  const grandTotalFormatted = grandTotal.toFixed(2);
-
-  html = html.replace(
-    /(<div[^>]*id="componentsTotal"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(componentsTotal) + '$2'
-  );
-  html = html.replace(
-    /(<div[^>]*id="subtotalAmount"[^>]*>)[^<]*(<\/div>)/,
+    /(<[^>]*\sid="paySubtotal"[^>]*>)[^<]*(<\/\w+>)/,
     '$1' + fmtCurrency(subtotal) + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="gstAmount"[^>]*>)[^<]*(<\/div>)/,
+    /(<[^>]*\sid="payGstAmount"[^>]*>)[^<]*(<\/\w+>)/,
     '$1' + fmtCurrency(gstAmount) + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="grandTotal"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + fmtCurrency(grandTotal) + '$2'
+    /(<[^>]*\sid="payDiscount"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + fmtCurrency(disc) + '$2'
+  );
+  html = html.replace(
+    /(<[^>]*\sid="remainingBalance"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + fmtCurrency(remainingBalance) + '$2'
+  );
+  html = html.replace(
+    /(<[^>]*\sid="paymentStatus"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + (order.payment_status || 'Unpaid') + '$2'
+  );
+  html = html.replace(
+    /(<[^>]*\sid="paymentMode"[^>]*>)[^<]*(<\/\w+>)/,
+    '$1' + (order.payment_type || 'Cash') + '$2'
   );
 
-  // ── SERVICE CENTER NAME IN FOOTER ──
+  // ── SPECIFICATIONS ──
+  let specs = order.specifications;
+  if (typeof specs === 'string') { try { specs = JSON.parse(specs); } catch { specs = null; } }
+  if (specs && Array.isArray(specs) && specs.length > 0) {
+    let specRows = '';
+    specs.forEach(function(s) {
+      if (s.spec || s.value) {
+        specRows += '<tr><td class="label">' + (s.spec || '') + '</td><td class="value">' + (s.value || '') + '</td></tr>';
+      }
+    });
+    if (specRows) {
+      html = html.replace(
+        /<tbody id="specificationsBody">[\s\S]*?<\/tbody>/,
+        '<tbody id="specificationsBody">' + specRows + '</tbody>'
+      );
+      html = html.replace(
+        /(id="specificationsSection")\s*style="display:none;"/,
+        'id="specificationsSection" style="display:block;"'
+      );
+    }
+  }
+
+  // ── WATERMARK ──
+  let watermarkSrc = '';
+  const watermarkPath = path.join(__dirname, '..', '..', '..', 'public', 'watermark.png');
+  if (fs.existsSync(watermarkPath)) {
+    const buf = fs.readFileSync(watermarkPath);
+    watermarkSrc = 'data:image/png;base64,' + buf.toString('base64');
+  }
   html = html.replace(
-    /(<div class="center-name"[^>]*id="centerName"[^>]*>)[^<]*(<\/div>)/,
-    '$1' + companyName + '$2'
+    /(<div class="watermark"[^>]*id="watermark"[^>]*>)[\s\S]*?(<\/div>)/,
+    '$1<img src="' + watermarkSrc + '" alt="" id="watermarkImg" />$2'
   );
 
   // ── GENERATED DATE ──
   const now = new Date().toLocaleString('en-IN');
   html = html.replace(
     /(<div class="generated-text"[^>]*id="generatedText"[^>]*>)[^<]*(<\/div>)/,
-    '$1Computer-generated repair order. Generated on ' + now + '$2'
+    '$1Computer-generated sales order confirmation. Generated on ' + now + '$2'
   );
 
   return html;

@@ -28,6 +28,13 @@ function formatPhone(phone) {
   if (cleaned.length === 10) {
     return '91' + cleaned;
   }
+  // Lenient: if length >= 10, take last 10 digits as the number
+  if (cleaned.length > 10) {
+    const last10 = cleaned.slice(-10);
+    if (/^\d{10}$/.test(last10)) {
+      return '91' + last10;
+    }
+  }
   wa.warn('formatPhone: unexpected length', { input: phone, cleaned, len: cleaned.length });
   return null;
 }
@@ -39,6 +46,13 @@ function normalizePhone(phone) {
   if (cleaned.length === 10) cleaned = '91' + cleaned;
   if (cleaned.length === 12 && cleaned.startsWith('91')) {
     return cleaned;
+  }
+  // Lenient: if length >= 10, take last 10 digits as the number
+  if (cleaned.length > 10) {
+    const last10 = cleaned.slice(-10);
+    if (/^\d{10}$/.test(last10)) {
+      return '91' + last10;
+    }
   }
   wa.warn('normalizePhone: unexpected format', { input: phone, cleaned, len: cleaned.length });
   return null;

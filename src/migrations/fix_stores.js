@@ -51,7 +51,7 @@ async function run() {
         owner_name VARCHAR(150) DEFAULT NULL,
         gst_number VARCHAR(100) DEFAULT NULL,
         address TEXT DEFAULT NULL,
-        phone VARCHAR(20) DEFAULT NULL,
+        phone VARCHAR(30) DEFAULT NULL,
         email VARCHAR(191) DEFAULT NULL,
         logo TEXT DEFAULT NULL,
         website VARCHAR(200) DEFAULT NULL,
@@ -72,8 +72,8 @@ async function run() {
   await addColumn('stores', 'city', 'VARCHAR(100)');
   await addColumn('stores', 'state', 'VARCHAR(100)');
   await addColumn('stores', 'pincode', 'VARCHAR(20)');
-  await addColumn('stores', 'mobile', 'VARCHAR(20)');
-  await addColumn('stores', 'whatsapp_number', 'VARCHAR(20)');
+  await addColumn('stores', 'mobile', 'VARCHAR(30)');
+  await addColumn('stores', 'whatsapp_number', 'VARCHAR(30)');
   await addColumn('stores', 'notes', 'TEXT');
   await addColumn('stores', 'invoice_footer', 'TEXT');
 

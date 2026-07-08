@@ -18,7 +18,7 @@ function generateInwardReceiptHtml(ticket, settings) {
         ${settings.logo ? `<img src="${settings.logo}" alt="Logo" class="logo" />` : ''}
       </div>
       <div class="company-info">
-        <div class="form-title">REPAIR ORDER FORM</div>
+        <div class="form-title">SALES ORDER CONFIRMATION</div>
         <div class="company-address">
           ${settings.address || ''}<br/>
           ${[settings.city, settings.state].filter(Boolean).join(', ')}${settings.pincode ? ' - ' + settings.pincode : ''}<br/>
@@ -120,7 +120,7 @@ function generateInwardReceiptHtml(ticket, settings) {
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Repair Order Form - ${ticket.ticket_id || ticket.id}</title>
+  <title>Sales Order Confirmation - ${ticket.ticket_id || ticket.id}</title>
   <style>
     @page { size: A4 portrait; margin: 0; }
     * { box-sizing: border-box; margin: 0; padding: 0; }

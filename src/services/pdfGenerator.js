@@ -129,7 +129,7 @@ async function generateInwardReceipt(ticketId) {
   doc.fontSize(11).font('Helvetica-Bold').fillColor('#1565C0');
   doc.text(store.company_name || 'REPAIR SHOP', ml + 8, y + hdrH - 18, { width: pw * 0.35 - 16 });
   doc.fontSize(13).font('Helvetica-Bold').fillColor('#1565C0');
-  doc.text('REPAIR ORDER', ml + pw * 0.35 + 8, y + 6, { width: pw * 0.65 - 16, align: 'right' });
+  doc.text('Sales Order Confirmation', ml + pw * 0.35 + 8, y + 6, { width: pw * 0.65 - 16, align: 'right' });
   doc.fontSize(6.5).font('Helvetica').fillColor('#666');
   const addrParts = [store.address, [store.city, store.state].filter(Boolean).join(', ')].filter(Boolean);
   doc.text(addrParts.join(', ') + (store.pincode ? ' - ' + store.pincode : ''), ml + pw * 0.35 + 8, y + 22, { width: pw * 0.65 - 16, align: 'right' });
@@ -511,9 +511,9 @@ async function generateOrderPdf(orderId) {
     try { doc.image(path.join(__dirname, '../../', store.logo), ml + 8, y + 4, { width: 50 }); } catch (e) { /* skip */ }
   }
   doc.fontSize(11).font('Helvetica-Bold').fillColor('#1565C0');
-  doc.text(store.company_name || 'REPAIR SHOP', ml + 8, y + hdrH - 18, { width: pw * 0.35 - 16 });
+  doc.text(store.company_name || 'SALES CENTER', ml + 8, y + hdrH - 18, { width: pw * 0.35 - 16 });
   doc.fontSize(13).font('Helvetica-Bold').fillColor('#1565C0');
-  doc.text('REPAIR ORDER', ml + pw * 0.35 + 8, y + 6, { width: pw * 0.65 - 16, align: 'right' });
+  doc.text('Sales Order Confirmation', ml + pw * 0.35 + 8, y + 6, { width: pw * 0.65 - 16, align: 'right' });
   doc.fontSize(6.5).font('Helvetica').fillColor('#666');
   const addrParts = [store.address, [store.city, store.state].filter(Boolean).join(', ')].filter(Boolean);
   doc.text(addrParts.join(', ') + (store.pincode ? ' - ' + store.pincode : ''), ml + pw * 0.35 + 8, y + 22, { width: pw * 0.65 - 16, align: 'right' });

@@ -19,7 +19,7 @@ router.post('/test-whatsapp', async (req, res) => {
     wa.info('Test: formatted phone', { original: phone, formatted });
 
     const name = templateName || process.env.WHATSAPP_TEMPLATE_NAME || 'ticket_created';
-    const templateParams = params || ['Test Customer', 'TKT-0000', 'Test Device'];
+    const templateParams = params || ['Test Customer', 'TKT-2026-JUL-0001', 'Test Device'];
 
     wa.info('Test: sending template', { name, templateParams });
 

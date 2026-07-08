@@ -156,6 +156,18 @@ function populateInwardTemplate(ticket, settings) {
     `$1${estCost > 0 ? ' \u20B9' + estCost.toFixed(2) : ''}`
   );
 
+  // ── WATERMARK ──
+  let watermarkSrc = '';
+  const watermarkPath = path.join(__dirname, '..', '..', '..', 'public', 'watermark.png');
+  if (fs.existsSync(watermarkPath)) {
+    const buf = fs.readFileSync(watermarkPath);
+    watermarkSrc = 'data:image/png;base64,' + buf.toString('base64');
+  }
+  html = html.replace(
+    /(<div class="watermark"[^>]*id="watermark"[^>]*>)[\s\S]*?(<\/div>)/,
+    '$1<img src="' + watermarkSrc + '" alt="" id="watermarkImg" />$2'
+  );
+
   // Replace footer company name with store name
   const footerName = companyName || 'REPAIR SHOP';
   html = html.replace(

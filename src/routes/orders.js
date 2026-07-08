@@ -16,14 +16,14 @@ async function getStoreInfo(storeId) {
   return fRes.rows[0] || {};
 }
 
-// Generate order number: ORD-YYYYMMDD-NNNN
+const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+// Generate order number: ORD-YYYY-MMM-NNNN
 async function generateOrderNumber(client) {
   const today = new Date();
   const y = today.getFullYear();
-  const m = String(today.getMonth() + 1).padStart(2, '0');
-  const d = String(today.getDate()).padStart(2, '0');
-  const dateStr = `${y}${m}${d}`;
-  const prefix = `ORD-${dateStr}-`;
+  const month = MONTHS[today.getMonth()];
+  const prefix = `ORD-${y}-${month}-`;
 
   const result = await client.query(
     `SELECT order_number FROM orders WHERE order_number LIKE $1 ORDER BY id DESC LIMIT 1`,
@@ -157,8 +157,9 @@ router.post('/', async (req, res, next) => {
       customerName, mobileNumber, address, orderDate, deviceType,
       desktopType, brand, model, serialNumber, problemDescription, orderNote,
       serviceAmount = 0, partsAmount = 0, additionalCharges = 0,
-      discount = 0, advancePayment = 0, paymentType = 'Cash',
-      deliveryDate, createdBy, components = [], storeId
+      discount = 0, advancePayment = 0, advancePaymentMode,
+      paymentType = 'Cash',
+      deliveryDate, createdBy, components = [], storeId, specifications
     } = req.body;
 
     const serviceAmt = parseFloat(serviceAmount) || 0;
@@ -183,23 +184,27 @@ router.post('/', async (req, res, next) => {
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     const orderDateVal = orderDate || new Date().toISOString().slice(0, 10);
 
+    const specsJson = specifications && Array.isArray(specifications) && specifications.length > 0
+      ? JSON.stringify(specifications)
+      : null;
+
     const insertResult = await client.query(
       `INSERT INTO orders (
         order_number, customer_name, mobile_number, address, order_date,
         device_type, desktop_type, brand, model, serial_number,
         problem_description, order_note, delivery_date, service_amount, parts_amount,
         additional_charges, discount, total_amount, advance_payment,
-        remaining_balance, payment_status, payment_type, created_by,
-        store_id, subtotal, gst_amount, grand_total, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+        advance_payment_mode, remaining_balance, payment_status, payment_type, created_by,
+        store_id, subtotal, gst_amount, grand_total, specifications, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
       RETURNING id`,
       [
         orderNumber, customerName, mobileNumber, address, orderDateVal,
         deviceType, desktopType || null, brand || null, model || null, serialNumber || null,
         problemDescription || null, orderNote || null, deliveryDate || null,
         serviceAmt, partsAmt, additional, disc, grandTotal,
-        advance, remainingBalance, paymentStatus, paymentType, createdBy || null,
-        storeId || null, subtotal, gstAmount, grandTotal, now, now
+        advance, advancePaymentMode || null, remainingBalance, paymentStatus, paymentType, createdBy || null,
+        storeId || null, subtotal, gstAmount, grandTotal, specsJson, now, now
       ]
     );
 
