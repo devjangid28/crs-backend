@@ -26,6 +26,8 @@ const orderRoutes = require('./routes/orders');
 const storeRoutes = require('./routes/stores');
 const testWhatsAppRoutes = require('./routes/testWhatsApp');
 const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
+const amcRoutes = require('./routes/amc');
+const amcPortalRoutes = require('./routes/amc_portal');
 
 const app = express();
 const server = http.createServer(app);
@@ -62,6 +64,12 @@ app.set('io', io);
 // Pass io to webhook
 whatsappWebhookRoutes.setSocketIO(io);
 
+// Make io accessible to all route handlers
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
+
 app.use(cors({ origin: config.cors.origin, credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -93,12 +101,8 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/stores', storeRoutes);
 app.use('/api', testWhatsAppRoutes);
 app.use('/api/whatsapp', whatsappWebhookRoutes);
-
-// Server-side Socket.IO helper - emit events via routes
-app.use((req, res, next) => {
-  req.io = io;
-  next();
-});
+app.use('/api/amc', amcRoutes);
+app.use('/api/amc', amcPortalRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -136,15 +140,17 @@ app.get('/feedback/:ticketId/:token', (req, res) => {
   res.sendFile(path.join(publicDir, 'feedback.html'));
 });
 
+// Customer portal route — serve SPA so React can render CustomerAMCPortal
+app.get('/amc/customer/:token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(frontendDist, 'index.html'));
+});
+
 // SPA fallback: serve index.html for all non-API routes
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return;
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  try {
-    res.sendFile(path.join(frontendDist, 'index.html'));
-  } catch (e) {
-    res.status(503).json({ success: false, message: 'Frontend not built yet. Run: npm run build' });
-  }
+  res.sendFile(path.join(frontendDist, 'index.html'));
 });
 
 app.use(errorHandler);

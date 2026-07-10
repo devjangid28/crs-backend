@@ -15,6 +15,7 @@ const config = {
   server: {
     port: parseInt(process.env.PORT, 10) || 5000,
     env: process.env.NODE_ENV || 'development',
+    publicUrl: process.env.PUBLIC_URL || null,
   },
   cors: {
     origin: process.env.CORS_ORIGIN || '*',
