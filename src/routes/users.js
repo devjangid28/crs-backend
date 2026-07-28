@@ -12,8 +12,11 @@ router.use(requireRole('owner'));
 router.get('/', async (req, res, next) => {
   try {
     const result = await query(
-      `SELECT id, full_name, mobile_number, email, username, role, is_active, is_disabled, created_at, updated_at
-       FROM users ORDER BY created_at DESC`
+      `SELECT u.id, u.full_name, u.mobile_number, u.email, u.username, u.role, u.is_active, u.is_disabled, u.store_id,
+              s.store_name, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN stores s ON s.id = u.store_id
+       ORDER BY u.created_at DESC`
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -70,10 +73,12 @@ router.post('/', async (req, res, next) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
+    const storeId = req.body.storeId || req.body.store_id || null;
+
     const result = await query(
-      `INSERT INTO users (full_name, mobile_number, email, username, password_hash, role)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [fullName, mobileNumber, email || null, username || null, passwordHash, role || 'staff']
+      `INSERT INTO users (full_name, mobile_number, email, username, password_hash, role, store_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [fullName, mobileNumber, email || null, username || null, passwordHash, role || 'staff', storeId || null]
     );
 
     const newUser = await query(
@@ -114,6 +119,10 @@ router.put('/:id', async (req, res, next) => {
     if (email !== undefined) { updates.push(`email = $${idx++}`); values.push(email || null); }
     if (username !== undefined) { updates.push(`username = $${idx++}`); values.push(username || null); }
     if (role !== undefined) { updates.push(`role = $${idx++}`); values.push(role); }
+    if (req.body.storeId !== undefined || req.body.store_id !== undefined) {
+      updates.push(`store_id = $${idx++}`);
+      values.push(req.body.storeId || req.body.store_id || null);
+    }
 
     if (updates.length > 0) {
       values.push(req.params.id);
@@ -121,8 +130,10 @@ router.put('/:id', async (req, res, next) => {
     }
 
     const updated = await query(
-      `SELECT id, full_name, mobile_number, email, username, role, is_active, is_disabled, created_at, updated_at
-       FROM users WHERE id = $1`,
+      `SELECT u.id, u.full_name, u.mobile_number, u.email, u.username, u.role, u.is_active, u.is_disabled,
+              u.store_id, s.store_name, u.created_at, u.updated_at
+       FROM users u LEFT JOIN stores s ON s.id = u.store_id
+       WHERE u.id = $1`,
       [req.params.id]
     );
 

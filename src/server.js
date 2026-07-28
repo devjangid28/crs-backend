@@ -28,6 +28,7 @@ const testWhatsAppRoutes = require('./routes/testWhatsApp');
 const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
 const amcRoutes = require('./routes/amc');
 const amcPortalRoutes = require('./routes/amc_portal');
+const tallyRoutes = require('./routes/tally');
 
 const app = express();
 const server = http.createServer(app);
@@ -103,6 +104,7 @@ app.use('/api', testWhatsAppRoutes);
 app.use('/api/whatsapp', whatsappWebhookRoutes);
 app.use('/api/amc', amcRoutes);
 app.use('/api/amc', amcPortalRoutes);
+app.use('/api/tally', tallyRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -158,11 +160,16 @@ app.use(errorHandler);
 const PORT = config.server.port;
 
 // ---- Try to connect to DB on startup (non-blocking) ----
+const tallyService = require('./services/tallyService');
 (async () => {
   try {
     dbReady = await waitForPool(20, 500);
     if (dbReady) {
       console.log('Database connected successfully to ' + config.db.database);
+      if (process.env.TALLY_HOST) {
+        console.log('Starting Tally poller...');
+        tallyService.startPoller(pool);
+      }
     }
   } catch (e) {
     console.warn('Database not available:', e.message);

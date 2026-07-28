@@ -11,7 +11,7 @@ const authenticate = async (req, res, next) => {
   try {
     const { query } = require('../config/database');
     const result = await query(
-      `SELECT u.id, u.full_name, u.mobile_number, u.email, u.username, u.role, u.is_active, u.is_disabled
+      `SELECT u.id, u.full_name, u.mobile_number, u.email, u.username, u.role, u.is_active, u.is_disabled, u.store_id
        FROM user_sessions s JOIN users u ON s.user_id = u.id
        WHERE s.session_token = $1 AND s.is_valid = TRUE AND s.expires_at > NOW()`,
       [token]
