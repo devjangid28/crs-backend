@@ -29,6 +29,7 @@ const whatsappWebhookRoutes = require('./routes/whatsappWebhook');
 const amcRoutes = require('./routes/amc');
 const amcPortalRoutes = require('./routes/amc_portal');
 const tallyRoutes = require('./routes/tally');
+const supplierRoutes = require('./routes/suppliers');
 
 const app = express();
 const server = http.createServer(app);
@@ -105,6 +106,7 @@ app.use('/api/whatsapp', whatsappWebhookRoutes);
 app.use('/api/amc', amcRoutes);
 app.use('/api/amc', amcPortalRoutes);
 app.use('/api/tally', tallyRoutes);
+app.use('/api/suppliers', supplierRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');

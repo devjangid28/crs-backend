@@ -1,0 +1,24 @@
+[
+  {
+    "stockName": "NOTEBOOK ASUS B1503CVAB-S76018",
+    "serial": "TCNXCV08C442508",
+    "rate": "47033.90",
+    "qty": "1 Qty",
+    "status": "Sold",
+    "vchType": "Sales Asus",
+    "partyName": "B M Roadline",
+    "vchDate": "20260727",
+    "vchNum": "ASUS2627JULY8"
+  },
+  {
+    "stockName": "NOTEBOOK HP VICTUS 15-FA2191TX",
+    "serial": "5CD5391BXX",
+    "rate": "62287.29",
+    "qty": "1 Qty",
+    "status": "Sold",
+    "vchType": "Sales Asus",
+    "partyName": "B M Roadline",
+    "vchDate": "20260727",
+    "vchNum": "ASUS2627JULY8"
+  }
+]

@@ -229,36 +229,6 @@ router.post('/', async (req, res, next) => {
 
     await client.query('COMMIT');
 
-    // Auto-mark inventory serial number as sold (fire-and-forget, outside transaction)
-    if (serialNumber && serialNumber.trim()) {
-      setImmediate(async () => {
-        try {
-          const invCheck = await query(
-            `SELECT id, status FROM inventory_items WHERE serial_number = $1 AND is_active = true`,
-            [serialNumber.trim()]
-          );
-          if (invCheck.rows.length > 0 && invCheck.rows[0].status === 'Available') {
-            const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-            await query(
-              `UPDATE inventory_items SET status = 'Sold', updated_at = $1 WHERE id = $2`,
-              [now, invCheck.rows[0].id]
-            );
-            await query(
-              `INSERT INTO inventory_history (inventory_item_id, action, user_id, user_name, previous_value, new_value, remarks, metadata, created_at)
-               VALUES ($1, 'Sold', NULL, 'System', 'Available', 'Sold', $2, $3, $4)`,
-              [invCheck.rows[0].id,
-               `Auto-marked as sold via order ${orderNumber}`,
-               JSON.stringify({ order_id: orderId, order_number: orderNumber, serial_number: serialNumber }),
-               now]
-            );
-            console.log(`[Inventory] Auto-marked serial ${serialNumber} as Sold for order ${orderNumber}`);
-          }
-        } catch (e) {
-          console.error('[Inventory] Failed to auto-mark serial as sold:', e.message);
-        }
-      });
-    }
-
     const newOrder = await client.query(
       `SELECT o.*, COALESCE(json_agg(json_build_object(
         'id', oc.id, 'component_name', oc.component_name,

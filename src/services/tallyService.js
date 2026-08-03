@@ -13,6 +13,10 @@ function getTallyConfig() {
     port: parseInt(process.env.TALLY_PORT, 10) || 9000,
     company: process.env.TALLY_COMPANY || '',
     pollIntervalMs: parseInt(process.env.TALLY_POLL_INTERVAL_MS, 10) || 300000,
+    salesVoucherType: process.env.TALLY_SALES_VOUCHER_TYPE || 'Sales',
+    salesLedger: process.env.TALLY_SALES_LEDGER || 'Sales',
+    cgstLedger: process.env.TALLY_CGST_LEDGER || 'Output CGST @9%',
+    sgstLedger: process.env.TALLY_SGST_LEDGER || 'Output SGST @9%',
   };
 }
 
@@ -43,15 +47,21 @@ const parser = new XMLParser({
     name === 'BATCHALLOCATIONS.LIST' ||
     name === 'ALLLEDGERENTRIES.LIST' ||
     name === 'INVENTORYENTRIES.LIST' ||
+    name === 'ALLINVENTORYENTRIES.LIST' ||
     name === 'SERIALNUMBERLIST' ||
     name === 'COMPANY' ||
     name === 'LEDGER' ||
     name === 'ACCOUNT' ||
-    name === 'STOCKITEM',
+    name === 'STOCKITEM' ||
+    name === 'STOCKGROUP' ||
+    name === 'STOCKCATEGORY' ||
+    name === 'BATCH' ||
+    name === 'SERIALNUMBER',
 });
 
 let poller = null;
 let lastSyncDate = null;
+let lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: null };
 
 function log(tag, msg) {
   console.log(`[TallyService ${new Date().toISOString()}] [${tag}] ${msg}`);
@@ -110,16 +120,17 @@ function buildExportRequest(fromDate, companyName) {
   return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}<SVFROMDATE>${dateStr}</SVFROMDATE><SVTODATE>$$SysName:Today</SVTODATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME></STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
 }
 
-function rawHttpRequest(url, method, headers, body) {
+function rawHttpRequest(url, method, headers, body, timeoutMs) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
+    const timeout = timeoutMs || 30000;
     const options = {
       hostname: urlObj.hostname,
       port: urlObj.port || 80,
       path: urlObj.pathname + urlObj.search,
       method: method,
       headers: headers || {},
-      timeout: 15000,
+      timeout: timeout,
     };
 
     log('REQ', `${method} ${url}`);
@@ -406,9 +417,11 @@ async function testConnection() {
     if (httpResult.body.includes('TallyPrime Server is Running') || httpResult.body.includes('Tally')) {
       log('TEST', 'Tally server confirmed running');
     }
+    lastConnectionStatus = { reachable: true, companyFound: false, lastChecked: new Date().toISOString() };
   } catch (err) {
     result.error = err.message;
     result.errorDetail = { code: err.code, errno: err.errno, syscall: err.syscall, address: err.address, port: err.port };
+    lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: new Date().toISOString() };
     logError('Test connection failed', err);
     return result;
   }
@@ -461,6 +474,7 @@ async function testConnection() {
         result.company = cfg.company || '(active)';
       }
 
+      lastConnectionStatus = { reachable: true, companyFound: result.companyFound, lastChecked: new Date().toISOString() };
       result.voucherCount = voucherCount;
       log('TEST', 'Day Book vouchers found: ' + voucherCount + ', Company: ' + result.company);
     } else {
@@ -525,7 +539,7 @@ function extractSerialNumbers(xmlResult) {
               if (maybeSerial && /^[A-Z0-9\-]+$/i.test(maybeSerial)) serialNos = [maybeSerial];
             }
 
-            if (!serialNos.length && batchName && batchName !== 'Primary' && batchName.trim()) {
+            if (!serialNos.length && batchName && batchName !== 'Primary' && !/^Primary\s*Batch$/i.test(batchName) && batchName.trim()) {
               serialNos = [batchName];
             }
 
@@ -662,24 +676,43 @@ async function syncSales(pool) {
 
   for (const entry of allSerials) {
     try {
-      const existing = await pool.query('SELECT id, status FROM inventory_items WHERE serial_number = $1', [entry.serial_number]);
+      const serialStr = String(entry.serial_number || '').trim();
+      if (!serialStr || serialStr === 'Primary' || /^Primary\s*Batch$/i.test(serialStr)) {
+        skipped++;
+        continue;
+      }
+
+      const existing = await pool.query('SELECT id, status FROM inventory_items WHERE serial_number = $1', [serialStr]);
       if (!existing.rows.length) {
         skipped++;
-        await pool.query(`INSERT INTO tally_sync_log (voucher_number, voucher_date, stock_item_name, batch_name, serial_number, company_name, sync_status, error_message, raw_data) VALUES ($1, $2, $3, $4, $5, $6, 'no_match', 'No matching inventory item found', $7)`, [entry.voucher_number, entry.voucher_date, entry.stock_item_name, entry.batch_name, entry.serial_number, entry.company_name || null, JSON.stringify(entry)]).catch(e => logError('DB log insert error', e));
+        // Skip noise:
+        // 1) This voucher+serial was already logged before (dedupe, so the 5-min
+        //    poller does not re-add the same no_match entry every cycle).
+        // 2) This serial was already pushed/synced by CRS itself (e.g. an invoice
+        //    pushed to Tally) - Tally renumbers vouchers, so match by serial.
+        const dupCheck = await pool.query(
+          `SELECT id FROM tally_sync_log
+           WHERE (sync_status = $1 AND voucher_number = $2 AND serial_number = $3)
+              OR (serial_number = $3 AND sync_status IN ('pushed','synced'))
+           LIMIT 1`,
+          ['no_match', entry.voucher_number, serialStr]
+        );
+        if (dupCheck.rows.length) continue;
+        await pool.query(`INSERT INTO tally_sync_log (voucher_number, voucher_date, stock_item_name, batch_name, serial_number, company_name, sync_status, error_message, raw_data) VALUES ($1, $2, $3, $4, $5, $6, 'no_match', 'No matching inventory item found', $7)`, [entry.voucher_number, entry.voucher_date, entry.stock_item_name, entry.batch_name, serialStr, entry.company_name || null, JSON.stringify(entry)]).catch(e => logError('DB log insert error', e));
         continue;
       }
 
       const inv = existing.rows[0];
       if (inv.status === 'Sold') { skipped++; continue; }
 
-      const alreadySynced = await pool.query('SELECT id FROM tally_sync_log WHERE serial_number = $1 AND sync_status = $2', [entry.serial_number, 'synced']);
+      const alreadySynced = await pool.query('SELECT id FROM tally_sync_log WHERE serial_number = $1 AND sync_status = $2', [serialStr, 'synced']);
       if (alreadySynced.rows.length) { skipped++; continue; }
 
       await pool.query(`UPDATE inventory_items SET status = 'Sold', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status != 'Sold'`, [inv.id]);
-      await pool.query(`INSERT INTO inventory_history (item_id, action, performed_by, remarks) VALUES ($1, 'status_change', 'Tally Auto-Sync', $2)`, [inv.id, `Auto-marked Sold via Tally (${entry.company_name || 'unknown'}). Voucher: ${entry.voucher_number}`]);
-      await pool.query(`INSERT INTO tally_sync_log (voucher_number, voucher_date, stock_item_name, batch_name, serial_number, company_name, matched_inventory_id, sync_status, raw_data) VALUES ($1, $2, $3, $4, $5, $6, $7, 'synced', $8)`, [entry.voucher_number, entry.voucher_date, entry.stock_item_name, entry.batch_name, entry.serial_number, entry.company_name || null, inv.id, JSON.stringify(entry)]);
+      await pool.query(`INSERT INTO inventory_history (inventory_item_id, action, performed_by, remarks) VALUES ($1, 'status_change', 'Tally Auto-Sync', $2)`, [inv.id, `Auto-marked Sold via Tally (${entry.company_name || 'unknown'}). Voucher: ${entry.voucher_number}`]);
+      await pool.query(`INSERT INTO tally_sync_log (voucher_number, voucher_date, stock_item_name, batch_name, serial_number, company_name, matched_inventory_id, sync_status, raw_data) VALUES ($1, $2, $3, $4, $5, $6, $7, 'synced', $8)`, [entry.voucher_number, entry.voucher_date, entry.stock_item_name, entry.batch_name, serialStr, entry.company_name || null, inv.id, JSON.stringify(entry)]);
       synced++;
-      log('SYNC', `Synced serial ${entry.serial_number} -> inventory #${inv.id} (${entry.company_name || 'unknown'})`);
+      log('SYNC', `Synced serial ${serialStr} -> inventory #${inv.id} (${entry.company_name || 'unknown'})`);
     } catch (err) {
       errors++;
       logError(`Error syncing serial ${entry.serial_number}`, err);
@@ -710,6 +743,1527 @@ function stopPoller() {
   if (poller) { clearInterval(poller); poller = null; log('POLLER', 'Stopped'); }
 }
 
+function escapeXml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function buildSalesVoucherXml(voucherData) {
+  const cfg = getTallyConfig();
+  let dateStr = voucherData.date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  if (!/^\d{8}$/.test(dateStr)) {
+    dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  }
+  const partyName = escapeXml(voucherData.partyName || 'Walk-in Customer');
+  const voucherNumber = escapeXml(voucherData.voucherNumber || '');
+  const narration = escapeXml(voucherData.narration || 'Sales via CRS');
+  const voucherType = escapeXml(voucherData.voucherType || cfg.salesVoucherType || 'Sales Asus');
+  const salesLedger = escapeXml(cfg.salesLedger || 'SALES @ 18%');
+  const cgstLedger = escapeXml(cfg.cgstLedger || 'OUTPUT CGST @ 9%');
+  const sgstLedger = escapeXml(cfg.sgstLedger || 'OUTPUT SGST @ 9%');
+  let companyTag = '';
+  if (cfg.company && cfg.company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
+  }
+
+  let inventoryEntries = '';
+  let totalAmount = 0;
+  const items = voucherData.items || [];
+  const taxRate = parseFloat(voucherData.taxRate) || 18;
+  const cgstRate = taxRate / 2;
+  const sgstRate = taxRate / 2;
+
+  for (const item of items) {
+    const qty = parseInt(item.qty || item.quantity) || 1;
+    const rate = parseFloat(item.price || item.unitPrice) || 0;
+    const disc = parseFloat(item.discount || 0);
+    const amount = (rate - disc) * qty;
+    const displayRate = rate - disc;
+    const itemName = escapeXml(item.name || item.description || 'Service');
+
+    if (item.skipInventory) {
+      totalAmount += amount;
+      continue;
+    }
+
+    // Sales Asus voucher type in this Tally uses positive AMOUNT for outgoing stock
+    // Sales ledger goes inside ACCOUNTINGALLOCATIONS.LIST within inventory entry
+    // BATCHALLOCATIONS.LIST is only needed when we MUST deduct from a specific existing
+    // Tally batch. For normal stock ('Primary' / 'Primary Batch' / no batch), we OMIT it
+    // so Tally auto-allocates from the available batch - this reliably reduces quantity.
+    // A BATCHALLOCATIONS.LIST pointing to a batch that does not exist creates a voucher
+    // that shows as synced but does NOT reduce stock.
+    const rawBatch = (item.batch || '').trim();
+    const batchName = escapeXml(rawBatch);
+    const unit = 'Qty';
+    const usesExplicitBatch = !!rawBatch && rawBatch !== 'Primary' && !/^Primary\s*Batch$/i.test(rawBatch);
+    const batchAlloc = usesExplicitBatch ? `
+        <BATCHALLOCATIONS.LIST>
+          <GODOWNNAME>Main Location</GODOWNNAME>
+          <BATCHNAME>${batchName}</BATCHNAME>
+          <AMOUNT>${amount.toFixed(2)}</AMOUNT>
+          <ACTUALQTY> ${qty} ${unit}</ACTUALQTY>
+          <BILLEDQTY> ${qty} ${unit}</BILLEDQTY>
+        </BATCHALLOCATIONS.LIST>` : '';
+    inventoryEntries += `
+      <ALLINVENTORYENTRIES.LIST>
+        <STOCKITEMNAME>${itemName}</STOCKITEMNAME>
+        <GSTSOURCETYPE>Ledger</GSTSOURCETYPE>
+        <GSTLEDGERSOURCE>${salesLedger}</GSTLEDGERSOURCE>
+        <HSNSOURCETYPE>Stock Item</HSNSOURCETYPE>
+        <GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>
+        <GSTRATEINFERAPPLICABILITY>As per Masters/Company</GSTRATEINFERAPPLICABILITY>
+        <GSTHSNINFERAPPLICABILITY>As per Masters/Company</GSTHSNINFERAPPLICABILITY>
+        <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+        <ISLASTDEEMEDPOSITIVE>No</ISLASTDEEMEDPOSITIVE>
+        <RATE>${displayRate.toFixed(2)}/${unit}</RATE>
+        <DISCOUNT>${disc.toFixed(2)}</DISCOUNT>
+        <AMOUNT>${amount.toFixed(2)}</AMOUNT>
+        <ACTUALQTY> ${qty} ${unit}</ACTUALQTY>
+        <BILLEDQTY> ${qty} ${unit}</BILLEDQTY>${batchAlloc}
+        <ACCOUNTINGALLOCATIONS.LIST>
+          <LEDGERNAME>${salesLedger}</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+          <AMOUNT>${amount.toFixed(2)}</AMOUNT>
+        </ACCOUNTINGALLOCATIONS.LIST>
+      </ALLINVENTORYENTRIES.LIST>`;
+    totalAmount += amount;
+  }
+
+  const cgstAmount = totalAmount * cgstRate / 100;
+  const sgstAmount = totalAmount * sgstRate / 100;
+  const rawGrandTotal = totalAmount + cgstAmount + sgstAmount;
+
+  // Round off (Tally-style): round the grand total to a whole rupee and balance the
+  // difference through the ROUND OFF ledger, exactly like a voucher entered manually.
+  let grandTotal = rawGrandTotal;
+  let roundOffEntry = '';
+  let roundOffMaster = '';
+  if (voucherData.roundOff === true) {
+    const rounded = Math.round(rawGrandTotal);
+    const diff = rounded - rawGrandTotal;
+    grandTotal = rounded;
+    if (diff !== 0) {
+      const roundOffLedger = voucherData.roundOffLedger || 'Round Off';
+      roundOffEntry = `
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${escapeXml(roundOffLedger)}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+      <AMOUNT>${diff.toFixed(2)}</AMOUNT>
+    </LEDGERENTRIES.LIST>`;
+      if (voucherData.includeRoundOffMaster === true) {
+        roundOffMaster = `
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${escapeXml(roundOffLedger)}" ACTION="Create">
+              <NAME>${escapeXml(roundOffLedger)}</NAME>
+              <PARENT>Indirect Expenses</PARENT>
+            </LEDGER>
+          </TALLYMESSAGE>`;
+      }
+    }
+  }
+
+  // LEDGERENTRIES.LIST (not ALLLEDGERENTRIES.LIST) for party and tax ledgers.
+  // Order matches a manually entered TallyPrime voucher: party first, then GST,
+  // then round off. Party: ISDEEMEDPOSITIVE=Yes with negative amount (debit party).
+  // GST: ISDEEMEDPOSITIVE=No with positive amount.
+  const partyBillAlloc = voucherNumber ? `
+      <BILLALLOCATIONS.LIST>
+        <BILLTYPE>New Ref</BILLTYPE>
+        <NAME>${voucherNumber}</NAME>
+        <AMOUNT>${grandTotal.toFixed(2)}</AMOUNT>
+      </BILLALLOCATIONS.LIST>` : '';
+  const ledgerEntries = `
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${partyName}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+      <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+      <AMOUNT>-${grandTotal.toFixed(2)}</AMOUNT>${partyBillAlloc}
+    </LEDGERENTRIES.LIST>
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${cgstLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${cgstAmount.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${cgstRate}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${sgstLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${sgstAmount.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${sgstRate}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>${roundOffEntry}`;
+
+  return `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <IMPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>Vouchers</REPORTNAME>
+          <STATICVARIABLES>${companyTag}</STATICVARIABLES>
+        </REQUESTDESC>
+        <REQUESTDATA>
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${partyName}" ACTION="Create">
+              <NAME>${partyName}</NAME>
+              <PARENT>Sundry Debtors</PARENT>
+            </LEDGER>
+          </TALLYMESSAGE>
+          ${roundOffMaster}
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <VOUCHER VCHTYPE="${voucherType}" ACTION="Create" OBJVIEW="Invoice Voucher View">
+              <DATE>${dateStr}</DATE>
+              <VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME>
+              ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+              <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+              <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
+              <ISINVOICE>Yes</ISINVOICE>
+              <NUMBERINGSTYLE>Auto Retain</NUMBERINGSTYLE>
+              <PARTYLEDGERNAME>${partyName}</PARTYLEDGERNAME>
+              <NARRATION>${narration}</NARRATION>
+              ${inventoryEntries}
+              ${ledgerEntries}
+            </VOUCHER>
+          </TALLYMESSAGE>
+        </REQUESTDATA>
+      </IMPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+}
+
+async function pushSalesVoucher(voucherData) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  log('PUSH', `Pushing sales voucher to Tally: ${voucherData.voucherNumber || '(auto)'}`);
+
+  const payload = { ...voucherData };
+  if (voucherData.roundOff === true) {
+    try {
+      const names = await ledgerNamesSnapshot(false);
+      const existing = names.find(n => /round\s*off/i.test(n));
+      payload.roundOffLedger = existing || 'Round Off';
+      payload.includeRoundOffMaster = !existing;
+      log('PUSH', `Round off ledger resolved: "${payload.roundOffLedger}" (create master: ${payload.includeRoundOffMaster})`);
+    } catch (err) {
+      payload.roundOffLedger = 'Round Off';
+      payload.includeRoundOffMaster = true;
+    }
+  }
+
+  const xml = buildSalesVoucherXml(payload);
+  log('PUSH', `XML length: ${xml.length} bytes`);
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml);
+
+    log('PUSH', `Response status: ${response.statusCode}, length: ${response.body.length}`);
+
+    const parsed = deepParseResponse(response.body);
+    // TallyPrime returns results inside <RESPONSE> tag (not IMPORTRESULT)
+    const importResult = parsed?.ENVELOPE?.BODY?.IMPORTDATA?.IMPORTRESULT
+      || parsed?.ENVELOPE?.BODY?.DATA?.IMPORTRESULT
+      || parsed?.RESPONSE
+      || null;
+
+    // Also check top-level RESPONSE (TallyPrime format)
+    const topResponse = parsed?.RESPONSE || null;
+
+    // Extract LINEERROR from raw response body (Tally returns it inside <RESPONSE> tag)
+    let tallyLineError = '';
+    if (response.body.includes('LINEERROR')) {
+      const match = response.body.match(/<LINEERROR>(.*?)<\/LINEERROR>/);
+      tallyLineError = match ? match[1] : '';
+    }
+
+    if (importResult) {
+      const created = parseInt(importResult.CREATED) || 0;
+      const errors = parseInt(importResult.ERRORS) || 0;
+      const exceptions = parseInt(importResult.EXCEPTIONS) || 0;
+      const lastVchId = importResult.LASTVCHID || null;
+
+      const hasProblems = errors > 0 || exceptions > 0;
+      const errMsg = tallyLineError || `Tally reported errors:${errors} exceptions:${exceptions}`;
+
+      if (created > 0 && hasProblems) {
+        log('PUSH', `Sales voucher created (${created}) but with exceptions: ${exceptions}, errors: ${errors}. ${errMsg}`);
+        return { success: false, message: `Voucher created but with errors: ${errMsg}`, created, lastVchId, errors, exceptions, synced: false };
+      }
+
+      if (created > 0) {
+        log('PUSH', `Sales voucher created: ${created}, LastVchID: ${lastVchId}`);
+        return { success: true, message: 'Sales voucher pushed to Tally', created, lastVchId, errors: 0, exceptions: 0, synced: true };
+      }
+
+      if (hasProblems) {
+        logError('Push sales voucher failed', errMsg);
+        return { success: false, message: errMsg, created: 0, errors, exceptions, synced: false };
+      }
+
+      log('PUSH', `Sales voucher result: created=${created}, errors=${errors}, exceptions=${exceptions}`);
+      return { success: created > 0, message: created > 0 ? 'Sales voucher pushed to Tally' : 'No voucher created', created, lastVchId, errors: 0, exceptions: 0, synced: created > 0 };
+    }
+
+    if (tallyLineError) {
+      logError('Push sales voucher LINEERROR', tallyLineError);
+      return { success: false, message: tallyLineError, created: 0, errors: 1, synced: false };
+    }
+
+    return { success: true, message: 'Request sent to Tally', created: 0, errors: 0, synced: false, raw: response.body.substring(0, 500) };
+  } catch (err) {
+    logError('Push sales voucher HTTP error', err);
+    return { success: false, message: err.message, created: 0, errors: 1, synced: false };
+  }
+}
+
+async function pushSalesVoucherWithRetry(voucherData, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    log('PUSH', `Attempt ${attempt}/${maxRetries} for voucher: ${voucherData.voucherNumber || '(auto)'}`);
+    try {
+      const result = await pushSalesVoucher(voucherData);
+      if (result.success) {
+        lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+        return result;
+      }
+      lastError = result.message;
+      log('PUSH', `Attempt ${attempt} failed: ${result.message}`);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+    } catch (err) {
+      lastError = err.message;
+      logError(`Push attempt ${attempt} error`, err);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+    }
+  }
+  lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: new Date().toISOString() };
+  return { success: false, message: `Failed after ${maxRetries} attempts: ${lastError}`, created: 0, errors: 1, synced: false };
+}
+
+async function pingTally() {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  try {
+    const result = await rawHttpRequest(url, 'GET', { 'User-Agent': 'CRS-Ping' }, null, 10000);
+    const reachable = result.statusCode >= 200 && result.statusCode < 500;
+    lastConnectionStatus = { reachable, companyFound: reachable, lastChecked: new Date().toISOString() };
+    return { reachable, status: result.statusCode };
+  } catch (err) {
+    lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: new Date().toISOString() };
+    return { reachable: false, error: err.message, code: err.code };
+  }
+}
+
+function getConnectionStatus() {
+  return lastConnectionStatus;
+}
+
+// ============================================================
+// SERIAL NUMBER -> STOCK ITEM NAME LOOKUP
+// Queries Tally to find which stock item has a given serial number
+// so we don't need CRS product_name to match Tally stock item name.
+// ============================================================
+let serialCache = null;
+let serialCacheTime = 0;
+const SERIAL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function buildStockItemsExportRequest() {
+  const cfg = getTallyConfig();
+  let companyTag = '';
+  if (cfg.company && cfg.company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
+  }
+  return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Stock Query</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}<SVINCLUDEBATCHES>Yes</SVINCLUDEBATCHES><SVSHOWITEMWISERATE>Yes</SVSHOWITEMWISERATE></STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+}
+
+function buildStockItemsListRequest() {
+  const cfg = getTallyConfig();
+  let companyTag = '';
+  if (cfg.company && cfg.company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
+  }
+  return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>List of Stock Items</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+}
+
+async function fetchStockSerialMap() {
+  const now = Date.now();
+  if (serialCache && (now - serialCacheTime) < SERIAL_CACHE_TTL_MS) {
+    log('SERIAL-LOOKUP', `Using cached serial map (${Object.keys(serialCache).length} entries, age ${Math.round((now - serialCacheTime) / 1000)}s)`);
+    return serialCache;
+  }
+
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const map = {};
+
+  // Strategy 1: Scan stock item NAMES for a trailing "[serial]" suffix. The add flow now
+  // creates one Tally stock item per serial named "{product} [{serial}]", so the serial
+  // travels inside the item NAME - this works even though serial tracking is disabled on the
+  // stock items (a plain SERIALNUMBERLIST is silently dropped by Tally). CRSStockFull is the
+  // same proven read-only collection used for stock verification.
+  log('SERIAL-LOOKUP', 'Scanning stock item names for "[serial]" suffix (CRSStockFull)...');
+  try {
+    const xml = buildMasterCollectionRequest('StockItem', 'CRSStockFull', ['Name', 'Parent', 'ClosingBalance']);
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 30000);
+
+    if (response.body && response.body.length > 200) {
+      const parsed = parser.parse(response.body);
+      const data = parsed?.ENVELOPE?.BODY?.DATA;
+      let collections = data?.COLLECTION;
+      if (collections) {
+        const collArr = Array.isArray(collections) ? collections : [collections];
+        for (const coll of collArr) {
+          const stockItems = coll?.STOCKITEM;
+          if (!stockItems) continue;
+          const itemArr = Array.isArray(stockItems) ? stockItems : [stockItems];
+          for (const item of itemArr) {
+            const stockName = (item?.NAME || item?.['@_NAME'] || '').trim();
+            if (!stockName) continue;
+            const match = stockName.match(/\[([^\[\]]+)\]$/);
+            if (match && match[1] && match[1].trim()) {
+              const serialFromName = match[1].trim();
+              if (!map[serialFromName]) {
+                map[serialFromName] = stockName;
+                log('SERIAL-LOOKUP', `Serial "${serialFromName}" -> Stock Item "${stockName}" (from item name)`);
+              }
+            }
+          }
+        }
+      }
+    }
+    log('SERIAL-LOOKUP', `Stock item name scan: found ${Object.keys(map).length} serial mappings`);
+  } catch (err) {
+    logError('Failed to scan stock item names', err);
+  }
+
+  // Strategy 2: Try "List of Stock Items" which returns stock items with batch/serial info.
+  // Only needed when the name scan found nothing (real serial-tracking data lives here).
+  if (Object.keys(map).length === 0) {
+    log('SERIAL-LOOKUP', 'Fetching stock items from Tally to build serial number map...');
+    try {
+      const xml = buildStockItemsListRequest();
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 30000);
+
+    if (response.body && response.body.length > 200) {
+      const parsed = parser.parse(response.body);
+      const body = parsed?.ENVELOPE?.BODY;
+      let messages = body?.IMPORTDATA?.REQUESTDATA?.TALLYMESSAGE;
+      if (!messages) messages = body?.DATA?.TALLYMESSAGE;
+
+      if (messages) {
+        const msgArr = Array.isArray(messages) ? messages : [messages];
+        log('SERIAL-LOOKUP', `Processing ${msgArr.length} TALLYMESSAGE entries from stock items list`);
+
+        for (const msg of msgArr) {
+          const stockItems = msg?.STOCKITEM;
+          if (!stockItems) continue;
+          const itemArr = Array.isArray(stockItems) ? stockItems : [stockItems];
+
+          for (const item of itemArr) {
+            const stockName = item?.NAME || item?.['@_NAME'] || '';
+            if (!stockName) continue;
+
+            // Check BATCHALLOCATIONS.LIST for serial numbers
+            const batches = item?.['BATCHALLOCATIONS.LIST'] || [];
+            const batchArr = Array.isArray(batches) ? batches : [batches];
+            for (const batch of batchArr) {
+              const serialNos = batch?.SERIALNUMBERLIST?.SERIALNUMBER || [];
+              const serialArr = Array.isArray(serialNos) ? serialNos : [serialNos];
+              for (const serial of serialArr) {
+                const serialStr = (typeof serial === 'string' ? serial : serial?.['#text'] || '').trim();
+                if (serialStr) {
+                  map[serialStr] = stockName;
+                  log('SERIAL-LOOKUP', `Serial "${serialStr}" -> Stock Item "${stockName}"`);
+                }
+              }
+              // Also check batch name as potential serial
+              const batchName = batch?.BATCHNAME || '';
+              if (batchName && batchName !== 'Primary' && !/^Primary\s*Batch$/i.test(batchName) && batchName.trim()) {
+                const bn = batchName.trim();
+                if (!map[bn]) {
+                  map[bn] = stockName;
+                }
+              }
+            }
+
+            // Also check ADDITIONALNAME
+            const additionalName = item?.ADDITIONALNAME || '';
+            if (additionalName && additionalName.trim() && !map[additionalName.trim()]) {
+              map[additionalName.trim()] = stockName;
+            }
+          }
+        }
+      }
+    }
+    log('SERIAL-LOOKUP', `List of Stock Items: found ${Object.keys(map).length} serial mappings`);
+    } catch (err) {
+      logError('Failed to fetch stock items list', err);
+    }
+  }
+
+  // Strategy 3: If the strategies above found nothing, try fetching Day Book vouchers to extract serial->stockitem mapping from past sales
+  if (Object.keys(map).length === 0) {
+    log('SERIAL-LOOKUP', 'No serials from stock items list, trying Day Book vouchers as fallback...');
+    try {
+      const exportXml = buildExportRequest(null, cfg.company);
+      const response = await rawHttpRequest(url, 'POST', {
+        'Content-Type': 'text/xml',
+        'Content-Length': Buffer.byteLength(exportXml),
+      }, exportXml, 30000);
+
+      if (response.body && response.body.length > 200) {
+        const parsed = parser.parse(response.body);
+        const body = parsed?.ENVELOPE?.BODY;
+        let messages = body?.IMPORTDATA?.REQUESTDATA?.TALLYMESSAGE;
+        if (!messages) messages = body?.DATA?.TALLYMESSAGE;
+
+        if (messages) {
+          const msgArr = Array.isArray(messages) ? messages : [messages];
+          for (const msg of msgArr) {
+            const vouchers = msg?.VOUCHER;
+            if (!vouchers) continue;
+            const vchArr = Array.isArray(vouchers) ? vouchers : [vouchers];
+            for (const vch of vchArr) {
+              const invAll = vch?.['ALLINVENTORYENTRIES.LIST'] || vch?.INVENTORYENTRIES?.LIST || [];
+              const invArr = Array.isArray(invAll) ? invAll : [invAll];
+              for (const inv of invArr) {
+                const stockName = inv?.STOCKITEMNAME || '';
+                const batches = inv?.['BATCHALLOCATIONS.LIST'] || inv?.BATCHALLOCATIONS?.LIST || [];
+                const batchArr = Array.isArray(batches) ? batches : [batches];
+                for (const batch of batchArr) {
+                  const serialNos = batch?.SERIALNUMBERLIST?.SERIALNUMBER || [];
+                  const serialArr = Array.isArray(serialNos) ? serialNos : [serialNos];
+                  for (const serial of serialArr) {
+                    const serialStr = (typeof serial === 'string' ? serial : serial?.['#text'] || '').trim();
+                    if (serialStr && stockName) {
+                      map[serialStr] = stockName;
+                    }
+                  }
+                  const batchName = batch?.BATCHNAME || '';
+                  if (batchName && batchName !== 'Primary' && !/^Primary\s*Batch$/i.test(batchName) && batchName.trim() && stockName) {
+                    map[batchName.trim()] = stockName;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      log('SERIAL-LOOKUP', `Day Book fallback: found ${Object.keys(map).length} serial mappings total`);
+    } catch (err) {
+      logError('Day Book fallback failed', err);
+    }
+  }
+
+  serialCache = map;
+  serialCacheTime = now;
+  log('SERIAL-LOOKUP', `Serial map built: ${Object.keys(map).length} entries cached for ${SERIAL_CACHE_TTL_MS / 1000}s`);
+  return map;
+}
+
+async function lookupStockItemBySerial(serialNumber) {
+  if (!serialNumber || !serialNumber.trim()) return null;
+  const map = await fetchStockSerialMap();
+  const result = map[serialNumber.trim()] || null;
+  if (result) {
+    log('SERIAL-LOOKUP', `Found: "${serialNumber}" -> "${result}"`);
+  } else {
+    log('SERIAL-LOOKUP', `Not found in Tally: "${serialNumber}"`);
+  }
+  return result;
+}
+
+function clearSerialCache() {
+  serialCache = null;
+  serialCacheTime = 0;
+  log('SERIAL-LOOKUP', 'Cache cleared');
+}
+
+function buildMasterCollectionRequest(type, collectionName, nativeMethods) {
+  const cfg = getTallyConfig();
+  let companyTag = '';
+  if (cfg.company && cfg.company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
+  }
+  const methods = (nativeMethods || []).map(m => `            <NATIVEMETHOD>${m}</NATIVEMETHOD>`).join('\n');
+  return `<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>${collectionName}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyTag}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="${collectionName}" ISINITIALIZE="Yes">
+            <TYPE>${type}</TYPE>
+${methods}
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`;
+}
+
+function cleanMasterParent(val) {
+  if (!val) return '';
+  return String(val).replace(/^[^A-Za-z0-9_]+/, '').trim();
+}
+
+async function fetchStockCategories() {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const categories = [];
+  const groups = [];
+
+  async function fetchList(type, collectionName, nativeMethods, tagName, target) {
+    try {
+      const xml = buildMasterCollectionRequest(type, collectionName, nativeMethods);
+      const response = await rawHttpRequest(url, 'POST', {
+        'Content-Type': 'text/xml',
+        'Content-Length': Buffer.byteLength(xml),
+      }, xml, 30000);
+      if (!response.body || response.body.length < 100) return;
+      const parsed = parser.parse(response.body);
+      const data = parsed?.ENVELOPE?.BODY?.DATA;
+      let collections = data?.COLLECTION;
+      if (!collections) return;
+      const collArr = Array.isArray(collections) ? collections : [collections];
+      for (const coll of collArr) {
+        const entries = coll?.[tagName];
+        if (!entries) continue;
+        const list = Array.isArray(entries) ? entries : [entries];
+        for (const entry of list) {
+          const name = entry?.NAME || entry?.['@_NAME'] || '';
+          if (name && name.trim()) {
+            target.push({
+              name: name.trim(),
+              parent: cleanMasterParent(entry?.PARENT?.['#text'] || entry?.PARENT || ''),
+            });
+          }
+        }
+      }
+    } catch (err) {
+      logError(`Failed to fetch ${tagName} from Tally`, err);
+    }
+  }
+
+  await fetchList('StockGroup', 'CRSStockGroups', ['Name', 'Parent'], 'STOCKGROUP', groups);
+  await fetchList('StockCategory', 'CRSStockCategories', ['Name', 'Parent'], 'STOCKCATEGORY', categories);
+
+  log('CATEGORIES', `Fetched ${categories.length} stock categories, ${groups.length} stock groups from Tally`);
+  return { categories, groups };
+}
+
+async function fetchLedgers() {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const ledgers = [];
+  try {
+    const xml = buildMasterCollectionRequest('Ledger', 'CRSLedgers', ['Name', 'Parent'], 'LEDGER', []);
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 30000);
+    if (!response.body || response.body.length < 100) return { ledgers: [], count: 0 };
+    const parsed = parser.parse(response.body);
+    const data = parsed?.ENVELOPE?.BODY?.DATA;
+    let collections = data?.COLLECTION;
+    if (!collections) return { ledgers: [], count: 0 };
+    const collArr = Array.isArray(collections) ? collections : [collections];
+    for (const coll of collArr) {
+      const entries = coll?.LEDGER;
+      if (!entries) continue;
+      const list = Array.isArray(entries) ? entries : [entries];
+      for (const entry of list) {
+        const name = entry?.NAME || entry?.['@_NAME'] || '';
+        if (name && name.trim()) {
+          ledgers.push({
+            name: name.trim(),
+            parent: cleanMasterParent(entry?.PARENT?.['#text'] || entry?.PARENT || ''),
+          });
+        }
+      }
+    }
+  } catch (err) {
+    logError('Failed to fetch ledgers from Tally', err);
+  }
+  log('LEDGERS', `Fetched ${ledgers.length} ledgers from Tally`);
+  return { ledgers, count: ledgers.length };
+}
+
+function buildLedgerCreateXml(name, company, options = {}) {
+  const cfg = getTallyConfig();
+  const companyName = company || cfg.company || '';
+  let companyTag = '';
+  if (companyName && companyName.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`;
+  }
+  const ledgerName = escapeXml(name || '');
+  const parent = escapeXml(options.parent || 'Sundry Creditors');
+  const gstNo = escapeXml(options.gstNo || '');
+  const gstRegistrationType = escapeXml(options.gstRegistrationType || 'Unregistered');
+  const typeOfSupply = escapeXml(options.typeOfSupply || 'Goods');
+
+  let gstXml = '';
+  if (gstNo) {
+    gstXml = `
+          <GSTAPPLICABLE>&#4; Applicable</GSTAPPLICABLE>
+          <GSTTYPEOFSUPPLY>${typeOfSupply}</GSTTYPEOFSUPPLY>
+          <GSTREGISTRATIONTYPE>${gstRegistrationType}</GSTREGISTRATIONTYPE>
+          <GSTDETAILS.LIST>
+            <GSTNUMBER>${gstNo}</GSTNUMBER>
+          </GSTDETAILS.LIST>`;
+  } else {
+    gstXml = `
+          <GSTAPPLICABLE>&#4; Not Applicable</GSTAPPLICABLE>
+          <GSTTYPEOFSUPPLY>${typeOfSupply}</GSTTYPEOFSUPPLY>`;
+  }
+
+  return `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <IMPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>All Masters</REPORTNAME>
+          <STATICVARIABLES>${companyTag}</STATICVARIABLES>
+        </REQUESTDESC>
+        <REQUESTDATA>
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${ledgerName}" ACTION="Create">
+              <NAME>${ledgerName}</NAME>
+              <PARENT>${parent}</PARENT>${gstXml}
+            </LEDGER>
+          </TALLYMESSAGE>
+        </REQUESTDATA>
+      </IMPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+}
+
+async function pushLedgerToTally(name, company, options = {}) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const xml = buildLedgerCreateXml(name, company, options);
+  log('LEDGER-PUSH', `Pushing ledger "${name}" to Tally (parent: ${options.parent || 'Sundry Creditors'})`);
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 30000);
+    let tallyLineError = '';
+    if (response.body.includes('LINEERROR')) {
+      const match = response.body.match(/<LINEERROR>(.*?)<\/LINEERROR>/);
+      tallyLineError = match ? match[1] : '';
+    }
+    const errors = /<ERRORS>[1-9]/.test(response.body) || /<EXCEPTIONS>[1-9]/.test(response.body) || /<CANCELLED>[1-9]/.test(response.body);
+    if (errors || tallyLineError) {
+      logError('Ledger push had errors', tallyLineError || response.body);
+      return { success: false, message: tallyLineError || `Tally reported errors creating ledger "${name}"` };
+    }
+    lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+    return { success: true, message: `Ledger "${name}" created in Tally under ${options.parent || 'Sundry Creditors'}`, created: /<CREATED>[1-9]/.test(response.body) };
+  } catch (err) {
+    logError('Push ledger HTTP error', err);
+    return { success: false, message: err.message };
+  }
+}
+
+function buildGstDetailsXml(item) {
+  const gstApplicable = String(item.gstApplicability || 'Applicable').trim().toLowerCase();
+  const isApplicable = gstApplicable !== 'not applicable' && gstApplicable !== 'no';
+  const hsnCode = escapeXml(item.hsnCode || '');
+  const hsnDescription = escapeXml(item.hsnDescription || '');
+  const typeOfSupply = escapeXml(item.typeOfSupply || 'Goods');
+  const taxability = escapeXml(item.gstTaxability || 'Taxable');
+  const hsnSource = escapeXml(item.hsnSource || 'Specify Details Here');
+  const gstSource = escapeXml(item.gstSource || 'Specify Details Here');
+  const totalRate = parseFloat(item.gstRate) || 0;
+  const applicableFrom = '20240401';
+
+  let xml = `
+        <GSTAPPLICABLE>&#4; ${isApplicable ? 'Applicable' : 'Not Applicable'}</GSTAPPLICABLE>`;
+  xml += `\n        <GSTTYPEOFSUPPLY>${typeOfSupply}</GSTTYPEOFSUPPLY>`;
+  xml += `
+        <GSTDETAILS.LIST>
+          <APPLICABLEFROM>${applicableFrom}</APPLICABLEFROM>
+          <HSNCODE>${hsnCode}</HSNCODE>
+          <SRCOFGSTDETAILS>${gstSource}</SRCOFGSTDETAILS>
+          <TAXABILITY>${taxability}</TAXABILITY>`;
+  if (isApplicable && totalRate > 0) {
+    const cgst = (totalRate / 2).toFixed(2);
+    const sgst = (totalRate / 2).toFixed(2);
+    xml += `
+          <STATEWISEDETAILS.LIST>
+            <STATENAME>&#4; Any</STATENAME>
+            <RATEDETAILS.LIST>
+              <GSTRATEDUTYHEAD>CGST</GSTRATEDUTYHEAD>
+              <GSTRATEVALUATIONTYPE>Based on Value</GSTRATEVALUATIONTYPE>
+              <GSTRATE> ${cgst}</GSTRATE>
+              <GSTRATEPERUNIT>0</GSTRATEPERUNIT>
+            </RATEDETAILS.LIST>
+            <RATEDETAILS.LIST>
+              <GSTRATEDUTYHEAD>SGST/UTGST</GSTRATEDUTYHEAD>
+              <GSTRATEVALUATIONTYPE>Based on Value</GSTRATEVALUATIONTYPE>
+              <GSTRATE> ${sgst}</GSTRATE>
+              <GSTRATEPERUNIT>0</GSTRATEPERUNIT>
+            </RATEDETAILS.LIST>
+          </STATEWISEDETAILS.LIST>`;
+  }
+  xml += `
+        </GSTDETAILS.LIST>`;
+  if (hsnCode) {
+    xml += `
+        <HSNDETAILS.LIST>
+          <APPLICABLEFROM>${applicableFrom}</APPLICABLEFROM>
+          <HSNCODE>${hsnCode}</HSNCODE>
+          <HSN>${hsnDescription}</HSN>
+          <SRCOFHSNDETAILS>${hsnSource}</SRCOFHSNDETAILS>
+        </HSNDETAILS.LIST>`;
+  }
+  return xml;
+}
+
+function buildStockItemMastersXml(items, company, options = {}) {
+  const cfg = getTallyConfig();
+  const companyName = company || cfg.company || '';
+  let companyTag = '';
+  if (companyName && companyName.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`;
+  }
+
+  // stripConflictFields: used as a fallback when the full create/alter fails with a
+  // permanent config conflict (e.g. item already exists in Tally with different units
+  // or is locked in another group). Omitting BASEUNITS/PARENT/CATEGORY lets Tally ALTER
+  // the existing item and add the opening batch stock without error.
+  const stripConflictFields = !!options.stripConflictFields;
+
+  let tallyMessages = '';
+  for (const item of items) {
+    const name = escapeXml(item.name || '');
+    if (!name) continue;
+    const qty = parseInt(item.qty, 10) || 1;
+    const rate = parseFloat(item.rate) || 0;
+    const serials = (item.serials || []).map(s => String(s).trim()).filter(Boolean);
+    const categoryName = escapeXml(item.category || '');
+    const categoryType = String(item.categoryType || 'category').toLowerCase();
+
+    let serialXml = '';
+    if (serials.length) {
+      serialXml = `
+        <SERIALNUMBERLIST>
+          ${serials.map(s => `<SERIALNUMBER>${escapeXml(s)}</SERIALNUMBER>`).join('\n          ')}
+        </SERIALNUMBERLIST>`;
+    }
+
+    const baseUnitsXml = stripConflictFields ? '' : '<BASEUNITS>Qty</BASEUNITS>';
+    const categoryXml = stripConflictFields ? '' : (categoryName && categoryType === 'group'
+      ? `\n          <PARENT>${categoryName}</PARENT>`
+      : categoryName
+        ? `\n          <CATEGORY>${categoryName}</CATEGORY>`
+        : '');
+
+    const gstXml = buildGstDetailsXml(item);
+
+    tallyMessages += `
+      <TALLYMESSAGE xmlns:UDF="TallyUDF">
+        <STOCKITEM NAME="${name}" ACTION="Create">
+          <NAME>${name}</NAME>
+          ${baseUnitsXml}${categoryXml}${gstXml}
+          <BATCHALLOCATIONS.LIST>
+            <GODOWNNAME>Main Location</GODOWNNAME>
+            <BATCHNAME>Primary</BATCHNAME>
+            <OPENINGQTY> ${qty} Qty</OPENINGQTY>
+            <ACTUALQTY> ${qty} Qty</ACTUALQTY>
+            <RATE>${rate.toFixed(2)}</RATE>
+            <AMOUNT>${(qty * rate).toFixed(2)}</AMOUNT>${serialXml}
+          </BATCHALLOCATIONS.LIST>
+        </STOCKITEM>
+      </TALLYMESSAGE>`;
+  }
+
+  return `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <IMPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>All Masters</REPORTNAME>
+          <STATICVARIABLES>${companyTag}</STATICVARIABLES>
+        </REQUESTDESC>
+        <REQUESTDATA>
+          ${tallyMessages}
+        </REQUESTDATA>
+      </IMPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+}
+
+async function pushStockItemsToTally(items, company, options = {}) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  log('STOCK-PUSH', `Pushing ${items.length} stock item master(s) to Tally${options.stripConflictFields ? ' (stripped: units/group unchanged)' : ''}`);
+
+  const xml = buildStockItemMastersXml(items, company, options);
+  log('STOCK-PUSH', `XML length: ${xml.length} bytes`);
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 60000);
+
+    const parsed = deepParseResponse(response.body);
+    const importResult = parsed?.ENVELOPE?.BODY?.IMPORTDATA?.IMPORTRESULT
+      || parsed?.ENVELOPE?.BODY?.DATA?.IMPORTRESULT
+      || parsed?.RESPONSE
+      || null;
+
+    let tallyLineError = '';
+    if (response.body.includes('LINEERROR')) {
+      const match = response.body.match(/<LINEERROR>(.*?)<\/LINEERROR>/);
+      tallyLineError = match ? match[1] : '';
+    }
+
+    if (importResult) {
+      const created = parseInt(importResult.CREATED) || 0;
+      const altered = parseInt(importResult.ALTERED) || 0;
+      const errors = parseInt(importResult.ERRORS) || 0;
+      const exceptions = parseInt(importResult.EXCEPTIONS) || 0;
+      if (errors > 0 || exceptions > 0) {
+        const errMsg = tallyLineError || `Tally reported errors:${errors} exceptions:${exceptions}`;
+        logError('Stock item push had errors', errMsg);
+        return { success: false, message: errMsg, created, altered, errors, exceptions };
+      }
+      return { success: created > 0 || altered > 0, message: `Stock items pushed: created=${created}, altered=${altered}`, created, altered, errors, exceptions };
+    }
+
+    if (tallyLineError) {
+      logError('Stock item push LINEERROR', tallyLineError);
+      return { success: false, message: tallyLineError, created: 0, altered: 0, errors: 1 };
+    }
+
+    return { success: true, message: 'Request sent to Tally', created: 0, altered: 0, errors: 0, raw: response.body.substring(0, 500) };
+  } catch (err) {
+    logError('Push stock items HTTP error', err);
+    return { success: false, message: err.message, created: 0, altered: 0, errors: 1 };
+  }
+}
+
+// Classify stock-master push failures. Some Tally errors are PERMANENT because the
+// stock item already exists in Tally with an incompatible configuration (different
+// units, or no 'Primary' batch). Retrying can never fix these, so callers mark the
+// serials 'stock_skipped' (never retried automatically) instead of 'stock_error'
+// (retried on every sync-inventory). Transient failures (network/Tally down) stay
+// 'stock_error' so they are retried.
+function isPermanentStockError(message) {
+  if (!message) return false;
+  const m = String(message);
+  return /Cannot alter Units/i.test(m)
+    || /Stock Group .*does not exist/i.test(m)
+    || /Stock Item .*does not exist/i.test(m)
+    || /Already exists/i.test(m);
+}
+
+// Config conflicts are permanent for the FULL push (units/group can't be altered on an
+// existing item), but the stock can still be added by retrying without those fields.
+function isConfigConflictError(message) {
+  if (!message) return false;
+  const m = String(message);
+  return /Cannot alter Units/i.test(m)
+    || /Stock Group .*does not exist/i.test(m)
+    || /Cannot (move|change|alter)/i.test(m)
+    || /does not exist/i.test(m);
+}
+
+async function pushStockItemsToTallyWithRetry(items, maxRetries = 3, company) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    log('STOCK-PUSH', `Attempt ${attempt}/${maxRetries} for ${items.length} stock item(s)`);
+    try {
+      const result = await pushStockItemsToTally(items, company);
+      if (result.success) {
+        lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+        return result;
+      }
+      lastError = result.message;
+      log('STOCK-PUSH', `Attempt ${attempt} failed: ${result.message}`);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+    } catch (err) {
+      lastError = err.message;
+      logError(`Push stock attempt ${attempt} error`, err);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+    }
+  }
+
+  // Fallback: the full master create/alter failed with a config conflict (item already
+  // exists in Tally with incompatible units or locked in another group). Retry with the
+  // conflict fields stripped so the opening stock is still added "any how" instead of
+  // being permanently skipped.
+  if (isConfigConflictError(lastError)) {
+    log('STOCK-PUSH', 'Config conflict detected; retrying with stripped masters (units/group unchanged)');
+    try {
+      const stripped = await pushStockItemsToTally(items, company, { stripConflictFields: true });
+      if (stripped.success) {
+        lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+        return {
+          ...stripped,
+          message: `Stock items added (units/group unchanged): created=${stripped.created}, altered=${stripped.altered}`,
+          fallbackStripped: true,
+        };
+      }
+      lastError = stripped.message;
+    } catch (err) {
+      lastError = err.message;
+      logError('Stripped fallback push error', err);
+    }
+  }
+
+  lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: new Date().toISOString() };
+  return { success: false, message: `Failed after ${maxRetries} attempts: ${lastError}`, created: 0, altered: 0, errors: 1 };
+}
+
+// ============================================================
+// PURCHASE VOUCHER FLOW
+// Mirrors Tally's own purchase voucher XML (Invoice Voucher View)
+// so an item added in CRS lands in Tally STOCK under its assigned
+// category, with GST statutory details and a serial, via a real
+// Purchase voucher (not just a ledger).
+// ============================================================
+
+let ledgerNamesCache = { at: 0, names: [] };
+
+async function ledgerNamesSnapshot(force) {
+  const now = Date.now();
+  if (!force && now - ledgerNamesCache.at < 30000 && ledgerNamesCache.names.length) return ledgerNamesCache.names;
+  try {
+    const r = await fetchLedgers();
+    ledgerNamesCache = { at: now, names: (r.ledgers || []).map(l => l.name) };
+  } catch (err) {
+    logError('ledgerNamesSnapshot failed', err);
+  }
+  return ledgerNamesCache.names;
+}
+
+function purchaseTaxLedgers(gstRate, purchaseLedger) {
+  const rate = parseFloat(gstRate) || 0;
+  const half = rate / 2;
+  if (/IGST/i.test(String(purchaseLedger || ''))) {
+    return { igst: { name: `INPUT IGST @ ${rate}%`, rate } };
+  }
+  return {
+    cgst: { name: `INPUT CGST @ ${half}%`, rate: half },
+    sgst: { name: `INPUT SGST @ ${half}%`, rate: half },
+  };
+}
+
+function buildPurchaseVoucherXml(voucherData) {
+  const cfg = getTallyConfig();
+  const company = voucherData.company || cfg.company || '';
+  let companyTag = '';
+  if (company && company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>`;
+  }
+
+  let dateStr = voucherData.date || '';
+  if (!/^\d{8}$/.test(dateStr)) {
+    dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  }
+  const voucherType = escapeXml(voucherData.voucherType || 'Purchase');
+  const partyLedger = escapeXml(voucherData.partyLedger || 'Walk-in Supplier');
+  const purchaseLedger = escapeXml(voucherData.purchaseLedger || 'PURCHASE @ 18%');
+  const voucherNumber = escapeXml(voucherData.voucherNumber || '');
+  const refNumber = escapeXml(voucherData.refNumber || '');
+  const poNumber = escapeXml(voucherData.poNumber || '');
+  const narration = escapeXml(voucherData.narration || 'Purchase via CRS');
+  const gstRate = parseFloat(voucherData.gstRate) || 18;
+
+  const entries = voucherData.entries || [];
+  let stockMasters = '';
+  let inventoryEntries = '';
+  let totalAmount = 0;
+  // Tax ledger entries are aggregated per rate bracket (one INPUT CGST/SGST line per
+  // rate), matching how Tally stores a manually entered purchase voucher instead of
+  // emitting a separate tax line per inventory item.
+  const taxBuckets = [];
+
+  function addTaxBucket(name, rate, amt) {
+    const existing = taxBuckets.find(b => b.name === name);
+    if (existing) existing.amount += amt;
+    else taxBuckets.push({ name, rate, amount: amt });
+  }
+
+  for (const item of entries) {
+    const itemName = escapeXml(item.name || '');
+    const category = escapeXml(item.category || item.parent || 'Primary');
+    const qty = parseFloat(item.qty ?? item.quantity ?? 1) || 1;
+    const rate = parseFloat(item.rate ?? item.price ?? item.unitPrice ?? 0) || 0;
+    const amount = qty * rate;
+    totalAmount += amount;
+
+    const itemGstRate = parseFloat(item.gstRate ?? gstRate) || 0;
+    const tax = purchaseTaxLedgers(itemGstRate, purchaseLedger);
+    const hsnCode = escapeXml(item.hsnCode || '');
+    const hsnDescription = escapeXml(item.hsnDescription || hsnCode);
+    const gstApplicable = String(item.gstApplicability || 'Applicable').trim().toLowerCase();
+    const isApplicable = gstApplicable !== 'not applicable' && gstApplicable !== 'no';
+    const half = itemGstRate / 2;
+    const typeOfSupply = escapeXml(item.typeOfSupply || 'Goods');
+
+    stockMasters += `
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <STOCKITEM NAME="${itemName}" ACTION="Create">
+              <NAME>${itemName}</NAME>
+              <PARENT>${category}</PARENT>
+              <BASEUNITS>Qty</BASEUNITS>
+              <GSTAPPLICABLE>&#4; ${isApplicable ? 'Applicable' : 'Not Applicable'}</GSTAPPLICABLE>
+              <GSTTYPEOFSUPPLY>${typeOfSupply}</GSTTYPEOFSUPPLY>
+              <GSTDETAILS.LIST>
+                <APPLICABLEFROM>20240401</APPLICABLEFROM>
+                <HSNCODE>${hsnCode}</HSNCODE>
+                <HSN>${hsnDescription}</HSN>
+                <SRCOFGSTDETAILS>${escapeXml(item.gstSource || 'Specify Details Here')}</SRCOFGSTDETAILS>
+                <TAXABILITY>${escapeXml(item.gstTaxability || 'Taxable')}</TAXABILITY>
+                <STATEWISEDETAILS.LIST>
+                  <STATENAME>&#4; Any</STATENAME>
+                  <RATEDETAILS.LIST>
+                    <GSTRATEDUTYHEAD>CGST</GSTRATEDUTYHEAD>
+                    <GSTRATEVALUATIONTYPE>Based on Value</GSTRATEVALUATIONTYPE>
+                    <GSTRATE> ${itemGstRate ? half : 0}</GSTRATE>
+                    <GSTRATEPERUNIT>0</GSTRATEPERUNIT>
+                  </RATEDETAILS.LIST>
+                  <RATEDETAILS.LIST>
+                    <GSTRATEDUTYHEAD>SGST/UTGST</GSTRATEDUTYHEAD>
+                    <GSTRATEVALUATIONTYPE>Based on Value</GSTRATEVALUATIONTYPE>
+                    <GSTRATE> ${itemGstRate ? half : 0}</GSTRATE>
+                    <GSTRATEPERUNIT>0</GSTRATEPERUNIT>
+                  </RATEDETAILS.LIST>
+                </STATEWISEDETAILS.LIST>
+              </GSTDETAILS.LIST>
+            </STOCKITEM>
+          </TALLYMESSAGE>`;
+
+    const serials = (item.serials && item.serials.length)
+      ? item.serials
+      : (item.serialNo ? [item.serialNo] : []);
+    let serialXml = '';
+    if (serials.length) {
+      serialXml = `
+                  <SERIALNUMBERLIST>
+                    ${serials.map(s => `  <SERIALNUMBER>${escapeXml(String(s))}</SERIALNUMBER>`).join('\n')}
+                  </SERIALNUMBERLIST>`;
+    }
+
+    inventoryEntries += `
+        <ALLINVENTORYENTRIES.LIST>
+          <STOCKITEMNAME>${itemName}</STOCKITEMNAME>
+          <GSTSOURCETYPE>Ledger</GSTSOURCETYPE>
+          <GSTLEDGERSOURCE>${purchaseLedger}</GSTLEDGERSOURCE>
+          <HSNSOURCETYPE>Stock Item</HSNSOURCETYPE>
+          <GSTHSNNAME>${hsnCode}</GSTHSNNAME>
+          <GSTHSNDESCRIPTION>${hsnDescription}</GSTHSNDESCRIPTION>
+          <GSTOVRDNTYPEOFSUPPLY>${typeOfSupply}</GSTOVRDNTYPEOFSUPPLY>
+          <GSTRATEINFERAPPLICABILITY>As per Masters/Company</GSTRATEINFERAPPLICABILITY>
+          <GSTHSNINFERAPPLICABILITY>As per Masters/Company</GSTHSNINFERAPPLICABILITY>
+          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+          <ISLASTDEEMEDPOSITIVE>Yes</ISLASTDEEMEDPOSITIVE>
+          <RATE>${rate.toFixed(2)}/Qty</RATE>
+          <DISCOUNT>0</DISCOUNT>
+          <AMOUNT>-${amount.toFixed(2)}</AMOUNT>
+          <ACTUALQTY> ${qty} Qty</ACTUALQTY>
+          <BILLEDQTY> ${qty} Qty</BILLEDQTY>
+          <BATCHALLOCATIONS.LIST>
+            <GODOWNNAME>Main Location</GODOWNNAME>
+            <BATCHNAME>Primary Batch</BATCHNAME>
+            <AMOUNT>-${amount.toFixed(2)}</AMOUNT>
+            <ACTUALQTY> ${qty} Qty</ACTUALQTY>
+            <BILLEDQTY> ${qty} Qty</BILLEDQTY>${serialXml}
+          </BATCHALLOCATIONS.LIST>
+          <ACCOUNTINGALLOCATIONS.LIST>
+            <LEDGERNAME>${purchaseLedger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-${amount.toFixed(2)}</AMOUNT>
+          </ACCOUNTINGALLOCATIONS.LIST>
+        </ALLINVENTORYENTRIES.LIST>`;
+
+    const itemTax = amount * itemGstRate / 100;
+    if (tax.igst) {
+      addTaxBucket(tax.igst.name, tax.igst.rate, itemTax);
+    } else {
+      addTaxBucket(tax.cgst.name, tax.cgst.rate, itemTax / 2);
+      addTaxBucket(tax.sgst.name, tax.sgst.rate, itemTax / 2);
+    }
+  }
+
+  const taxTotal = taxBuckets.reduce((sum, b) => sum + b.amount, 0);
+  let grandTotal = totalAmount + taxTotal;
+
+  // Round off (Tally-style): round the grand total to a whole rupee and balance the
+  // difference through the ROUND OFF ledger, exactly like a manually entered voucher.
+  let roundOffEntry = '';
+  let roundOffMaster = '';
+  if (voucherData.roundOff === true) {
+    const rounded = Math.round(grandTotal);
+    const diff = rounded - grandTotal;
+    grandTotal = rounded;
+    if (diff !== 0) {
+      const roundOffLedger = voucherData.roundOffLedger || 'Round Off';
+      roundOffEntry = `
+        <LEDGERENTRIES.LIST>
+          <LEDGERNAME>${escapeXml(roundOffLedger)}</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+          <AMOUNT>${(-diff).toFixed(2)}</AMOUNT>
+        </LEDGERENTRIES.LIST>`;
+      if (voucherData.includeRoundOffMaster === true) {
+        roundOffMaster = `
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${escapeXml(roundOffLedger)}" ACTION="Create">
+              <NAME>${escapeXml(roundOffLedger)}</NAME>
+              <PARENT>Indirect Expenses</PARENT>
+            </LEDGER>
+          </TALLYMESSAGE>`;
+      }
+    }
+  }
+
+  let taxEntries = '';
+  for (const b of taxBuckets) {
+    taxEntries += `
+        <LEDGERENTRIES.LIST>
+          <LEDGERNAME>${escapeXml(b.name)}</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+          <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+          <AMOUNT>-${b.amount.toFixed(2)}</AMOUNT>
+          <RATEOFINVOICETAX.LIST TYPE="Number">
+            <RATEOFINVOICETAX> ${b.rate}</RATEOFINVOICETAX>
+          </RATEOFINVOICETAX.LIST>
+        </LEDGERENTRIES.LIST>`;
+  }
+
+  let partyMaster = '';
+  if (voucherData.includePartyLedger !== false) {
+    partyMaster = `
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${partyLedger}" ACTION="Create">
+              <NAME>${partyLedger}</NAME>
+              <PARENT>Sundry Creditors</PARENT>
+            </LEDGER>
+          </TALLYMESSAGE>`;
+  }
+
+  const billName = refNumber || voucherNumber;
+  const partyEntry = `
+        <LEDGERENTRIES.LIST>
+          <LEDGERNAME>${partyLedger}</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+          <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+          <AMOUNT>${grandTotal.toFixed(2)}</AMOUNT>${billName ? `
+          <BILLALLOCATIONS.LIST>
+            <BILLTYPE>New Ref</BILLTYPE>
+            <NAME>${billName}</NAME>
+            <AMOUNT>${grandTotal.toFixed(2)}</AMOUNT>
+          </BILLALLOCATIONS.LIST>` : ''}
+        </LEDGERENTRIES.LIST>`;
+
+  return `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <IMPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>Vouchers</REPORTNAME>
+          <STATICVARIABLES>${companyTag}</STATICVARIABLES>
+        </REQUESTDESC>
+        <REQUESTDATA>
+          ${stockMasters}
+          ${partyMaster}
+          ${roundOffMaster}
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <VOUCHER VCHTYPE="${voucherType}" ACTION="Create" OBJVIEW="Invoice Voucher View">
+              <DATE>${dateStr}</DATE>
+              <VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME>
+              ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+              ${refNumber ? `<REFERENCE>${refNumber}</REFERENCE>` : ''}
+              ${poNumber ? `<CURRBASICPURCHASEORDERNO>${poNumber}</CURRBASICPURCHASEORDERNO>` : ''}
+              <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+              <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
+              <ISINVOICE>Yes</ISINVOICE>
+              <NUMBERINGSTYLE>Auto Retain</NUMBERINGSTYLE>
+              <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+              <NARRATION>${narration}</NARRATION>
+              ${inventoryEntries}
+              ${partyEntry}
+              ${taxEntries}
+              ${roundOffEntry}
+            </VOUCHER>
+          </TALLYMESSAGE>
+        </REQUESTDATA>
+      </IMPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+}
+
+async function pushPurchaseVoucher(voucherData) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+
+  let includePartyLedger = true;
+  if (voucherData.partyLedger) {
+    try {
+      const names = await ledgerNamesSnapshot(false);
+      includePartyLedger = !names.includes(voucherData.partyLedger);
+    } catch (err) {
+      includePartyLedger = true;
+    }
+  }
+
+  const payload = { ...voucherData, includePartyLedger };
+  if (voucherData.roundOff === true) {
+    try {
+      const names = await ledgerNamesSnapshot(false);
+      const existing = names.find(n => /round\s*off/i.test(n));
+      payload.roundOffLedger = existing || 'Round Off';
+      payload.includeRoundOffMaster = !existing;
+      log('PURCHASE-PUSH', `Round off ledger resolved: "${payload.roundOffLedger}" (create master: ${payload.includeRoundOffMaster})`);
+    } catch (err) {
+      payload.roundOffLedger = 'Round Off';
+      payload.includeRoundOffMaster = true;
+    }
+  }
+
+  const xml = buildPurchaseVoucherXml(payload);
+  log('PURCHASE-PUSH', `Pushing purchase voucher to Tally for "${voucherData.partyLedger}" (partyLedgerMaster=${includePartyLedger})`);
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 40000);
+
+    const parsed = deepParseResponse(response.body);
+    const importResult = parsed?.ENVELOPE?.BODY?.IMPORTDATA?.IMPORTRESULT
+      || parsed?.ENVELOPE?.BODY?.DATA?.IMPORTRESULT
+      || parsed?.RESPONSE
+      || null;
+
+    let tallyLineError = '';
+    if (response.body.includes('LINEERROR')) {
+      const match = response.body.match(/<LINEERROR>(.*?)<\/LINEERROR>/);
+      tallyLineError = match ? match[1] : '';
+    }
+
+    if (importResult) {
+      const created = parseInt(importResult.CREATED) || 0;
+      const altered = parseInt(importResult.ALTERED) || 0;
+      const errors = parseInt(importResult.ERRORS) || 0;
+      const exceptions = parseInt(importResult.EXCEPTIONS) || 0;
+
+      if (errors > 0 || exceptions > 0) {
+        const errMsg = tallyLineError || `Tally reported errors:${errors} exceptions:${exceptions}`;
+        logError('Purchase voucher push had errors', errMsg);
+        return { success: false, message: errMsg, created, altered, errors, exceptions, synced: false };
+      }
+      if (created > 0) {
+        lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+        log('PURCHASE-PUSH', `Purchase voucher created: ${created}`);
+        return { success: true, message: 'Purchase voucher created in Tally', created, altered, errors, exceptions, synced: true };
+      }
+      return { success: false, message: tallyLineError || 'Tally did not create the purchase voucher', created, altered, errors, exceptions, synced: false };
+    }
+
+    if (tallyLineError) {
+      return { success: false, message: tallyLineError, created: 0, altered: 0, errors: 1, synced: false };
+    }
+    lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+    return { success: true, message: 'Request sent to Tally', created: 0, altered: 0, errors: 0, synced: true, raw: response.body.substring(0, 500) };
+  } catch (err) {
+    logError('Push purchase voucher HTTP error', err);
+    return { success: false, message: err.message, created: 0, altered: 0, errors: 1, synced: false };
+  }
+}
+
+async function pushPurchaseVoucherWithRetry(voucherData, maxRetries = 2) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    log('PURCHASE-PUSH', `Attempt ${attempt}/${maxRetries}`);
+    try {
+      const result = await pushPurchaseVoucher(voucherData);
+      if (result.success && (result.created > 0 || result.errors === 0)) {
+        return result;
+      }
+      lastError = result.message;
+      if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
+    } catch (err) {
+      lastError = err.message;
+      logError('Purchase push retry error', err);
+      if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  return { success: false, message: `Failed after ${maxRetries} attempts: ${lastError}`, created: 0, altered: 0, errors: 1, synced: false };
+}
+
+async function fetchPurchaseOrders(company) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const companyName = company || cfg.company || '';
+  const now = new Date();
+  let fyStartYear = now.getFullYear();
+  if (now.getMonth() < 3) fyStartYear -= 1;
+  const fromDate = `01-Apr-${fyStartYear}`;
+  const toDate = now.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+
+  const xml = `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Export Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <EXPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>Day Book</REPORTNAME>
+          <STATICVARIABLES>
+            <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+            <SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>
+            <SVFROMDATE>${fromDate}</SVFROMDATE>
+            <SVTODATE>${toDate}</SVTODATE>
+          </STATICVARIABLES>
+        </REQUESTDESC>
+      </EXPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 60000);
+    const parsed = parser.parse(response.body);
+    const body = parsed?.ENVELOPE?.BODY;
+    let messages = body?.IMPORTDATA?.REQUESTDATA?.TALLYMESSAGE || body?.DATA?.TALLYMESSAGE;
+    if (!messages) return { purchaseOrders: [], count: 0 };
+    const msgArr = Array.isArray(messages) ? messages : [messages];
+    const pos = [];
+    for (const msg of msgArr) {
+      const vs = msg?.VOUCHER;
+      if (!vs) continue;
+      const vArr = Array.isArray(vs) ? vs : [vs];
+      for (const v of vArr) {
+        const vtype = v?.VOUCHERTYPENAME || v?.['@_VOUCHERTYPENAME'] || '';
+        if (/purchase order/i.test(vtype)) {
+          pos.push({
+            number: v?.VOUCHERNUMBER || v?.['@_VOUCHERNUMBER'] || '',
+            date: v?.DATE || v?.['@_DATE'] || '',
+            party: v?.PARTYLEDGERNAME || v?.PARTYNAME || '',
+          });
+        }
+      }
+    }
+    pos.sort((a, b) => String(b.number).localeCompare(String(a.number)));
+    log('PURCHASE-ORDERS', `Fetched ${pos.length} purchase orders from Tally`);
+    return { purchaseOrders: pos, count: pos.length };
+  } catch (err) {
+    logError('Failed to fetch purchase orders', err);
+    return { purchaseOrders: [], count: 0, error: err.message };
+  }
+}
+
+async function fetchLedgerBalances(company) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const companyName = company || cfg.company || '';
+  try {
+    const xml = `<ENVELOPE>
+      <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>CRSLedgerBals</ID></HEADER>
+      <BODY><DESC>
+        <STATICVARIABLES>
+          <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+          <SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>
+        </STATICVARIABLES>
+        <TDL><TDLMESSAGE>
+          <COLLECTION NAME="CRSLedgerBals" ISINITIALIZE="Yes">
+            <TYPE>Ledger</TYPE>
+            <NATIVEMETHOD>Name</NATIVEMETHOD>
+            <NATIVEMETHOD>Parent</NATIVEMETHOD>
+            <NATIVEMETHOD>ClosingBalance</NATIVEMETHOD>
+          </COLLECTION>
+        </TDLMESSAGE></TDL>
+      </DESC></BODY>
+    </ENVELOPE>`;
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 40000);
+    if (!response.body || response.body.length < 100) return { ledgers: [], count: 0 };
+    const parsed = parser.parse(response.body);
+    const collections = parsed?.ENVELOPE?.BODY?.DATA?.COLLECTION;
+    if (!collections) return { ledgers: [], count: 0 };
+    const collArr = Array.isArray(collections) ? collections : [collections];
+    const ledgers = [];
+    for (const coll of collArr) {
+      const entries = coll?.LEDGER;
+      if (!entries) continue;
+      const list = Array.isArray(entries) ? entries : [entries];
+      for (const entry of list) {
+        const name = entry?.NAME || entry?.['@_NAME'] || '';
+        if (!name || !name.trim()) continue;
+        const rawBal = entry?.CLOSINGBALANCE;
+        let closing = null;
+        if (rawBal && typeof rawBal === 'object') closing = rawBal['#text'] ?? '';
+        else if (rawBal !== undefined && rawBal !== null) closing = rawBal;
+        ledgers.push({
+          name: name.trim(),
+          parent: cleanMasterParent(entry?.PARENT?.['#text'] || entry?.PARENT || ''),
+          closing,
+        });
+      }
+    }
+    log('LEDGER-BALS', `Fetched ${ledgers.length} ledger balances from Tally`);
+    return { ledgers, count: ledgers.length };
+  } catch (err) {
+    logError('Failed to fetch ledger balances', err);
+    return { ledgers: [], count: 0, error: err.message };
+  }
+}
+
+async function getLedgerBalance(name, company) {
+  if (!name) return null;
+  const r = await fetchLedgerBalances(company);
+  const found = (r.ledgers || []).find(l => l.name === name);
+  return found ? found : null;
+}
+
 module.exports = {
   testConnection,
   fetchRecentSales,
@@ -726,4 +2280,26 @@ module.exports = {
   buildExportRequest,
   buildCompanyListRequest,
   buildListCompaniesRequest,
+  pushSalesVoucher,
+  pushSalesVoucherWithRetry,
+  buildSalesVoucherXml,
+  pingTally,
+  getConnectionStatus,
+  lookupStockItemBySerial,
+  fetchStockSerialMap,
+  clearSerialCache,
+  buildStockItemMastersXml,
+  pushStockItemsToTally,
+  pushStockItemsToTallyWithRetry,
+  isPermanentStockError,
+  fetchStockCategories,
+  fetchLedgers,
+  pushLedgerToTally,
+  buildLedgerCreateXml,
+  buildPurchaseVoucherXml,
+  pushPurchaseVoucher,
+  pushPurchaseVoucherWithRetry,
+  fetchPurchaseOrders,
+  fetchLedgerBalances,
+  getLedgerBalance,
 };

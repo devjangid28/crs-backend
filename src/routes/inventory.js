@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { query, getConnection } = require('../config/database');
+const { query, getConnection, pool } = require('../config/database');
 const { authenticate, requireRole } = require('../middleware/auth');
+const tallyService = require('../services/tallyService');
 
 // ════════════════════════════════════════════════════════════════
 // HELPER: Get user's accessible store IDs
@@ -19,6 +20,108 @@ function formatHistory(val) {
   if (val === null || val === undefined) return null;
   if (typeof val === 'object') return JSON.stringify(val);
   return String(val);
+}
+
+// ════════════════════════════════════════════════════════════════
+// HELPER: Push stock to Tally in the background (non-blocking)
+// Creates ONE Tally stock item PER SERIAL, named "{product} [{serial}]".
+// Tally has serial tracking disabled on stock items, so a plain
+// SERIALNUMBERLIST is silently dropped - embedding the serial in the
+// item NAME makes Tally literally hold the serial, and a sale that
+// references that exact item reduces ITS quantity to zero automatically.
+// When purchase details are supplied, pushes a full PURCHASE VOUCHER
+// (one inventory entry per serial, qty 1 each) so the items land in
+// Tally STOCK under the assigned category with GST statutory details
+// (this also credits the supplier AC via the purchase ledger).
+// Otherwise falls back to the plain stock-master import.
+// Serial rows are RESERVED as 'stock_pending' BEFORE pushing so the
+// bulk sync-inventory route never picks the same serials mid-flight.
+// On success rows become 'stock_pushed'; on failure they become
+// 'stock_error' (retryable by sync-inventory).
+// ════════════════════════════════════════════════════════════════
+async function pushStockToTallyBackground(productName, price, serials, source, stockMeta, purchase) {
+  try {
+    const tallyNames = {};
+    for (const sn of serials) tallyNames[sn] = `${productName} [${sn}]`;
+
+    for (const sn of serials) {
+      await pool.query(
+        `INSERT INTO tally_sync_log (stock_item_name, serial_number, sync_status, raw_data)
+         VALUES ($1, $2, 'stock_pending', $3)`,
+        [tallyNames[sn], sn, JSON.stringify({ ...source, startedAt: new Date().toISOString() })]
+      ).catch(e => console.error('[Inventory] tally_sync_log insert error:', e.message));
+    }
+
+    let pushResult;
+    if (purchase && (purchase.partyLedger || purchase.purchaseLedger)) {
+      pushResult = await tallyService.pushPurchaseVoucherWithRetry({
+        partyLedger: purchase.partyLedger || 'Walk-in Supplier',
+        purchaseLedger: purchase.purchaseLedger || 'PURCHASE @ 18%',
+        refNumber: purchase.supplierInvoiceNo || null,
+        poNumber: purchase.purchaseOrderNo || null,
+        narration: `Purchase via CRS (${productName})${purchase.purchaseOrderNo ? ` - PO ${purchase.purchaseOrderNo}` : ''}${purchase.supplierInvoiceNo ? ` - Inv ${purchase.supplierInvoiceNo}` : ''}`,
+        date: purchase.date || null,
+        roundOff: true,
+        entries: serials.map(sn => ({
+          name: tallyNames[sn],
+          category: (stockMeta || {}).category || 'Primary',
+          qty: 1,
+          rate: parseFloat(price) || 0,
+          serials: [sn],
+          gstRate: (stockMeta || {}).gstRate,
+          hsnCode: (stockMeta || {}).hsnCode,
+          hsnDescription: (stockMeta || {}).hsnDescription,
+          gstApplicability: (stockMeta || {}).gstApplicability,
+          typeOfSupply: (stockMeta || {}).typeOfSupply,
+          gstSource: (stockMeta || {}).gstSource,
+          gstTaxability: (stockMeta || {}).gstTaxability,
+        })),
+      }, 2);
+    } else {
+      const stockItems = serials.map(sn => ({
+        name: tallyNames[sn],
+        qty: 1,
+        rate: parseFloat(price) || 0,
+        serials: [sn],
+        ...(stockMeta || {}),
+      }));
+      pushResult = await tallyService.pushStockItemsToTallyWithRetry(stockItems, 3);
+    }
+
+    if (pushResult.success) {
+      await pool.query(
+        `UPDATE tally_sync_log SET sync_status = 'stock_pushed', raw_data = $2
+         WHERE serial_number = ANY($1) AND sync_status = 'stock_pending'`,
+        [serials, JSON.stringify({ ...source, pushedAt: new Date().toISOString(), message: 'Successfully added to Tally', tallyResponse: pushResult.message, purchaseVoucher: !!(purchase && (purchase.partyLedger || purchase.purchaseLedger)) })]
+      ).catch(e => console.error('[Inventory] tally_sync_log update error:', e.message));
+      tallyService.clearSerialCache();
+      console.log(`[Inventory] Tally stock push OK for "${productName}" (${serials.length} units) -> ${Object.values(tallyNames).join(', ')}`);
+    } else {
+      const permanent = tallyService.isPermanentStockError(pushResult.message);
+      await pool.query(
+        `UPDATE tally_sync_log SET sync_status = $2, error_message = $3
+         WHERE serial_number = ANY($1) AND sync_status = 'stock_pending'`,
+        [serials, permanent ? 'stock_skipped' : 'stock_error', pushResult.message]
+      ).catch(e => console.error('[Inventory] tally_sync_log update error:', e.message));
+      console.error(`[Inventory] Tally stock push ${permanent ? 'SKIPPED (permanent)' : 'FAILED'} for "${productName}": ${pushResult.message}`);
+    }
+  } catch (e) {
+    const permanent = tallyService.isPermanentStockError(e.message);
+    await pool.query(
+      `UPDATE tally_sync_log SET sync_status = $2, error_message = $3
+       WHERE serial_number = ANY($1) AND sync_status = 'stock_pending'`,
+      [serials, permanent ? 'stock_skipped' : 'stock_error', e.message]
+    ).catch(() => {});
+    console.error(`[Inventory] Tally stock push ${permanent ? 'SKIPPED (permanent)' : 'ERROR'} for "${productName}": ${e.message}`);
+  }
+}
+
+function voucherDateFrom(dateStr) {
+  if (!dateStr) return null;
+  const s = String(dateStr).trim();
+  if (/^\d{8}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s.replace(/-/g, '');
+  return null;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -111,6 +214,42 @@ router.get('/dashboard', authenticate, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ─────────────────────────────────────────────────────────────────
+// Helpers for serial lookup
+// ─────────────────────────────────────────────────────────────────
+const MODEL_STOP_WORDS = [
+  'NOTE BOOK', 'NOTEBOOK', 'NOTEBUK', 'LAPTOP', 'DESKTOP', 'ALL IN ONE', 'AIO',
+  'MONITOR', 'PRINTER', 'SCANNER', 'TABLET', 'SMARTPHONE', 'MOBILE', 'PHONE',
+  'COMPUTER', 'SERVER', 'WORKSTATION', 'PC', 'ASUS', 'DELL', 'HP', 'LENOVO',
+  'ACER', 'MSI', 'TOSHIBA', 'SONY', 'SAMSUNG', 'APPLE', 'MACBOOK'
+];
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Many items are entered without a model column (e.g. product name
+// "NOTEBOOK ASUS PM3406CKA-NZ0395X"). Fall back to deriving the model
+// from the product name by stripping leading descriptor words + brand.
+function deriveModelFromProductName(productName, brand) {
+  if (!productName) return null;
+  const words = MODEL_STOP_WORDS.concat(brand ? [brand] : []);
+  let name = String(productName).trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const w of words) {
+      if (!w) continue;
+      const re = new RegExp(`^${w.split(/\s+/).map(escapeRegex).join('\\s+')}\\s+`, 'i');
+      if (re.test(name)) {
+        name = name.replace(re, '').trim();
+        changed = true;
+      }
+    }
+  }
+  return name || null;
+}
+
 // ════════════════════════════════════════════════════════════════
 // GET /api/inventory/lookup/:serialNumber - Lookup by serial number
 // ════════════════════════════════════════════════════════════════
@@ -133,7 +272,11 @@ router.get('/lookup/:serialNumber', authenticate, async (req, res, next) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'No inventory item found with this serial number' });
     }
-    res.json({ success: true, data: result.rows[0] });
+    const item = result.rows[0];
+    if (!item.model) {
+      item.model = deriveModelFromProductName(item.product_name, item.brand);
+    }
+    res.json({ success: true, data: item });
   } catch (err) { next(err); }
 });
 
@@ -322,7 +465,7 @@ router.get('/:id', authenticate, async (req, res, next) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// POST /api/inventory - Create new inventory item
+// POST /api/inventory - Create new inventory item(s)
 // ════════════════════════════════════════════════════════════════
 router.post('/', authenticate, async (req, res, next) => {
   const client = await getConnection();
@@ -335,9 +478,175 @@ router.post('/', authenticate, async (req, res, next) => {
       chargerIncluded, color, generation, otherSpecifications,
       warranty, purchaseDate, supplier,
       purchasePrice, sellingPrice, serialNumber, barcode, sku,
-      storeId, status, remarks, category
+      storeId, status, remarks, category,
+      quantity, serials,
+      supplierId, tallyCategory, tallyCategoryType,
+      gstApplicability, hsnCode, hsnDescription, hsnSource,
+      gstRate, gstSource, gstTaxability, gstRateType, typeOfSupply,
+      purchaseOrderNo, supplierInvoiceNo, purchaseLedger
     } = req.body;
 
+    const stockMeta = {
+      category: tallyCategory,
+      categoryType: tallyCategoryType || 'category',
+      gstApplicability: gstApplicability || 'Applicable',
+      hsnCode,
+      hsnDescription,
+      hsnSource,
+      gstRate,
+      gstSource,
+      gstTaxability,
+      gstRateType,
+      typeOfSupply: typeOfSupply || 'Goods',
+    };
+
+    // Selling price defaults to the purchase price when not provided, so the
+    // items list, dashboard stock value and sales flow never show ₹0.
+    const effectiveSellingPrice =
+      (sellingPrice !== undefined && sellingPrice !== null && String(sellingPrice).trim() !== '' && parseFloat(sellingPrice) > 0)
+        ? sellingPrice
+        : (purchasePrice || 0);
+
+    const isBatch = quantity && Array.isArray(serials) && serials.length > 0;
+
+    // Validate store
+    const storeCheck = await client.query('SELECT id, store_name FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (storeCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Invalid store selected' });
+    }
+    const storeName = storeCheck.rows[0].store_name;
+
+    // Check RBAC - staff can only add to their assigned store
+    if (req.user.role !== 'owner' && req.user.store_id && req.user.store_id !== parseInt(storeId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, message: 'You can only add inventory to your assigned store' });
+    }
+
+    if (isBatch) {
+      // ===== BATCH INSERT: multiple serials for same product =====
+      const qty = parseInt(quantity, 10);
+      if (!qty || qty < 1 || qty > 100) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Quantity must be between 1 and 100' });
+      }
+      if (serials.length !== qty) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Expected ${qty} serial numbers, got ${serials.length}` });
+      }
+
+      // Validate all serials provided and unique
+      const trimmedSerials = serials.map(s => String(s || '').trim());
+      if (trimmedSerials.some(s => !s)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'All serial numbers are required' });
+      }
+      const uniq = new Set(trimmedSerials);
+      if (uniq.size !== trimmedSerials.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Duplicate serial numbers in batch' });
+      }
+
+      // Check for existing serials in DB
+      const existingSerials = await client.query(
+        `SELECT serial_number FROM inventory_items WHERE serial_number = ANY($1) AND is_active = true`,
+        [trimmedSerials]
+      );
+      if (existingSerials.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, message: `Serial number(s) already exist: ${existingSerials.rows.map(r => r.serial_number).join(', ')}` });
+      }
+
+      // Validate required fields
+      if (!productName || !productName.trim()) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Product name is required' });
+      }
+
+      const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+      const createdItems = [];
+
+      for (const sn of trimmedSerials) {
+        const insertResult = await client.query(
+          `INSERT INTO inventory_items (
+            product_name, brand, model, processor, ram, storage, graphics_card,
+            display_size, display_resolution, operating_system, battery_condition,
+            charger_included, color, generation, other_specifications,
+            warranty, purchase_date, supplier,
+            purchase_price, selling_price, serial_number, barcode, sku,
+            store_id, status, remarks, category, created_by, created_at, updated_at,
+            supplier_id, tally_category, tally_category_type,
+            gst_applicability, hsn_code, hsn_description, hsn_source,
+            gst_rate, gst_source, gst_taxability, gst_rate_type, type_of_supply,
+            purchase_order_no, supplier_invoice_no, purchase_ledger
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+          RETURNING *`,
+          [
+            productName.trim(), brand || null, model || null, processor || null, ram || null,
+            storage || null, graphicsCard || null, displaySize || null,
+            displayResolution || null, operatingSystem || null, batteryCondition || null,
+            chargerIncluded || null, color || null, generation || null, otherSpecifications || null,
+            warranty || null, purchaseDate || null, supplier || null,
+            purchasePrice || 0, effectiveSellingPrice, sn,
+            barcode || null, sku || null, storeId,
+            status || 'Available', remarks || null, category || 'Laptop',
+            req.user.id, now, now,
+            supplierId || null, tallyCategory || null, tallyCategoryType || null,
+            gstApplicability || 'Applicable', hsnCode || null, hsnDescription || null, hsnSource || null,
+            parseFloat(gstRate) || 0, gstSource || null, gstTaxability || null, gstRateType || null,
+            typeOfSupply || 'Goods',
+            purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null
+          ]
+        );
+        const newItem = insertResult.rows[0];
+        createdItems.push(newItem);
+
+        await client.query(
+          `INSERT INTO inventory_history (inventory_item_id, action, user_id, user_name, new_value, remarks, created_at)
+           VALUES ($1, 'Added', $2, $3, $4, $5, $6)`,
+          [newItem.id, req.user.id, req.user.full_name || 'Admin',
+           JSON.stringify({ product_name: productName, serial_number: sn }),
+           `Batch add: ${trimmedSerials.length} units of ${productName}`, now]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      // Fetch with store_name
+      const fullItems = await query(
+        `SELECT ii.*, s.store_name FROM inventory_items ii
+         JOIN stores s ON s.id = ii.store_id WHERE ii.id = ANY($1)`,
+        [createdItems.map(i => i.id)]
+      );
+
+      // Fire-and-forget Tally purchase-voucher push (non-blocking - response returns immediately)
+      if (createdItems.length > 0) {
+        pushStockToTallyBackground(
+          productName.trim(),
+          sellingPrice || purchasePrice,
+          trimmedSerials,
+          { batchPush: true, productName: productName.trim(), userId: req.user.id },
+          stockMeta,
+          {
+            partyLedger: supplier,
+            purchaseLedger: purchaseLedger || 'PURCHASE @ 18%',
+            purchaseOrderNo,
+            supplierInvoiceNo,
+            date: voucherDateFrom(purchaseDate),
+          }
+        );
+      }
+
+      res.status(201).json({
+        success: true,
+        message: `Batch created: ${createdItems.length} item(s)`,
+        data: fullItems.rows,
+        tally: { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
+      });
+      return;
+    }
+
+    // ===== SINGLE SERIAL (original behavior, unchanged) =====
     if (!serialNumber || !serialNumber.trim()) {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'Serial number is mandatory' });
@@ -353,19 +662,6 @@ router.post('/', authenticate, async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'A product with this serial number already exists' });
     }
 
-    // Validate store
-    const storeCheck = await client.query('SELECT id, store_name FROM stores WHERE id = $1 AND is_active = true', [storeId]);
-    if (storeCheck.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Invalid store selected' });
-    }
-
-    // Check RBAC - staff can only add to their assigned store
-    if (req.user.role !== 'owner' && req.user.store_id && req.user.store_id !== parseInt(storeId)) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ success: false, message: 'You can only add inventory to your assigned store' });
-    }
-
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     const insertResult = await client.query(
       `INSERT INTO inventory_items (
@@ -374,8 +670,12 @@ router.post('/', authenticate, async (req, res, next) => {
         charger_included, color, generation, other_specifications,
         warranty, purchase_date, supplier,
         purchase_price, selling_price, serial_number, barcode, sku,
-        store_id, status, remarks, category, created_by, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+        store_id, status, remarks, category, created_by, created_at, updated_at,
+        supplier_id, tally_category, tally_category_type,
+        gst_applicability, hsn_code, hsn_description, hsn_source,
+        gst_rate, gst_source, gst_taxability, gst_rate_type, type_of_supply,
+        purchase_order_no, supplier_invoice_no, purchase_ledger
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
       RETURNING *`,
       [
         productName, brand || null, model || null, processor || null, ram || null,
@@ -383,10 +683,15 @@ router.post('/', authenticate, async (req, res, next) => {
         displayResolution || null, operatingSystem || null, batteryCondition || null,
         chargerIncluded || null, color || null, generation || null, otherSpecifications || null,
         warranty || null, purchaseDate || null, supplier || null,
-        purchasePrice || 0, sellingPrice || 0, serialNumber.trim(),
+        purchasePrice || 0, effectiveSellingPrice, serialNumber.trim(),
         barcode || null, sku || null, storeId,
         status || 'Available', remarks || null, category || 'Laptop',
-        req.user.id, now, now
+        req.user.id, now, now,
+        supplierId || null, tallyCategory || null, tallyCategoryType || null,
+        gstApplicability || 'Applicable', hsnCode || null, hsnDescription || null, hsnSource || null,
+        parseFloat(gstRate) || 0, gstSource || null, gstTaxability || null, gstRateType || null,
+        typeOfSupply || 'Goods',
+        purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null
       ]
     );
 
@@ -410,7 +715,28 @@ router.post('/', authenticate, async (req, res, next) => {
       [newItem.id]
     );
 
-    res.status(201).json({ success: true, message: 'Inventory item created successfully', data: fullItem.rows[0] });
+    // Fire-and-forget Tally purchase-voucher push (non-blocking - response returns immediately)
+    pushStockToTallyBackground(
+      productName.trim(),
+      sellingPrice || purchasePrice,
+      [serialNumber.trim()],
+      { singlePush: true, productName: productName.trim(), userId: req.user.id },
+      stockMeta,
+      {
+        partyLedger: supplier,
+        purchaseLedger: purchaseLedger || 'PURCHASE @ 18%',
+        purchaseOrderNo,
+        supplierInvoiceNo,
+        date: voucherDateFrom(purchaseDate),
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Inventory item created successfully',
+      data: fullItem.rows[0],
+      tally: { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     if (err.code === '23505') {
@@ -468,7 +794,11 @@ router.put('/:id', authenticate, async (req, res, next) => {
       warranty: 'warranty', purchaseDate: 'purchase_date', supplier: 'supplier',
       purchasePrice: 'purchase_price', sellingPrice: 'selling_price',
       serialNumber: 'serial_number', barcode: 'barcode', sku: 'sku',
-      storeId: 'store_id', status: 'status', remarks: 'remarks', category: 'category'
+      storeId: 'store_id', status: 'status', remarks: 'remarks', category: 'category',
+      supplierId: 'supplier_id', tallyCategory: 'tally_category', tallyCategoryType: 'tally_category_type',
+      gstApplicability: 'gst_applicability', hsnCode: 'hsn_code', hsnDescription: 'hsn_description',
+      hsnSource: 'hsn_source', gstRate: 'gst_rate', gstSource: 'gst_source',
+      gstTaxability: 'gst_taxability', gstRateType: 'gst_rate_type', typeOfSupply: 'type_of_supply'
     };
 
     const setClauses = ['updated_at = $1'];
@@ -507,6 +837,35 @@ router.put('/:id', authenticate, async (req, res, next) => {
        JOIN stores s ON s.id = ii.store_id WHERE ii.id = $1`,
       [req.params.id]
     );
+
+    // Fire-and-forget Tally re-push when Tally-relevant fields changed
+    const tallyFields = ['productName', 'brand', 'model', 'serialNumber', 'barcode', 'sku',
+      'warranty', 'sellingPrice', 'purchasePrice', 'tallyCategory', 'tallyCategoryType',
+      'gstApplicability', 'hsnCode', 'hsnDescription', 'hsnSource', 'gstRate', 'gstSource',
+      'gstTaxability', 'gstRateType', 'typeOfSupply', 'category'];
+    const tallyChanged = Object.keys(changes).some(dbField => tallyFields.some(f => fieldMapping[f] === dbField));
+    if (tallyChanged && updated.rows[0]) {
+      const row = updated.rows[0];
+      pushStockToTallyBackground(
+        row.product_name.trim(),
+        row.selling_price || row.purchase_price,
+        [row.serial_number],
+        { updatePush: true, productName: row.product_name.trim(), userId: req.user.id },
+        {
+          category: row.tally_category,
+          categoryType: row.tally_category_type || 'category',
+          gstApplicability: row.gst_applicability || 'Applicable',
+          hsnCode: row.hsn_code,
+          hsnDescription: row.hsn_description,
+          hsnSource: row.hsn_source,
+          gstRate: row.gst_rate,
+          gstSource: row.gst_source,
+          gstTaxability: row.gst_taxability,
+          gstRateType: row.gst_rate_type,
+          typeOfSupply: row.type_of_supply || 'Goods',
+        }
+      );
+    }
 
     res.json({ success: true, message: 'Inventory item updated', data: updated.rows[0] });
   } catch (err) {
