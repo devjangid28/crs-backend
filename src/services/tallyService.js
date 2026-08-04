@@ -17,6 +17,9 @@ function getTallyConfig() {
     salesLedger: process.env.TALLY_SALES_LEDGER || 'Sales',
     cgstLedger: process.env.TALLY_CGST_LEDGER || 'Output CGST @9%',
     sgstLedger: process.env.TALLY_SGST_LEDGER || 'Output SGST @9%',
+    igstLedger: process.env.TALLY_IGST_LEDGER || 'OUTPUT IGST @ 18%',
+    bankLedger: process.env.TALLY_BANK_LEDGER || '',
+    taxUnit: process.env.TALLY_TAX_UNIT || 'Gujarat Registration',
   };
 }
 
@@ -62,6 +65,8 @@ const parser = new XMLParser({
 let poller = null;
 let lastSyncDate = null;
 let lastConnectionStatus = { reachable: false, companyFound: false, lastChecked: null };
+let companyInfoCache = null;
+let companyInfoCacheAt = 0;
 
 function log(tag, msg) {
   console.log(`[TallyService ${new Date().toISOString()}] [${tag}] ${msg}`);
@@ -755,23 +760,57 @@ function buildSalesVoucherXml(voucherData) {
     dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   }
   const partyName = escapeXml(voucherData.partyName || 'Walk-in Customer');
+  const partyLedger = escapeXml(voucherData.partyLedger || voucherData.partyName || 'Walk-in Customer');
   const voucherNumber = escapeXml(voucherData.voucherNumber || '');
   const narration = escapeXml(voucherData.narration || 'Sales via CRS');
-  const voucherType = escapeXml(voucherData.voucherType || cfg.salesVoucherType || 'Sales Asus');
+  const voucherType = escapeXml(voucherData.voucherType || cfg.salesVoucherType || 'Sales');
   const salesLedger = escapeXml(cfg.salesLedger || 'SALES @ 18%');
-  const cgstLedger = escapeXml(cfg.cgstLedger || 'OUTPUT CGST @ 9%');
-  const sgstLedger = escapeXml(cfg.sgstLedger || 'OUTPUT SGST @ 9%');
+  const cgstLedger = escapeXml(voucherData.cgstLedger || cfg.cgstLedger || 'OUTPUT CGST @ 9%');
+  const sgstLedger = escapeXml(voucherData.sgstLedger || cfg.sgstLedger || 'OUTPUT SGST @ 9%');
+  const igstLedger = escapeXml(voucherData.igstLedger || cfg.igstLedger || 'OUTPUT IGST @ 18%');
+
+  // Company (dispatch-from / our GSTIN) details
+  const company = {
+    name: voucherData.company?.name || '',
+    gstin: voucherData.company?.gstin || '',
+    state: voucherData.company?.state || '',
+    pincode: voucherData.company?.pincode || '',
+    place: voucherData.company?.place || '',
+    country: voucherData.company?.country || 'India',
+    address: Array.isArray(voucherData.company?.address) ? voucherData.company.address : [],
+    taxUnit: voucherData.company?.taxUnit || cfg.taxUnit || '',
+  };
+
+  // Party details
+  const partyGstin = String(voucherData.partyGstin || '').trim();
+  const partyState = String(voucherData.partyState || '').trim();
+  const partyPincode = String(voucherData.partyPincode || '').trim();
+  const partyPlace = String(voucherData.partyPlace || '').trim();
+  const partyAddress = Array.isArray(voucherData.partyAddress)
+    ? voucherData.partyAddress
+    : String(voucherData.partyAddress || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const placeOfSupply = String(voucherData.placeOfSupply || partyState || company.state || '').trim();
+  const isInterState = !!placeOfSupply && !!company.state &&
+    placeOfSupply.toLowerCase() !== String(company.state).toLowerCase();
+  const panNumber = partyGstin && /^[0-9A-Z]{15}$/i.test(partyGstin) ? partyGstin.slice(0, 10).toUpperCase() : '';
+
   let companyTag = '';
   if (cfg.company && cfg.company.trim()) {
     companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
   }
 
   let inventoryEntries = '';
+  let skipSalesEntries = '';
   let totalAmount = 0;
   const items = voucherData.items || [];
-  const taxRate = parseFloat(voucherData.taxRate) || 18;
-  const cgstRate = taxRate / 2;
-  const sgstRate = taxRate / 2;
+  const defaultTaxRate = parseFloat(voucherData.taxRate) || 18;
+  // One tax bucket per distinct GST rate, exactly like a manually entered voucher.
+  const taxBuckets = new Map();
+
+  function bucket(rate) {
+    if (!taxBuckets.has(rate)) taxBuckets.set(rate, { rate, base: 0 });
+    return taxBuckets.get(rate);
+  }
 
   for (const item of items) {
     const qty = parseInt(item.qty || item.quantity) || 1;
@@ -780,22 +819,24 @@ function buildSalesVoucherXml(voucherData) {
     const amount = (rate - disc) * qty;
     const displayRate = rate - disc;
     const itemName = escapeXml(item.name || item.description || 'Service');
+    const taxRate = parseFloat(item.taxRate) || defaultTaxRate;
+    const unit = escapeXml(item.unit || 'Qty');
+    const typeOfSupply = /service/i.test(item.typeOfSupply || item.name || '') ? 'Services' : 'Goods';
+
+    bucket(taxRate).base += amount;
 
     if (item.skipInventory) {
+      // Service / non-stock line: credited directly to the sales ledger (no stock
+      // reduction). Keeps the voucher balanced like a manual "Sales" entry.
       totalAmount += amount;
+      bucket(taxRate).skipBase = (bucket(taxRate).skipBase || 0) + amount;
       continue;
     }
 
-    // Sales Asus voucher type in this Tally uses positive AMOUNT for outgoing stock
-    // Sales ledger goes inside ACCOUNTINGALLOCATIONS.LIST within inventory entry
-    // BATCHALLOCATIONS.LIST is only needed when we MUST deduct from a specific existing
-    // Tally batch. For normal stock ('Primary' / 'Primary Batch' / no batch), we OMIT it
-    // so Tally auto-allocates from the available batch - this reliably reduces quantity.
-    // A BATCHALLOCATIONS.LIST pointing to a batch that does not exist creates a voucher
-    // that shows as synced but does NOT reduce stock.
+    totalAmount += amount;
+
     const rawBatch = (item.batch || '').trim();
     const batchName = escapeXml(rawBatch);
-    const unit = 'Qty';
     const usesExplicitBatch = !!rawBatch && rawBatch !== 'Primary' && !/^Primary\s*Batch$/i.test(rawBatch);
     const batchAlloc = usesExplicitBatch ? `
         <BATCHALLOCATIONS.LIST>
@@ -805,13 +846,21 @@ function buildSalesVoucherXml(voucherData) {
           <ACTUALQTY> ${qty} ${unit}</ACTUALQTY>
           <BILLEDQTY> ${qty} ${unit}</BILLEDQTY>
         </BATCHALLOCATIONS.LIST>` : '';
+    const itemDesc = escapeXml(item.description || item.name || '');
     inventoryEntries += `
       <ALLINVENTORYENTRIES.LIST>
+        <BASICUSERDESCRIPTION.LIST TYPE="String">
+          <BASICUSERDESCRIPTION>${itemDesc}</BASICUSERDESCRIPTION>
+        </BASICUSERDESCRIPTION.LIST>
         <STOCKITEMNAME>${itemName}</STOCKITEMNAME>
+        <GSTOVRDNINELIGIBLEITC>&#4; Applicable</GSTOVRDNINELIGIBLEITC>
+        <GSTOVRDNISREVCHARGEAPPL>&#4; Not Applicable</GSTOVRDNISREVCHARGEAPPL>
+        <GSTOVRDNTAXABILITY>Taxable</GSTOVRDNTAXABILITY>
         <GSTSOURCETYPE>Ledger</GSTSOURCETYPE>
         <GSTLEDGERSOURCE>${salesLedger}</GSTLEDGERSOURCE>
         <HSNSOURCETYPE>Stock Item</HSNSOURCETYPE>
-        <GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>
+        <HSNITEMSOURCE>${itemName}</HSNITEMSOURCE>
+        <GSTOVRDNTYPEOFSUPPLY>${typeOfSupply}</GSTOVRDNTYPEOFSUPPLY>
         <GSTRATEINFERAPPLICABILITY>As per Masters/Company</GSTRATEINFERAPPLICABILITY>
         <GSTHSNINFERAPPLICABILITY>As per Masters/Company</GSTHSNINFERAPPLICABILITY>
         <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -827,12 +876,67 @@ function buildSalesVoucherXml(voucherData) {
           <AMOUNT>${amount.toFixed(2)}</AMOUNT>
         </ACCOUNTINGALLOCATIONS.LIST>
       </ALLINVENTORYENTRIES.LIST>`;
-    totalAmount += amount;
   }
 
-  const cgstAmount = totalAmount * cgstRate / 100;
-  const sgstAmount = totalAmount * sgstRate / 100;
-  const rawGrandTotal = totalAmount + cgstAmount + sgstAmount;
+  // Sales-ledger entries for non-stock (skipInventory) lines, grouped by rate
+  for (const [rate, b] of taxBuckets) {
+    const skipBase = b.skipBase || 0;
+    if (skipBase > 0) {
+      skipSalesEntries += `
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${salesLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${skipBase.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${rate}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>`;
+    }
+  }
+
+  // Tax amounts, computed per rate bucket (sum of per-line base x rate) so they
+  // match Tally's own calculation and never trigger the tax-mismatch warning.
+  let rawGrandTotal = totalAmount;
+  const taxEntries = [];
+  for (const [rate, b] of taxBuckets) {
+    const half = rate / 2;
+    if (isInterState) {
+      const igstAmt = b.base * rate / 100;
+      rawGrandTotal += igstAmt;
+      taxEntries.push(`    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${igstLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${igstAmt.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${rate}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>`);
+    } else {
+      const cgstAmt = b.base * half / 100;
+      const sgstAmt = b.base * half / 100;
+      rawGrandTotal += cgstAmt + sgstAmt;
+      taxEntries.push(`    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${cgstLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${cgstAmt.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${half}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>
+    <LEDGERENTRIES.LIST>
+      <LEDGERNAME>${sgstLedger}</LEDGERNAME>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
+      <AMOUNT>${sgstAmt.toFixed(2)}</AMOUNT>
+      <RATEOFINVOICETAX.LIST TYPE="Number">
+        <RATEOFINVOICETAX> ${half}</RATEOFINVOICETAX>
+      </RATEOFINVOICETAX.LIST>
+    </LEDGERENTRIES.LIST>`);
+    }
+  }
 
   // Round off (Tally-style): round the grand total to a whole rupee and balance the
   // difference through the ROUND OFF ledger, exactly like a voucher entered manually.
@@ -863,10 +967,6 @@ function buildSalesVoucherXml(voucherData) {
     }
   }
 
-  // LEDGERENTRIES.LIST (not ALLLEDGERENTRIES.LIST) for party and tax ledgers.
-  // Order matches a manually entered TallyPrime voucher: party first, then GST,
-  // then round off. Party: ISDEEMEDPOSITIVE=Yes with negative amount (debit party).
-  // GST: ISDEEMEDPOSITIVE=No with positive amount.
   const partyBillAlloc = voucherNumber ? `
       <BILLALLOCATIONS.LIST>
         <BILLTYPE>New Ref</BILLTYPE>
@@ -875,29 +975,59 @@ function buildSalesVoucherXml(voucherData) {
       </BILLALLOCATIONS.LIST>` : '';
   const ledgerEntries = `
     <LEDGERENTRIES.LIST>
-      <LEDGERNAME>${partyName}</LEDGERNAME>
+      <LEDGERNAME>${partyLedger}</LEDGERNAME>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
       <AMOUNT>-${grandTotal.toFixed(2)}</AMOUNT>${partyBillAlloc}
     </LEDGERENTRIES.LIST>
-    <LEDGERENTRIES.LIST>
-      <LEDGERNAME>${cgstLedger}</LEDGERNAME>
-      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
-      <AMOUNT>${cgstAmount.toFixed(2)}</AMOUNT>
-      <RATEOFINVOICETAX.LIST TYPE="Number">
-        <RATEOFINVOICETAX> ${cgstRate}</RATEOFINVOICETAX>
-      </RATEOFINVOICETAX.LIST>
-    </LEDGERENTRIES.LIST>
-    <LEDGERENTRIES.LIST>
-      <LEDGERNAME>${sgstLedger}</LEDGERNAME>
-      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-      <ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>
-      <AMOUNT>${sgstAmount.toFixed(2)}</AMOUNT>
-      <RATEOFINVOICETAX.LIST TYPE="Number">
-        <RATEOFINVOICETAX> ${sgstRate}</RATEOFINVOICETAX>
-      </RATEOFINVOICETAX.LIST>
-    </LEDGERENTRIES.LIST>${roundOffEntry}`;
+    ${skipSalesEntries}
+    ${taxEntries.join('\n')}
+    ${roundOffEntry}`;
+
+  // Party header / address block (mirrors the manual voucher field order)
+  const partyHeader = `
+        ${partyAddress.length ? `<ADDRESS.LIST TYPE="String">
+${partyAddress.map(a => `          <ADDRESS>${escapeXml(a)}</ADDRESS>`).join('\n')}
+        </ADDRESS.LIST>` : ''}
+        <DATE>${dateStr}</DATE>
+        <REFERENCEDATE>${dateStr}</REFERENCEDATE>
+        <VCHSTATUSDATE>${dateStr}</VCHSTATUSDATE>
+        ${company.gstin ? `<GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>` : ''}
+        ${company.state ? `<STATENAME>${escapeXml(company.state)}</STATENAME>` : ''}
+        ${company.country ? `<COUNTRYOFRESIDENCE>${escapeXml(company.country)}</COUNTRYOFRESIDENCE>` : ''}
+        ${partyGstin ? `<PARTYGSTIN>${escapeXml(partyGstin)}</PARTYGSTIN>` : ''}
+        ${placeOfSupply ? `<PLACEOFSUPPLY>${escapeXml(placeOfSupply)}</PLACEOFSUPPLY>` : ''}
+        <VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME>
+        <PARTYNAME>${partyName}</PARTYNAME>
+        ${company.gstin ? `<GSTREGISTRATION TAXTYPE="GST" TAXREGISTRATION="${escapeXml(company.gstin)}">${escapeXml(company.taxUnit)}</GSTREGISTRATION>` : ''}
+        ${company.gstin ? `<CMPGSTIN>${escapeXml(company.gstin)}</CMPGSTIN>` : ''}
+        <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+        ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+        <BASICBUYERNAME>${partyName}</BASICBUYERNAME>
+        ${company.gstin ? `<CMPGSTREGISTRATIONTYPE>Regular</CMPGSTREGISTRATIONTYPE>` : ''}
+        <PARTYMAILINGNAME>${partyName}</PARTYMAILINGNAME>
+        ${partyPincode ? `<PARTYPINCODE>${escapeXml(partyPincode)}</PARTYPINCODE>` : ''}
+        ${partyPlace ? `<BILLTOPLACE>${escapeXml(partyPlace)}</BILLTOPLACE>` : ''}
+        ${company.name ? `<DISPATCHFROMNAME>${escapeXml(company.name)}</DISPATCHFROMNAME>` : ''}
+        ${company.state ? `<DISPATCHFROMSTATENAME>${escapeXml(company.state)}</DISPATCHFROMSTATENAME>` : ''}
+        ${company.pincode ? `<DISPATCHFROMPINCODE>${escapeXml(company.pincode)}</DISPATCHFROMPINCODE>` : ''}
+        ${company.place ? `<DISPATCHFROMPLACE>${escapeXml(company.place)}</DISPATCHFROMPLACE>` : ''}
+        ${partyPlace ? `<SHIPTOPLACE>${escapeXml(partyPlace)}</SHIPTOPLACE>` : ''}
+        ${partyGstin ? `<CONSIGNEEGSTIN>${escapeXml(partyGstin)}</CONSIGNEEGSTIN>` : ''}
+        <CONSIGNEEMAILINGNAME>${partyName}</CONSIGNEEMAILINGNAME>
+        ${partyPincode ? `<CONSIGNEEPINCODE>${escapeXml(partyPincode)}</CONSIGNEEPINCODE>` : ''}
+        ${partyState ? `<CONSIGNEESTATENAME>${escapeXml(partyState)}</CONSIGNEESTATENAME>` : ''}
+        ${company.state ? `<CMPGSTSTATE>${escapeXml(company.state)}</CMPGSTSTATE>` : ''}
+        <CONSIGNEECOUNTRYNAME>${escapeXml(company.country || 'India')}</CONSIGNEECOUNTRYNAME>
+        <BASICBASEPARTYNAME>${partyName}</BASICBASEPARTYNAME>
+        <NUMBERINGSTYLE>Auto Retain</NUMBERINGSTYLE>
+        ${company.taxUnit ? `<VCHSTATUSTAXUNIT>${escapeXml(company.taxUnit)}</VCHSTATUSTAXUNIT>` : ''}
+        ${panNumber ? `<BUYERPINNUMBER>${escapeXml(panNumber)}</BUYERPINNUMBER>
+        <CONSIGNEEPINNUMBER>${escapeXml(panNumber)}</CONSIGNEEPINNUMBER>` : ''}
+        <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
+        <ISINVOICE>Yes</ISINVOICE>
+        <EFFECTIVEDATE>${dateStr}</EFFECTIVEDATE>
+        <NARRATION>${narration}</NARRATION>`;
 
   return `<ENVELOPE>
     <HEADER>
@@ -911,23 +1041,15 @@ function buildSalesVoucherXml(voucherData) {
         </REQUESTDESC>
         <REQUESTDATA>
           <TALLYMESSAGE xmlns:UDF="TallyUDF">
-            <LEDGER NAME="${partyName}" ACTION="Create">
-              <NAME>${partyName}</NAME>
+            <LEDGER NAME="${partyLedger}" ACTION="Create">
+              <NAME>${partyLedger}</NAME>
               <PARENT>Sundry Debtors</PARENT>
             </LEDGER>
           </TALLYMESSAGE>
           ${roundOffMaster}
           <TALLYMESSAGE xmlns:UDF="TallyUDF">
             <VOUCHER VCHTYPE="${voucherType}" ACTION="Create" OBJVIEW="Invoice Voucher View">
-              <DATE>${dateStr}</DATE>
-              <VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME>
-              ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
-              <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
-              <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
-              <ISINVOICE>Yes</ISINVOICE>
-              <NUMBERINGSTYLE>Auto Retain</NUMBERINGSTYLE>
-              <PARTYLEDGERNAME>${partyName}</PARTYLEDGERNAME>
-              <NARRATION>${narration}</NARRATION>
+              ${partyHeader}
               ${inventoryEntries}
               ${ledgerEntries}
             </VOUCHER>
@@ -1415,6 +1537,135 @@ async function fetchLedgers() {
   }
   log('LEDGERS', `Fetched ${ledgers.length} ledgers from Tally`);
   return { ledgers, count: ledgers.length };
+}
+
+function companyInfoFromEnv() {
+  return {
+    name: process.env.TALLY_COMPANY_NAME || getTallyConfig().company || '',
+    gstin: process.env.TALLY_COMPANY_GSTIN || '',
+    state: process.env.TALLY_COMPANY_STATE || '',
+    pincode: process.env.TALLY_COMPANY_PINCODE || '',
+    place: process.env.TALLY_COMPANY_PLACE || '',
+    country: process.env.TALLY_COMPANY_COUNTRY || 'India',
+    address: (process.env.TALLY_COMPANY_ADDRESS || '').split('|').filter(Boolean),
+    taxUnit: getTallyConfig().taxUnit || '',
+  };
+}
+
+// Builds the Company master query. Only the fast native methods are used here
+// (Name/PinCode/CountryName); the heavier GST registration master makes Tally's
+// TDL compiler hang, so GSTIN/state/dispatch-address are derived from the Day
+// Book sales vouchers instead (see fetchCompanyInfo).
+function buildCompanyInfoRequest() {
+  const cfg = getTallyConfig();
+  return `<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>CRSCompany</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        <SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="CRSCompany" ISINITIALIZE="Yes">
+            <TYPE>Company</TYPE>
+            <NATIVEMETHOD>Name</NATIVEMETHOD>
+            <NATIVEMETHOD>PinCode</NATIVEMETHOD>
+            <NATIVEMETHOD>CountryName</NATIVEMETHOD>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`;
+}
+
+// Fetches the CRS company's own details from Tally (company master + GST details
+// carried on Sales vouchers). Result is cached in memory and persisted to .env so
+// subsequent calls are instant and work even when Tally is unreachable.
+async function fetchCompanyInfo(force = false) {
+  const now = Date.now();
+  if (!force && companyInfoCache && now - companyInfoCacheAt < 5 * 60 * 1000) {
+    return { success: true, company: companyInfoCache, cached: true };
+  }
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const company = companyInfoFromEnv();
+
+  // 1. Company master (Name / PinCode / CountryName)
+  try {
+    const res = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(buildCompanyInfoRequest()),
+    }, buildCompanyInfoRequest(), 20000);
+    const name = res.body.match(/<COMPANY NAME="([^"]*)"/);
+    const pin = res.body.match(/<PINCODE TYPE="String">([^<]*)<\/PINCODE>/);
+    const country = res.body.match(/<COUNTRYNAME TYPE="String">([^<]*)<\/COUNTRYNAME>/);
+    if (name) company.name = name[1];
+    if (pin) company.pincode = pin[1];
+    if (country) company.country = country[1];
+  } catch (err) {
+    log('COMPANY', `Company master fetch failed: ${err.message}`);
+  }
+
+  // 2. GSTIN / state / dispatch address from the Sales vouchers. Scans every voucher
+  // in the Day Book (not just the first) so we take the first non-empty value of each
+  // field across all vouchers - robust to a mix of vouchers with/without these fields.
+  try {
+    const dayBookXml = buildExportRequest('01-Apr-2024', cfg.company);
+    const res = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(dayBookXml),
+    }, dayBookXml, 30000);
+    const body = res.body || '';
+
+    const firstOf = (tag) => {
+      const re = new RegExp(`<${tag}>([^<]*)</${tag}>`, 'g');
+      let m;
+      while ((m = re.exec(body)) !== null) {
+        if (m[1] && m[1].trim()) return m[1].trim();
+      }
+      return null;
+    };
+    const gstin = firstOf('CMPGSTIN');
+    const state = firstOf('CMPGSTSTATE');
+    const dfName = firstOf('DISPATCHFROMNAME');
+    const dfPlace = firstOf('DISPATCHFROMPLACE');
+    const dfPin = firstOf('DISPATCHFROMPINCODE');
+    if (gstin) company.gstin = gstin;
+    if (state) company.state = state;
+    if (dfName) company.name = dfName;
+    if (dfPlace) company.place = dfPlace;
+    if (dfPin) company.pincode = dfPin;
+    const dfAddr = [...body.matchAll(/<DISPATCHFROMADDRESS>([^<]*)<\/DISPATCHFROMADDRESS>/g)].map(m => m[1].trim()).filter(Boolean);
+    if (dfAddr.length) company.address = dfAddr;
+    if (company.state) company.taxUnit = getTallyConfig().taxUnit || `${company.state} Registration`;
+  } catch (err) {
+    log('COMPANY', `Day Book company info fetch failed: ${err.message}`);
+  }
+
+  // Persist so restarts keep the last known-good values
+  persistConfig({
+    TALLY_COMPANY_NAME: company.name,
+    TALLY_COMPANY_GSTIN: company.gstin,
+    TALLY_COMPANY_STATE: company.state,
+    TALLY_COMPANY_PINCODE: company.pincode,
+    TALLY_COMPANY_PLACE: company.place,
+    TALLY_COMPANY_COUNTRY: company.country,
+    TALLY_COMPANY_ADDRESS: company.address.join('|'),
+  });
+
+  const hasRealData = !!(company.gstin || company.state || company.address.length);
+  companyInfoCache = company;
+  companyInfoCacheAt = now;
+  log('COMPANY', `Company info resolved: ${company.name}, GSTIN: ${company.gstin || '(none)'}, state: ${company.state || '(none)'}`);
+  return { success: hasRealData, company, cached: false };
 }
 
 function buildLedgerCreateXml(name, company, options = {}) {
@@ -2264,6 +2515,307 @@ async function getLedgerBalance(name, company) {
   return found ? found : null;
 }
 
+// Bank ledgers = ledgers created under the "Bank Accounts" / "Bank OD A/c" groups
+// (used for the Receipt / Payment vouchers). Returns the configured TALLY_BANK_LEDGER
+// first when it is also present in Tally, so the UI can show the saved selection.
+async function fetchBankLedgers() {
+  const cfg = getTallyConfig();
+  const result = await fetchLedgers();
+  const bankLedgers = (result.ledgers || [])
+    .filter(l => /bank/i.test(l.parent))
+    .map(l => l.name)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .sort((a, b) => a.localeCompare(b));
+  return {
+    success: true,
+    bankLedgers,
+    count: bankLedgers.length,
+    selected: cfg.bankLedger,
+  };
+}
+
+// Receipt voucher (money received from a customer against a sales invoice). Mirrors
+// the manual TallyPrime entry: party credited (+amount) with a bill allocation to the
+// outstanding sales voucher, bank debited (-amount) with a bank allocation. Ledger
+// entries live in ALLLEDGERENTRIES.LIST for accounting vouchers.
+function buildReceiptVoucherXml(voucherData) {
+  const cfg = getTallyConfig();
+  let dateStr = voucherData.date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  if (!/^\d{8}$/.test(dateStr)) {
+    dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  }
+  const amount = parseFloat(voucherData.amount) || 0;
+  const partyLedger = escapeXml(voucherData.partyLedger || voucherData.partyName || 'Walk-in Customer');
+  const bankLedger = escapeXml(voucherData.bankLedger || cfg.bankLedger || '');
+  const voucherNumber = escapeXml(voucherData.voucherNumber || '');
+  const refVoucherNumber = escapeXml(voucherData.refVoucherNumber || '');
+  const narration = escapeXml(voucherData.narration || 'Receipt via CRS');
+  const voucherType = escapeXml(voucherData.voucherType || 'Receipt');
+
+  if (!bankLedger) {
+    return { success: false, message: 'No bank ledger configured. Select a bank ledger in Tally settings first.', xml: null };
+  }
+
+  let companyTag = '';
+  if (cfg.company && cfg.company.trim()) {
+    companyTag = `<SVCURRENTCOMPANY>${escapeXml(cfg.company)}</SVCURRENTCOMPANY>`;
+  }
+
+  const amountStr = amount.toFixed(2);
+  const billAlloc = refVoucherNumber ? `
+        <BILLALLOCATIONS.LIST>
+          <BILLTYPE>Agnst Ref</BILLTYPE>
+          <NAME>${refVoucherNumber}</NAME>
+          <AMOUNT>${amountStr}</AMOUNT>
+        </BILLALLOCATIONS.LIST>` : '';
+
+  const xml = `<ENVELOPE>
+    <HEADER>
+      <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+      <IMPORTDATA>
+        <REQUESTDESC>
+          <REPORTNAME>Vouchers</REPORTNAME>
+          <STATICVARIABLES>${companyTag}</STATICVARIABLES>
+        </REQUESTDESC>
+        <REQUESTDATA>
+          <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <VOUCHER VCHTYPE="${voucherType}" ACTION="Create" OBJVIEW="Accounting Voucher View">
+              <DATE>${dateStr}</DATE>
+              <REFERENCEDATE>${dateStr}</REFERENCEDATE>
+              <VCHSTATUSDATE>${dateStr}</VCHSTATUSDATE>
+              <VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME>
+              ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+              <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+              <BASICBUYERNAME>${partyLedger}</BASICBUYERNAME>
+              <NUMBERINGSTYLE>Auto Retain</NUMBERINGSTYLE>
+              <VCHENTRYMODE>Account Invoice</VCHENTRYMODE>
+              <ISINVOICE>No</ISINVOICE>
+              <EFFECTIVEDATE>${dateStr}</EFFECTIVEDATE>
+              <NARRATION>${narration}</NARRATION>
+              <ALLLEDGERENTRIES.LIST>
+                <LEDGERNAME>${partyLedger}</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+                <AMOUNT>${amountStr}</AMOUNT>${billAlloc}
+              </ALLLEDGERENTRIES.LIST>
+              <ALLLEDGERENTRIES.LIST>
+                <LEDGERNAME>${bankLedger}</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                <AMOUNT>-${amountStr}</AMOUNT>
+                <BANKALLOCATIONS.LIST>
+                  <NAME>${bankLedger}</NAME>
+                  <AMOUNT>-${amountStr}</AMOUNT>
+                </BANKALLOCATIONS.LIST>
+              </ALLLEDGERENTRIES.LIST>
+            </VOUCHER>
+          </TALLYMESSAGE>
+        </REQUESTDATA>
+      </IMPORTDATA>
+    </BODY>
+  </ENVELOPE>`;
+  return { success: true, xml };
+}
+
+async function pushReceiptVoucher(voucherData) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  log('PUSH', `Pushing receipt voucher to Tally: ${voucherData.voucherNumber || '(auto)'}`);
+
+  const built = buildReceiptVoucherXml(voucherData);
+  if (!built.success) return built;
+  const xml = built.xml;
+  log('PUSH', `XML length: ${xml.length} bytes`);
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml);
+    const parsed = deepParseResponse(response.body);
+    const importResult = parsed?.ENVELOPE?.BODY?.IMPORTDATA?.IMPORTRESULT
+      || parsed?.ENVELOPE?.BODY?.DATA?.IMPORTRESULT
+      || parsed?.RESPONSE
+      || null;
+
+    let tallyLineError = '';
+    if (response.body.includes('LINEERROR')) {
+      const match = response.body.match(/<LINEERROR>(.*?)<\/LINEERROR>/);
+      tallyLineError = match ? match[1] : '';
+    }
+
+    if (importResult) {
+      const created = parseInt(importResult.CREATED) || 0;
+      const errors = parseInt(importResult.ERRORS) || 0;
+      const exceptions = parseInt(importResult.EXCEPTIONS) || 0;
+      const lastVchId = importResult.LASTVCHID || null;
+      const hasProblems = errors > 0 || exceptions > 0;
+      const errMsg = tallyLineError || `Tally reported errors:${errors} exceptions:${exceptions}`;
+
+      if (created > 0 && hasProblems) {
+        return { success: false, message: `Receipt created but with errors: ${errMsg}`, created, lastVchId, errors, exceptions, synced: false };
+      }
+      if (created > 0) {
+        return { success: true, message: 'Receipt voucher pushed to Tally', created, lastVchId, errors: 0, exceptions: 0, synced: true };
+      }
+      if (hasProblems) {
+        logError('Push receipt voucher failed', errMsg);
+        return { success: false, message: errMsg, created: 0, errors, exceptions, synced: false };
+      }
+      return { success: created > 0, message: created > 0 ? 'Receipt voucher pushed to Tally' : 'No receipt created', created, lastVchId, errors: 0, exceptions: 0, synced: created > 0 };
+    }
+
+    if (tallyLineError) {
+      logError('Push receipt voucher LINEERROR', tallyLineError);
+      return { success: false, message: tallyLineError, created: 0, errors: 1, synced: false };
+    }
+
+    return { success: true, message: 'Request sent to Tally', created: 0, errors: 0, synced: false, raw: response.body.substring(0, 500) };
+  } catch (err) {
+    logError('Push receipt voucher HTTP error', err);
+    return { success: false, message: err.message, created: 0, errors: 1, synced: false };
+  }
+}
+
+async function pushReceiptVoucherWithRetry(voucherData, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    log('PUSH', `Attempt ${attempt}/${maxRetries} for receipt: ${voucherData.voucherNumber || '(auto)'}`);
+    try {
+      const result = await pushReceiptVoucher(voucherData);
+      if (result.success) {
+        lastConnectionStatus = { reachable: true, companyFound: true, lastChecked: new Date().toISOString() };
+        return result;
+      }
+      lastError = result.message;
+      if (attempt < maxRetries) {
+        const delay = 1500 * attempt;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    } catch (err) {
+      lastError = err.message;
+      if (attempt < maxRetries) {
+        const delay = 1500 * attempt;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  return { success: false, message: lastError || 'Failed to push receipt voucher', created: 0, errors: 1, synced: false };
+}
+
+// Pre-push validation: verifies Tally is reachable, all required ledgers exist, the
+// stock items referenced will be found, and the GST computation matches Tally's own
+// calculation (per-line base x rate) so the tax-mismatch warning is never triggered.
+async function validatePrePush(voucherData = {}) {
+  const cfg = getTallyConfig();
+  const warnings = [];
+  const errors = [];
+
+  // 1. Reachability
+  let reachable = false;
+  try {
+    const ping = await pingTally();
+    reachable = !!ping.reachable;
+  } catch (_) { reachable = false; }
+  if (!reachable) {
+    errors.push(`Tally is not reachable at ${cfg.host}:${cfg.port}`);
+  }
+
+  // 2. Required ledgers exist
+  const required = new Set();
+  const salesLedger = cfg.salesLedger || 'SALES @ 18%';
+  required.add(salesLedger);
+  required.add(voucherData.cgstLedger || cfg.cgstLedger || 'OUTPUT CGST @ 9%');
+  required.add(voucherData.sgstLedger || cfg.sgstLedger || 'OUTPUT SGST @ 9%');
+  const igstLedger = voucherData.igstLedger || cfg.igstLedger || 'OUTPUT IGST @ 18%';
+  required.add(igstLedger);
+  if (voucherData.voucherType === 'Receipt' || voucherData.receipt) {
+    required.add(voucherData.bankLedger || cfg.bankLedger || '');
+  }
+  if (voucherData.roundOff) {
+    required.add(voucherData.roundOffLedger || 'Round Off');
+  }
+
+  let names = [];
+  try {
+    const snap = await ledgerNamesSnapshot(false);
+    names = snap || [];
+  } catch (_) { /* keep empty */ }
+
+  const existingNames = new Set(names.map(n => String(n).toLowerCase()));
+  const missing = [];
+  for (const ledger of required) {
+    if (!ledger) continue;
+    if (!existingNames.has(String(ledger).toLowerCase())) missing.push(ledger);
+  }
+  if (missing.length) {
+    errors.push(`Ledger(s) not found in Tally (will need to be created): ${missing.join(', ')}`);
+  }
+
+  // 3. GST computation vs Tally (never trigger the tax-mismatch warning)
+  const items = voucherData.items || [];
+  const defaultTaxRate = parseFloat(voucherData.taxRate) || 18;
+  const buckets = new Map();
+  for (const item of items) {
+    const qty = parseInt(item.qty || item.quantity) || 1;
+    const rate = parseFloat(item.price || item.unitPrice) || 0;
+    const disc = parseFloat(item.discount || 0);
+    const amount = (rate - disc) * qty;
+    const tr = parseFloat(item.taxRate) || defaultTaxRate;
+    if (!buckets.has(tr)) buckets.set(tr, 0);
+    buckets.set(tr, buckets.get(tr) + amount);
+  }
+  let computedTax = 0;
+  for (const [tr, base] of buckets) {
+    computedTax += base * tr / 100;
+  }
+
+  // Explicit taxAmount mismatch (when caller supplies one) is the #1 cause of the
+  // "Amount of Taxes & 18%" mismatch warning - catch it before the push.
+  if (voucherData.taxAmount !== undefined && voucherData.taxAmount !== null) {
+    const declared = parseFloat(voucherData.taxAmount) || 0;
+    if (Math.abs(declared - computedTax) > 0.005) {
+      errors.push(`Tax mismatch: declared tax ${declared.toFixed(2)} does not match Tally's computation ${computedTax.toFixed(2)} (${[...buckets.entries()].map(([r, b]) => `${b.toFixed(2)} x ${r}%`).join(' + ')}).`);
+    }
+  }
+
+  // 4. GST override fields that Tally would reject / warn about
+  for (const item of items) {
+    const overrideFields = ['GSTOVRDNTAXABILITY', 'GSTOVRDNELIGIBLEITC', 'GSTOVRDNISREVCHARGEAPPL', 'GSTOVRDNISRCM', 'GSTOVRDNTYPEOFSUPPLY'];
+    for (const f of overrideFields) {
+      if (item[f] !== undefined && item[f] !== null) {
+        warnings.push(`Item "${item.name || item.description || '?'}" carries override field ${f} - the manual voucher never sets it; consider removing it to avoid a Tally tax warning.`);
+      }
+    }
+  }
+
+  // 5. Stock items (for non-skip lines) - warn if the referenced item is unknown.
+  // Only attempted when Tally responded, since the serial map fetch is expensive.
+  if (reachable) {
+    try {
+      const serialMap = await fetchStockSerialMap();
+      for (const item of items) {
+        if (item.skipInventory) continue;
+        if (item.serialNumber && !serialMap[item.serialNumber]) {
+          warnings.push(`Serial ${item.serialNumber} was not found in Tally's stock items; the push will use the CRS name "${item.name || item.description}".`);
+        }
+      }
+    } catch (_) { /* serial check is best-effort */ }
+  }
+
+  const taxDetail = {
+    computedTax: round2(computedTax),
+    buckets: [...buckets.entries()].map(([r, b]) => ({ rate: r, base: round2(b), tax: round2(b * r / 100) })),
+  };
+
+  return { ok: errors.length === 0, reachable, errors, warnings, taxDetail };
+}
+
+function round2(n) {
+  return Math.round((parseFloat(n) + Number.EPSILON) * 100) / 100;
+}
+
 module.exports = {
   testConnection,
   fetchRecentSales,
@@ -2302,4 +2854,10 @@ module.exports = {
   fetchPurchaseOrders,
   fetchLedgerBalances,
   getLedgerBalance,
+  fetchCompanyInfo,
+  fetchBankLedgers,
+  buildReceiptVoucherXml,
+  pushReceiptVoucher,
+  pushReceiptVoucherWithRetry,
+  validatePrePush,
 };

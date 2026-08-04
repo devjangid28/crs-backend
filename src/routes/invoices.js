@@ -207,6 +207,44 @@ router.post('/', async (req, res, next) => {
               if (!isNaN(d.getTime())) vchDate = d.toISOString().slice(0, 10).replace(/-/g, '');
             }
 
+            // Party billing/shipping details from the customer master (or the invoice's
+            // billedTo block). These populate the Tally-printed invoice's party header.
+            let partyState = '';
+            let partyPincode = '';
+            let partyPlace = '';
+            let partyAddress = null;
+            try {
+              if (customerRef) {
+                const cust = await query(
+                  `SELECT name, company, address, address_line2, city, state, postcode FROM customers WHERE id = $1`,
+                  [customerRef]
+                );
+                const c = cust.rows[0];
+                if (c) {
+                  partyState = c.state || '';
+                  partyPincode = c.postcode || c.postcode || '';
+                  partyPlace = c.city || '';
+                  partyAddress = [c.address, c.address_line2].filter(Boolean);
+                }
+              }
+              if (!partyAddress || partyAddress.length === 0) {
+                const cand = [billedTo?.address1, billedTo?.address2].filter(Boolean);
+                partyAddress = cand.length ? cand : null;
+              }
+              if (!partyPlace && billedTo?.place) partyPlace = billedTo.place;
+              if (!partyState && billedTo?.state) partyState = billedTo.state;
+              if (!partyPincode && billedTo?.pincode) partyPincode = billedTo.pincode;
+            } catch (custErr) {
+              console.error('[Invoice] Customer details lookup failed:', custErr.message);
+            }
+
+            // CRS company (dispatch-from / our GSTIN) - resolved from Tally and cached
+            let company = null;
+            try {
+              const ci = await tallyService.fetchCompanyInfo(false);
+              if (ci && ci.company) company = ci.company;
+            } catch (_) { /* leave null - builder falls back to .env */ }
+
             const tallyResult = await tallyService.pushSalesVoucherWithRetry({
               partyName: customerName || billedTo?.name || 'Walk-in Customer',
               voucherNumber: invId,
@@ -215,6 +253,11 @@ router.post('/', async (req, res, next) => {
               narration: `Invoice ${invId} - ${customerName || 'Customer'}`,
               date: vchDate,
               roundOff: true,
+              partyState: partyState || null,
+              partyPincode: partyPincode || null,
+              partyPlace: partyPlace || null,
+              partyAddress: partyAddress || null,
+              company,
             }, 3);
 
             const syncStatus = tallyResult.synced ? 'synced' : (tallyResult.success ? 'pushed' : 'error');

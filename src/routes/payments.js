@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../config/database');
+const tallyService = require('../services/tallyService');
 
 router.get('/', async (req, res, next) => {
   try {
@@ -28,6 +29,43 @@ router.post('/', async (req, res, next) => {
     if (invoiceId) {
       await query('UPDATE invoices SET amount_paid = amount_paid + ?, balance_due = total_amount - (amount_paid + ?) WHERE id = ?',
         [amount || 0, amount || 0, invoiceId]);
+    }
+
+    // Push a Receipt voucher to Tally (fire-and-forget): the bank ledger configured in
+    // Tally settings is debited, the customer is credited against the sales invoice.
+    if (invoiceId && (parseFloat(amount) || 0) > 0) {
+      setImmediate(async () => {
+        try {
+          const invResult = await query(
+            `SELECT id, invoice_id, customer_name, customer_id FROM invoices WHERE id = ?`,
+            [invoiceId]
+          );
+          const inv = invResult.rows[0];
+          if (!inv) return;
+          let partyName = inv.customer_name || 'Walk-in Customer';
+          if (inv.customer_id) {
+            try {
+              const cust = await query('SELECT name FROM customers WHERE id = ?', [inv.customer_id]);
+              if (cust.rows[0]?.name) partyName = cust.rows[0].name;
+            } catch (_) { /* fall through */ }
+          }
+          const cfg = tallyService.getTallyConfig();
+          if (!cfg.bankLedger) {
+            console.warn('[Payment] No TALLY_BANK_LEDGER configured - skipping Receipt voucher push.');
+            return;
+          }
+          const receiptResult = await tallyService.pushReceiptVoucherWithRetry({
+            partyName,
+            refVoucherNumber: inv.invoice_id,
+            amount: parseFloat(amount),
+            bankLedger: cfg.bankLedger,
+            narration: `Payment received against ${inv.invoice_id} - ${partyName}`,
+          }, 2);
+          console.log(`[Payment] Receipt voucher push for ${inv.invoice_id}: ${receiptResult.success ? 'ok' : 'failed'} - ${receiptResult.message}`);
+        } catch (e) {
+          console.error('[Payment] Receipt voucher push error:', e.message);
+        }
+      });
     }
 
     const insertId = result.rows[0].id;

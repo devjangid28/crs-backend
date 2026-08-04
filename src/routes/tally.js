@@ -36,6 +36,13 @@ router.get('/status', async (req, res) => {
       port: cfg.port,
       company: cfg.company || '(auto-detect)',
       pollIntervalMs: cfg.pollIntervalMs,
+      salesVoucherType: cfg.salesVoucherType,
+      salesLedger: cfg.salesLedger,
+      cgstLedger: cfg.cgstLedger,
+      sgstLedger: cfg.sgstLedger,
+      igstLedger: cfg.igstLedger,
+      bankLedger: cfg.bankLedger,
+      taxUnit: cfg.taxUnit,
       statusCounts,
       lastSyncAt: lastSync.rows[0]?.synced_at || null,
       inventoryStats: { total: parseInt(totalItems.rows[0].total, 10), sold: parseInt(soldItems.rows[0].total, 10) },
@@ -118,7 +125,7 @@ router.post('/mark-sold', async (req, res) => {
 // PUT /api/tally/config
 router.put('/config', async (req, res) => {
   try {
-    const { host, port, pollIntervalMs, company, salesVoucherType, salesLedger, cgstLedger, sgstLedger } = req.body;
+    const { host, port, pollIntervalMs, company, salesVoucherType, salesLedger, cgstLedger, sgstLedger, igstLedger, bankLedger, taxUnit } = req.body;
     const envUpdates = {};
     if (host !== undefined) { process.env.TALLY_HOST = host; envUpdates.TALLY_HOST = host; }
     if (port !== undefined) { process.env.TALLY_PORT = String(port); envUpdates.TALLY_PORT = String(port); }
@@ -128,9 +135,12 @@ router.put('/config', async (req, res) => {
     if (salesLedger !== undefined) { process.env.TALLY_SALES_LEDGER = salesLedger; envUpdates.TALLY_SALES_LEDGER = salesLedger; }
     if (cgstLedger !== undefined) { process.env.TALLY_CGST_LEDGER = cgstLedger; envUpdates.TALLY_CGST_LEDGER = cgstLedger; }
     if (sgstLedger !== undefined) { process.env.TALLY_SGST_LEDGER = sgstLedger; envUpdates.TALLY_SGST_LEDGER = sgstLedger; }
+    if (igstLedger !== undefined) { process.env.TALLY_IGST_LEDGER = igstLedger; envUpdates.TALLY_IGST_LEDGER = igstLedger; }
+    if (bankLedger !== undefined) { process.env.TALLY_BANK_LEDGER = bankLedger; envUpdates.TALLY_BANK_LEDGER = bankLedger; }
+    if (taxUnit !== undefined) { process.env.TALLY_TAX_UNIT = taxUnit; envUpdates.TALLY_TAX_UNIT = taxUnit; }
     tallyService.persistConfig(envUpdates);
     const cfg = tallyService.getTallyConfig();
-    res.json({ success: true, message: 'Config saved.', host: cfg.host, port: cfg.port, pollIntervalMs: cfg.pollIntervalMs, company: cfg.company, salesVoucherType: cfg.salesVoucherType, salesLedger: cfg.salesLedger, cgstLedger: cfg.cgstLedger, sgstLedger: cfg.sgstLedger });
+    res.json({ success: true, message: 'Config saved.', host: cfg.host, port: cfg.port, pollIntervalMs: cfg.pollIntervalMs, company: cfg.company, salesVoucherType: cfg.salesVoucherType, salesLedger: cfg.salesLedger, cgstLedger: cfg.cgstLedger, sgstLedger: cfg.sgstLedger, igstLedger: cfg.igstLedger, bankLedger: cfg.bankLedger, taxUnit: cfg.taxUnit });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -150,10 +160,22 @@ router.get('/lookup/:serial', async (req, res) => {
 // POST /api/tally/push-sales - Push a sales voucher to Tally
 router.post('/push-sales', async (req, res) => {
   try {
-    const { partyName, voucherNumber, items, taxRate, narration, date, invoiceId } = req.body;
+    const { partyName, voucherNumber, items, taxRate, narration, date, invoiceId, partyGstin, partyState, partyPincode, partyPlace, partyAddress, company } = req.body;
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: 'items array is required with at least one item' });
     }
+
+    // Company / dispatch-from details come from Tally itself (cached in .env)
+    let companyInfo = null;
+    if (company) {
+      companyInfo = company;
+    } else {
+      try {
+        const ci = await tallyService.fetchCompanyInfo(false);
+        if (ci && ci.company) companyInfo = ci.company;
+      } catch (_) { /* fall through to env-cached values */ }
+    }
+
     const result = await tallyService.pushSalesVoucherWithRetry({
       partyName: partyName || 'Walk-in Customer',
       voucherNumber: voucherNumber || null,
@@ -162,6 +184,12 @@ router.post('/push-sales', async (req, res) => {
       narration: narration || `Invoice ${invoiceId || ''} via CRS`,
       date: date || null,
       roundOff: true,
+      partyGstin: partyGstin || null,
+      partyState: partyState || null,
+      partyPincode: partyPincode || null,
+      partyPlace: partyPlace || null,
+      partyAddress: partyAddress || null,
+      company: companyInfo || null,
     }, 3);
 
     // Log to tally_sync_log
@@ -183,6 +211,65 @@ router.post('/push-sales', async (req, res) => {
   } catch (err) {
     console.error('[TallyRoute] Push sales error:', err.message);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/tally/bank-ledgers - Ledgers under "Bank Accounts" for Receipt/Payment vouchers
+router.get('/bank-ledgers', async (req, res) => {
+  try {
+    const result = await tallyService.fetchBankLedgers();
+    res.json(result);
+  } catch (err) {
+    console.error('[TallyRoute] Fetch bank ledgers error:', err.message);
+    res.status(500).json({ success: false, bankLedgers: [], count: 0, message: err.message });
+  }
+});
+
+// GET /api/tally/company-info - CRS company details resolved from Tally
+router.get('/company-info', async (req, res) => {
+  try {
+    const force = req.query.force === 'true' || req.query.force === '1';
+    const result = await tallyService.fetchCompanyInfo(force);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Fetch company info error:', err.message);
+    res.status(500).json({ success: false, company: null, message: err.message });
+  }
+});
+
+// POST /api/tally/push-receipt - Push a Receipt voucher (payment against an invoice)
+router.post('/push-receipt', async (req, res) => {
+  try {
+    const { partyName, partyLedger, voucherNumber, refVoucherNumber, amount, bankLedger, narration, date } = req.body;
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) {
+      return res.status(400).json({ success: false, message: 'amount must be a positive number' });
+    }
+    const result = await tallyService.pushReceiptVoucherWithRetry({
+      partyName: partyName || partyLedger || 'Walk-in Customer',
+      partyLedger: partyLedger || partyName || null,
+      voucherNumber: voucherNumber || null,
+      refVoucherNumber: refVoucherNumber || null,
+      amount: amt,
+      bankLedger: bankLedger || null,
+      narration: narration || `Payment received against ${refVoucherNumber || 'invoice'}`,
+      date: date || null,
+    }, 3);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Push receipt error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/tally/validate-push - Pre-push validation before sending a voucher
+router.post('/validate-push', async (req, res) => {
+  try {
+    const result = await tallyService.validatePrePush(req.body || {});
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Validate push error:', err.message);
+    res.status(500).json({ success: false, ok: false, message: err.message });
   }
 });
 
