@@ -64,9 +64,13 @@ function populateInwardTemplate(ticket, settings) {
     [settings.city, settings.state].filter(Boolean).join(', '),
     settings.pincode,
   ].filter(Boolean);
-  const phoneLine = settings.phone || '';
+  const contactEmail = settings.email || 'bluechipcs@yahoo.com';
+  const website = 'www.bccsgroup.in';
   let addressHtml = addressParts.join('<br>');
-  if (phoneLine) addressHtml += '<br>' + phoneLine;
+  addressHtml += '<br>' +
+    '9099128072 | ' +
+    '<a href="mailto:' + contactEmail + '" style="color:#1a73e8;">' + contactEmail + '</a>' +
+    ' , <a href="https://' + website + '" target="_blank" style="color:#1a73e8;">' + website + '</a>';
 
   html = html.replace(
     /<p>[^]*?<\/p>/,

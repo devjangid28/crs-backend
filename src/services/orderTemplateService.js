@@ -72,10 +72,11 @@ function populateOrderTemplate(order, components, settings) {
   ].filter(Boolean);
 
   let addrLine = addressParts.join('<br>');
-  const phoneParts = [];
-  if (settings.phone) phoneParts.push('Phone: ' + settings.phone);
-  if (settings.email) phoneParts.push('Email: ' + settings.email);
-  if (phoneParts.length) addrLine += '<br>' + phoneParts.join(' | ');
+  const contactEmail = settings.email || 'bluechipcs@yahoo.com';
+  const website = 'www.bccsgroup.in';
+  addrLine += '<br>Phone: 9099128072 | ' +
+    '<a href="mailto:' + contactEmail + '" style="color:#1a73e8;">' + contactEmail + '</a>' +
+    ' , <a href="https://' + website + '" target="_blank" style="color:#1a73e8;">' + website + '</a>';
   if (settings.gst_vat) addrLine += '<br>GST: ' + settings.gst_vat;
 
   html = html.replace(

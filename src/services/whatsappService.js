@@ -391,7 +391,7 @@ async function sendMediaMessage(to, mediaUrl, mediaType, caption, context = {}) 
 }
 
 async function sendTicketTemplate(ticket, store) {
-  const estPrice = parseFloat(ticket.estimated_price ?? ticket.estimatedPrice ?? ticket.estimated_cost ?? ticket.estimatedCost);
+  const estPrice = parseFloat(ticket.estimated_price || ticket.estimatedPrice || ticket.estimated_cost || ticket.estimatedCost) || 0;
   const priceDisplay = (estPrice > 0) ? estPrice.toFixed(2) : 'N/A';
   const params = [
     ticket.customer_name || 'Valued Customer',

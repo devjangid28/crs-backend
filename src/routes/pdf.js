@@ -3,7 +3,7 @@ const router = express.Router();
 const path = require('path');
 const fs = require('fs');
 const { query } = require('../config/database');
-const { generateInwardReceipt, generateInvoicePdf, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
 const { populateOrderTemplate } = require('../services/orderTemplateService');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
@@ -42,7 +42,7 @@ async function getStoreData(storeId) {
 router.post('/generate-inward/:ticketId', authenticate, async (req, res, next) => {
   try {
     const ticketId = parseInt(req.params.ticketId);
-    const pdf = await generateInwardReceipt(ticketId);
+    const pdf = await generateInwardReceiptFromHTML(ticketId);
 
     // Ensure inward_receipts table has entry
     const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
@@ -84,13 +84,22 @@ router.get('/download/inward/:ticketId', async (req, res, next) => {
   try {
     const ticketId = parseInt(req.params.ticketId);
     const result = await query('SELECT * FROM inward_receipts WHERE ticket_id = $1 ORDER BY created_at DESC LIMIT 1', [ticketId]);
-    if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'Inward receipt not found' });
-
     const receipt = result.rows[0];
-    const filePath = receipt.pdf_path;
 
+    let filePath = receipt?.pdf_path || null;
+
+    // Fallback: locate the receipt file on disk (created via /messages/send-document)
     if (!filePath || !fs.existsSync(filePath)) {
-      return res.status(404).json({ success: false, message: 'PDF file not found' });
+      const tRes = await query('SELECT ticket_id FROM tickets WHERE id = $1', [ticketId]);
+      if (tRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Ticket not found' });
+      const diskPath = path.join(PDF_DIR, 'inward', `Inward_Receipt_${tRes.rows[0].ticket_id}.pdf`);
+      if (fs.existsSync(diskPath)) filePath = diskPath;
+    }
+
+    // Last resort: generate the receipt on the fly
+    if (!filePath || !fs.existsSync(filePath)) {
+      const pdf = await generateInwardReceiptFromHTML(ticketId);
+      filePath = pdf.filePath;
     }
 
     const fileName = path.basename(filePath);
@@ -99,7 +108,7 @@ router.get('/download/inward/:ticketId', async (req, res, next) => {
       action: actions.PDF_VIEWED,
       ticketId,
       entityType: 'inward_receipt',
-      entityId: receipt.receipt_number,
+      entityId: receipt?.receipt_number || fileName,
       performedBy: req.user?.full_name || 'Staff',
     });
 

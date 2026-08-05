@@ -274,6 +274,25 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       pdf = await generateInwardReceiptFromHTML(ticketId);
       entityId = ticketId;
       entityType = 'inward';
+
+      // Keep inward_receipts in sync so download/preview lookups always succeed
+      try {
+        const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
+        const t = tRes.rows[0];
+        if (t) {
+          await query(
+            `INSERT INTO inward_receipts (ticket_id, receipt_number, customer_name, customer_phone, device_details, serial_number, problem_description, accessories_received, pdf_path, pdf_size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (receipt_number) DO UPDATE SET pdf_path = $9, pdf_size = $10`,
+            [ticketId, pdf.receiptNumber, t.customer_name, t.customer_phone,
+             `${t.device_type || ''} ${t.brand || ''} ${t.model || ''}`.trim(),
+             t.serial_number, t.problem_description, t.accessories,
+             pdf.filePath, pdf.fileSize]
+          );
+        }
+      } catch (syncErr) {
+        console.error('Failed to sync inward_receipts row:', syncErr.message);
+      }
     } else if (documentType === 'order' && orderId) {
       pdf = await generateOrderPdfFromHTML(orderId);
       entityId = orderId;

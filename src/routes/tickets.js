@@ -161,24 +161,47 @@ router.post('/', validateTicket, async (req, res, next) => {
     const ticketId = await generateTicketId(client);
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-    const {
-      customerId, customerName,
-      primaryPhone, customerPhone,
-      email, customerEmail, serviceAddress,
-      addressLine2, city, state, postcode, pincode, country,
-      deviceType, brand, model, serialNumber, serialIMEI, imei, macAddress, password,
-      issueCategory, customIssueCategory, problemDescription, issue,
-      secondaryName, secondaryPhone, secondaryEmail,
-      accessories, bodyDamage, body_damage, dataBackup, data_backup,
-      estimatedCost, estimatedPrice, advancePayment, priority, location, warranty, company,
-      storeId,
-      status = 'New'
-    } = req.body;
+    const b = req.body;
+    const customerId = pick(b, ['customerId', 'customer_id']);
+    const customerName = pick(b, ['customerName', 'customer_name']);
+    const primaryPhone = pick(b, ['primaryPhone', 'primary_phone', 'customerPhone', 'customer_phone', 'phone', 'mobile_number']);
+    const emailAddr = pick(b, ['email', 'customerEmail', 'customer_email']);
+    const serviceAddress = pick(b, ['serviceAddress', 'service_address']);
+    const addressLine2 = pick(b, ['addressLine2', 'address_line2']);
+    const city = pick(b, ['city']);
+    const state = pick(b, ['state']);
+    const postCode = pick(b, ['postcode', 'pincode']);
+    const country = pick(b, ['country']);
+    const deviceType = pick(b, ['deviceType', 'device_type']);
+    const brand = pick(b, ['brand']);
+    const model = pick(b, ['model']);
+    const serialNumber = pick(b, ['serialNumber', 'serial_number']);
+    const serialIMEI = pick(b, ['serialIMEI', 'serial_imei']);
+    const imei = pick(b, ['imei']);
+    const macAddress = pick(b, ['macAddress', 'mac_address']);
+    const password = pick(b, ['password', 'device_password']);
+    const issueCategory = pick(b, ['issueCategory', 'issue_category']);
+    const customIssueCategory = pick(b, ['customIssueCategory', 'custom_issue_category']);
+    const problemDesc = pick(b, ['problemDescription', 'problem_description', 'issue']);
+    const secondaryName = pick(b, ['secondaryName', 'secondary_name']);
+    const secondaryPhone = pick(b, ['secondaryPhone', 'secondary_phone']);
+    const secondaryEmail = pick(b, ['secondaryEmail', 'secondary_email']);
+    const accessories = pick(b, ['accessories']);
+    const bodyDamage = pick(b, ['bodyDamage', 'body_damage']);
+    const dataBackup = pick(b, ['dataBackup', 'data_backup']);
+    const estimatedCost = pick(b, ['estimatedCost', 'estimated_cost']);
+    const estimatedPrice = pick(b, ['estimatedPrice', 'estimated_price']);
+    const advancePayment = pick(b, ['advancePayment', 'advance_payment']);
+    const priority = pick(b, ['priority']);
+    const location = pick(b, ['location', 'asset_location']);
+    const warranty = pick(b, ['warranty']);
+    const company = pick(b, ['company']);
+    const storeId = pick(b, ['storeId', 'store_id']);
+    const createdBy = pick(b, ['createdBy', 'created_by', 'checkedInBy', 'checked_in_by', 'technician']);
+    const assignedTechnician = pick(b, ['assignedTechnician', 'assigned_technician']);
+    const status = pick(b, ['status']) || 'New';
 
-    const phone = primaryPhone || customerPhone;
-    const emailAddr = email || customerEmail;
-    const problemDesc = problemDescription || issue;
-    const postCode = postcode || pincode;
+    const phone = primaryPhone;
 
     // Resolve store_id: prefer provided storeId, then default store, then first active store
     let resolvedStoreId = storeId || null;
@@ -192,8 +215,24 @@ router.post('/', validateTicket, async (req, res, next) => {
       }
     }
 
+    // Resolve the customer record (match by phone -> email, create if new) so tickets
+    // created from the web AND mobile app are linked to the same customer.
+    let resolvedCustomer = null;
+    if (customerId && /^\d+$/.test(String(customerId))) {
+      const existing = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
+      if (existing.rows.length > 0) resolvedCustomer = existing.rows[0];
+    }
+    if (!resolvedCustomer) {
+      resolvedCustomer = await resolveCustomer(client, {
+        name: customerName, phone, email: emailAddr, company,
+      });
+    }
+    const resolvedCustomerId = resolvedCustomer ? resolvedCustomer.id : null;
+
+    const enteredEstimate = (estimatedPrice || estimatedCost) || 0;
+
     const fields = {
-      ticket_id: ticketId, customer_id: customerId || null,
+      ticket_id: ticketId, customer_id: resolvedCustomerId,
       customer_name: customerName, customer_phone: phone,
       customer_email: emailAddr, service_address: serviceAddress || '',
       address_line2: addressLine2 || null, city: city || null,
@@ -206,11 +245,13 @@ router.post('/', validateTicket, async (req, res, next) => {
       secondary_name: secondaryName || null, secondary_phone: secondaryPhone || null,
       secondary_email: secondaryEmail || null,
       accessories: accessories || null,
-      body_damage: bodyDamage || body_damage || 'No', data_backup: dataBackup || data_backup || 'No',
-      estimated_cost: estimatedCost || 0, estimated_price: estimatedPrice || 0, advance_payment: advancePayment || 0,
+      body_damage: bodyDamage || 'No', data_backup: dataBackup || 'No',
+      estimated_cost: enteredEstimate, estimated_price: enteredEstimate, advance_payment: advancePayment || 0,
       priority: priority || 'Medium', asset_location: location || 'In Shop',
       warranty: warranty ? true : false, company: company || null,
       store_id: resolvedStoreId,
+      checked_in_by: createdBy || null,
+      assigned_technician: assignedTechnician || null,
       status, created_at: now, updated_at: now
     };
 
@@ -235,7 +276,7 @@ router.post('/', validateTicket, async (req, res, next) => {
     const custConvId = getConversationIdFromPhone(phone);
     setImmediate(async () => {
       try {
-        await getOrCreateConversation(insertId, customerId || null, phone);
+        await getOrCreateConversation(insertId, resolvedCustomerId, phone);
       } catch (e) {
         console.error('Auto-create conversation failed:', e.message);
       }
@@ -250,7 +291,7 @@ router.post('/', validateTicket, async (req, res, next) => {
           if (phone) {
             const ticketData = newTicket.rows[0];
             const fallbackText = `*Ticket Created*\n\nCustomer: ${ticketData.customer_name || 'N/A'}\nTicket: ${ticketData.ticket_id || ticketData.id}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
-            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: customerId || null, phone, sender: 'System', conversationId: custConvId });
+            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: resolvedCustomerId, phone, sender: 'System', conversationId: custConvId });
           }
         }
       } catch (e) {
@@ -263,7 +304,7 @@ router.post('/', validateTicket, async (req, res, next) => {
         await createPdfMessage({
           conversationId: custConvId,
           ticketId: insertId,
-          customerId: customerId || null,
+          customerId: resolvedCustomerId,
           sender: 'System',
           fileName: pdf.fileName,
           fileSize: pdf.fileSize,
