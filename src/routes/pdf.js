@@ -12,7 +12,7 @@ const PDF_DIR = path.join(__dirname, '../../uploads/pdfs');
 
 function normalizeStoreData(store) {
   if (!store || Object.keys(store).length === 0) return {};
-  store.company_name = store.company_name || store.store_name || 'REPAIR SHOP';
+  store.company_name = store.company_name || store.store_name || 'SALES CENTER';
   store.store_name = store.store_name || store.company_name || '';
   store.gst_vat = store.gst_vat || store.gst_number || '';
   store.gst_number = store.gst_number || store.gst_vat || '';

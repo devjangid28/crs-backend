@@ -23,7 +23,7 @@ function formatCurrency(amount) {
 function normalizeStoreData(store) {
   if (!store || Object.keys(store).length === 0) return {};
   // Map stores table fields to store_settings-style fields and vice versa
-  store.company_name = store.company_name || store.store_name || 'REPAIR SHOP';
+  store.company_name = store.company_name || store.store_name || 'SALES CENTER';
   store.store_name = store.store_name || store.company_name || '';
   store.gst_vat = store.gst_vat || store.gst_number || '';
   store.gst_number = store.gst_number || store.gst_vat || '';
@@ -294,7 +294,7 @@ async function generateInvoicePdf(invoiceId) {
   }
   doc.fontSize(20).font('Helvetica-Bold').fillColor('#1a1a1a').text('INVOICE', 150, y, { align: 'center' });
   doc.fontSize(8).font('Helvetica').fillColor('#666')
-    .text([store.company_name || 'Repair Shop', store.address, store.city ? `${store.city}, ${store.state || ''}` : '', `GST: ${store.gst_vat || ''}`].filter(Boolean).join('\n'), 150, y + 25, { align: 'center' });
+    .text([store.company_name || 'Sales Center', store.address, store.city ? `${store.city}, ${store.state || ''}` : '', `GST: ${store.gst_vat || ''}`].filter(Boolean).join('\n'), 150, y + 25, { align: 'center' });
 
   y += 70;
 
@@ -358,7 +358,7 @@ async function generateInvoicePdf(invoiceId) {
 
   doc.fontSize(8).font('Helvetica').fillColor('#333');
   let rowNum = 0;
-  (items.length > 0 ? items : [{ name: inv.service || 'Repair Service', quantity: 1, unit_price: inv.total_amount || 0, tax_rate: inv.tax_rate || 0, total: inv.total_amount || 0 }]).forEach(item => {
+  (items.length > 0 ? items : [{ name: inv.service || 'Service', quantity: 1, unit_price: inv.total_amount || 0, tax_rate: inv.tax_rate || 0, total: inv.total_amount || 0 }]).forEach(item => {
     const rowY = y;
     const cols = [
       String(++rowNum),
@@ -554,7 +554,7 @@ async function generateOrderPdf(orderId) {
   ]);
   drawFieldRow([
     { label: 'Device Type', value: (order.device_type || '') + (order.desktop_type ? ' (' + order.desktop_type + ')' : '') },
-    { label: 'Service Type', value: 'Repair' },
+    { label: 'Order Type', value: 'Sales Order' },
   ]);
   endSection(devBodyTop);
 
@@ -615,7 +615,7 @@ async function generateOrderPdf(orderId) {
   endSection(payBodyTop);
 
   // ── TERMS ──
-  const termsTxt = 'TERMS & CONDITIONS: 1. Product warranty subject to company policy. 2. Data backup is customer\'s responsibility. 3. Repair warranty valid for 30 days. 4. Inspection charges applicable. 5. Device must be collected within 30 days. 6. Service center not responsible for accessories after 30 days.';
+  const termsTxt = 'TERMS & CONDITIONS: 1. Service Time - We will try to complete your order as quickly as possible. Some orders may take more time if we need to order parts. 2. Diagnosis Fees - If you don\'t go ahead with the order after we check your device, we may charge a small fee for the inspection. 3. Data Safety - Please back up your files before giving us your device. We are not responsible for any data loss. 4. Warranty on Repairs - We give a warranty on certain repairs (usually 30 days). The warranty only covers the parts we replaced or fixed. 5. Non-Warranty Repairs - If your device is not under warranty or the issue is not covered, we will estimate your cost before starting the work. 6. Third-Party Parts - We may use original or high-quality compatible parts based on availability and your choice. 7. Unclaimed Devices - If you don\'t collect your device within 30 days of completion, we may charge a storage fee or dispose of it. 8. Physical Damage - We are not responsible for damage already present or caused by misuse, water, or accidental drops. 9. Payment - Full payment is required when you pick up the device. We accept cash, card, or other approved methods.';
   const termsH = doc.heightOfString(termsTxt, { width: pw - 20 }) + 12;
   doc.rect(ml, y, pw, termsH).stroke('#D9D9D9');
   doc.fontSize(6).font('Helvetica').fillColor('#666');
@@ -647,7 +647,7 @@ async function generateOrderPdf(orderId) {
   // ── Footer ──
   y = Math.min(y + 8, doc.page.height - 30);
   doc.fontSize(6).fillColor('#aaa');
-  doc.text('Computer-generated repair order. Generated on ' + new Date().toLocaleString('en-IN'), ml, y, { align: 'center' });
+  doc.text('Computer-generated order form. Generated on ' + new Date().toLocaleString('en-IN'), ml, y, { align: 'center' });
 
   doc.end();
 

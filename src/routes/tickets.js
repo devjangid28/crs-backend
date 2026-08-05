@@ -19,6 +19,59 @@ const { generateInwardReceiptFromHTML } = require('../services/pdfGenerator');
 const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
 const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendDocumentFile, getConversationIdFromPhone } = require('../services/whatsappService');
 
+// Accept both camelCase (web) and snake_case (mobile) request bodies
+function pick(body, names) {
+  for (const n of names) {
+    const v = body[n];
+    if (v !== undefined && v !== null) return v;
+  }
+  return undefined;
+}
+
+function normalizePhoneDigits(phone) {
+  if (!phone) return null;
+  const cleaned = String(phone).replace(/[^\d]/g, '').replace(/^0+/, '');
+  if (!cleaned) return null;
+  return cleaned.length > 10 ? cleaned.slice(-10) : cleaned;
+}
+
+// Find an existing customer by phone/email, otherwise create one.
+// Mirrors the web app's logic (find by phone -> find by email -> create) so
+// tickets created from the mobile app link to the same customer record.
+async function resolveCustomer(client, { name, phone, email, company }) {
+  const shortPhone = normalizePhoneDigits(phone);
+  let customer = null;
+
+  if (shortPhone) {
+    const r1 = await client.query(
+      `SELECT * FROM customers
+       WHERE phone LIKE $1 OR phone2 LIKE $1 OR phone LIKE $2 OR phone2 LIKE $2
+       ORDER BY id ASC LIMIT 1`,
+      [`%${shortPhone}`, `%${shortPhone}`]
+    );
+    if (r1.rows.length > 0) customer = r1.rows[0];
+  }
+
+  if (!customer && email) {
+    const r2 = await client.query(
+      'SELECT * FROM customers WHERE LOWER(email) = LOWER($1) LIMIT 1',
+      [String(email).trim()]
+    );
+    if (r2.rows.length > 0) customer = r2.rows[0];
+  }
+
+  if (!customer && (shortPhone || email) && name) {
+    const r3 = await client.query(
+      `INSERT INTO customers (name, phone, email, company, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *`,
+      [String(name).trim(), phone || null, email || null, company || null]
+    );
+    customer = r3.rows[0];
+  }
+
+  return customer || null;
+}
+
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
   try {

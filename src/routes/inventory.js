@@ -251,7 +251,8 @@ function deriveModelFromProductName(productName, brand) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// GET /api/inventory/lookup/:serialNumber - Lookup by serial number
+// GET /api/inventory/lookup/:serialNumber - Lookup by serial number,
+// barcode or SKU (used by mobile barcode scan to auto-fill brand/model/serial)
 // ════════════════════════════════════════════════════════════════
 router.get('/lookup/:serialNumber', authenticate, async (req, res, next) => {
   try {
@@ -265,12 +266,15 @@ router.get('/lookup/:serialNumber', authenticate, async (req, res, next) => {
       `SELECT ii.*, s.store_name
        FROM inventory_items ii
        JOIN stores s ON s.id = ii.store_id
-       WHERE ii.serial_number ILIKE $1 AND ii.is_active = true AND ii.store_id IN (${storeIds.join(',')})`,
+       WHERE ii.is_active = true AND ii.store_id IN (${storeIds.join(',')})
+         AND (ii.serial_number ILIKE $1 OR ii.barcode ILIKE $1 OR ii.sku ILIKE $1)
+       ORDER BY (CASE WHEN ii.serial_number ILIKE $1 THEN 0 WHEN ii.barcode ILIKE $1 THEN 1 ELSE 2 END)
+       LIMIT 1`,
       [`%${sn}%`]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'No inventory item found with this serial number' });
+      return res.status(404).json({ success: false, message: 'No inventory item found with this serial number, barcode or SKU' });
     }
     const item = result.rows[0];
     if (!item.model) {

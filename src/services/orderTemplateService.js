@@ -17,6 +17,12 @@ function fmtCurrency(amount) {
   return '\u20B9' + val.toLocaleString('en-IN', { minimumFractionDigits: 2 });
 }
 
+function componentAmount(c) {
+  const stored = parseFloat(c.amount) || 0;
+  if (stored > 0) return stored;
+  return (parseFloat(c.price) || 0) * (parseInt(c.quantity, 10) || 1);
+}
+
 function populateOrderTemplate(order, components, settings) {
   if (!fs.existsSync(TEMPLATE_PATH)) {
     throw new Error('Template file not found at ' + TEMPLATE_PATH);
@@ -121,7 +127,7 @@ function populateOrderTemplate(order, components, settings) {
   if (components && components.length > 0) {
     let rows = '';
     components.forEach(function(c, idx) {
-      const amount = parseFloat(c.amount || 0).toFixed(2);
+      const amount = componentAmount(c).toFixed(2);
       const price = parseFloat(c.price || 0).toFixed(2);
       rows += '<tr><td>' + (idx + 1) + '</td><td>' + (c.component_name || '') + '</td><td>' + (c.description || '') + '</td><td>' + (c.warranty || '') + '</td><td>' + (c.quantity || 1) + '</td><td>' + price + '</td><td>' + amount + '</td></tr>';
     });
@@ -129,10 +135,14 @@ function populateOrderTemplate(order, components, settings) {
       /<tbody id="componentsTable">[\s\S]*?<\/tbody>/,
       '<tbody id="componentsTable">' + rows + '</tbody>'
     );
+    html = html.replace(
+      /(id="componentsSection")\s*style="display:none;"/,
+      'id="componentsSection" style="display:block;"'
+    );
   }
 
   // ── FINANCIAL CALCULATIONS ──
-  const componentsTotal = components ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
+  const componentsTotal = components ? components.reduce((sum, c) => sum + componentAmount(c), 0) : 0;
   const serviceAmt = parseFloat(order.service_amount) || 0;
   const disc = parseFloat(order.discount) || 0;
   const subtotal = serviceAmt + componentsTotal;

@@ -1,30 +1,42 @@
+const pick = (body, names) => {
+  for (const n of names) {
+    const v = body[n];
+    if (v !== undefined && v !== null) return v;
+  }
+  return undefined;
+};
+
 const validateTicket = (req, res, next) => {
-  const {
-    customerName, primaryPhone, customerPhone, deviceType, brand, model, issueCategory,
-    problemDescription, issue
-  } = req.body;
+  const b = req.body;
+  const customerName = pick(b, ['customerName', 'customer_name']);
+  const primaryPhone = pick(b, ['primaryPhone', 'primary_phone', 'customerPhone', 'customer_phone', 'phone', 'mobile_number']);
+  const deviceType = pick(b, ['deviceType', 'device_type']);
+  const brand = pick(b, ['brand']);
+  const model = pick(b, ['model']);
+  const issueCategory = pick(b, ['issueCategory', 'issue_category']);
+  const problemDescription = pick(b, ['problemDescription', 'problem_description', 'issue']);
 
   const errors = [];
 
-  if (!customerName || !customerName.trim()) {
+  if (!customerName || !String(customerName).trim()) {
     errors.push({ field: 'customerName', message: 'Customer Name is required' });
   }
-  if ((!primaryPhone || !primaryPhone.trim()) && (!customerPhone || !customerPhone.trim())) {
+  if (!primaryPhone || !String(primaryPhone).trim()) {
     errors.push({ field: 'primaryPhone', message: 'Phone Number is required' });
   }
-  if (!deviceType || !deviceType.trim()) {
+  if (!deviceType || !String(deviceType).trim()) {
     errors.push({ field: 'deviceType', message: 'Device Type is required' });
   }
-  if (!brand || !brand.trim()) {
+  if (!brand || !String(brand).trim()) {
     errors.push({ field: 'brand', message: 'Brand is required' });
   }
-  if (!model || !model.trim()) {
+  if (!model || !String(model).trim()) {
     errors.push({ field: 'model', message: 'Model is required' });
   }
-  if (!issueCategory || !issueCategory.trim()) {
+  if (!issueCategory || !String(issueCategory).trim()) {
     errors.push({ field: 'issueCategory', message: 'Issue Category is required' });
   }
-  if ((!problemDescription || !problemDescription.trim()) && (!issue || !issue.trim())) {
+  if (!problemDescription || !String(problemDescription).trim()) {
     errors.push({ field: 'problemDescription', message: 'Problem Description is required' });
   }
 

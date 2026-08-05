@@ -220,7 +220,7 @@ router.post('/', async (req, res, next) => {
             orderId, comp.componentName,
             comp.description || null, comp.warranty || null,
             comp.quantity || 1, parseFloat(comp.price) || 0,
-            parseFloat(comp.amount) || 0,
+            parseFloat(comp.amount) || (parseFloat(comp.price) || 0) * (parseInt(comp.quantity, 10) || 1),
             comp.remarks || null, comp.status || 'present'
           ]
         );
@@ -245,43 +245,47 @@ router.post('/', async (req, res, next) => {
 
     setImmediate(async () => {
       try {
-        const store = await getStoreInfo(newOrder.rows[0]?.store_id);
-        const result = await notifyOrderCreated(newOrder.rows[0], store);
-        if (!result?.template?.success) {
-          console.error('WhatsApp order_created template failed:', JSON.stringify({ error: result?.templateError, fallback: result?.templateFallback }));
-        }
-      } catch (e) {
-        console.error('WhatsApp notification error:', e.stack || e.message);
-      }
-    });
-
-    // Auto-send orderform PDF after 30 seconds (fire-and-forget)
-    setImmediate(async () => {
-      try {
-        await new Promise(resolve => setTimeout(resolve, 30000));
         const orderData = newOrder.rows[0];
         const phone = orderData.mobile_number;
-        const custConvId = getConversationIdFromPhone(phone);
-        const pdf = await generateOrderPdfFromHTML(orderId);
-        await createPdfMessage({
-          conversationId: custConvId,
-          orderId: orderId,
-          sender: 'System',
-          fileName: pdf.fileName,
-          fileSize: pdf.fileSize,
-          documentType: 'order_form',
-          event: 'Order form generated',
-          phone: phone,
-        });
-        if (phone && pdf.filePath) {
-          sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
-            orderId: orderId,
+
+        // 1. Send template message first (falls back to text messages if template fails)
+        try {
+          const store = await getStoreInfo(orderData?.store_id);
+          const result = await notifyOrderCreated(orderData, store);
+          if (!result?.template?.success) {
+            console.error('WhatsApp order_created template failed:', JSON.stringify({ error: result?.templateError, fallback: result?.templateFallback }));
+          }
+        } catch (e) {
+          console.error('WhatsApp notification error:', e.stack || e.message);
+        }
+
+        // 2. Send order form PDF right after the template message (no delay)
+        if (!phone) return;
+        try {
+          const custConvId = getConversationIdFromPhone(phone);
+          const pdf = await generateOrderPdfFromHTML(orderId);
+          await createPdfMessage({
             conversationId: custConvId,
+            orderId: orderId,
             sender: 'System',
-          }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+            fileName: pdf.fileName,
+            fileSize: pdf.fileSize,
+            documentType: 'order_form',
+            event: 'Order form generated',
+            phone: phone,
+          });
+          if (pdf.filePath) {
+            sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
+              orderId: orderId,
+              conversationId: custConvId,
+              sender: 'System',
+            }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+          }
+        } catch (e) {
+          console.error('Auto-generate order form failed:', e.message);
         }
       } catch (e) {
-        console.error('Auto-generate order form failed:', e.message);
+        console.error('Order auto-notification error:', e.stack || e.message);
       }
     });
 
@@ -381,7 +385,7 @@ router.put('/:id', async (req, res, next) => {
             req.params.id, comp.componentName,
             comp.description || null, comp.warranty || null,
             comp.quantity || 1, parseFloat(comp.price) || 0,
-            parseFloat(comp.amount) || 0,
+            parseFloat(comp.amount) || (parseFloat(comp.price) || 0) * (parseInt(comp.quantity, 10) || 1),
             comp.remarks || null, comp.status || 'present'
           ]
         );
