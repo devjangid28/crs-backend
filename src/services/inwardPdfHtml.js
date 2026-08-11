@@ -11,6 +11,21 @@ function generateInwardReceiptHtml(ticket, settings) {
   const pincode = ticket.pincode || '';
   const state = ticket.state || '';
 
+  const cleanAddress = (str) => {
+    if (!str) return '';
+    return String(str)
+      .replace(/,?\s*201,\s*Vrundavan\s+Complex\s*,?\s*/i, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .toUpperCase();
+  };
+
+  const storeAddress = cleanAddress([settings.address, [settings.city, settings.state].filter(Boolean).join(', '), settings.pincode].filter(Boolean).join(', '));
+  const storeNo = settings.mobile || '9904991819';
+  const serviceInfoNo = '9099128072';
+  const contactEmail = settings.email || 'bluechipcs@yahoo.com';
+  const website = 'www.bccsgroup.in';
+
   const formContent = `
   <div class="form-container">
     <div class="header-row">
@@ -18,23 +33,22 @@ function generateInwardReceiptHtml(ticket, settings) {
         ${settings.logo ? `<img src="${settings.logo}" alt="Logo" class="logo" />` : ''}
       </div>
       <div class="company-info">
-        <div class="form-title">Repair Order Form</div>
         <div class="company-address">
-          ${settings.address || ''}<br/>
-          ${[settings.city, settings.state].filter(Boolean).join(', ')}${settings.pincode ? ' - ' + settings.pincode : ''}<br/>
-          ${settings.phone || ''}
+          ${storeAddress}<br/>
+          STORE NO. : ${storeNo} | SERVICE INFO NO. : ${serviceInfoNo}<br/>
+          <a href="mailto:${contactEmail}" style="color:#1a73e8;">${contactEmail}</a> , <a href="https://${website}" target="_blank" style="color:#1a73e8;">${website}</a>
         </div>
       </div>
     </div>
 
     <div class="row" style="min-height:28px;">
-      <div class="cell" style="width:100%;"><span class="label">INWARD NO. : ${ticket.ticket_id || ticket.id || ''}</span></div>
+      <div class="cell" style="width:70%;"><span class="label">INWARD NO. : ${ticket.ticket_id || ticket.id || ''}</span></div>
+      <div class="cell" style="width:30%;justify-content:flex-end;"><span class="label">DATE : ${fmt(ticket.created_at) || ''}</span></div>
     </div>
 
     <div class="row" style="min-height:28px;">
-      <div class="cell" style="width:30%;"><span class="label">DATE : ${fmt(ticket.created_at) || ''}</span></div>
-      <div class="cell" style="width:35%;"><span class="label">SERVICE TYPE : ${ticket.issue_category || ''}</span></div>
-      <div class="cell" style="width:35%;"><span class="label">BRAND : ${ticket.brand || ''}</span></div>
+      <div class="cell" style="width:50%;"><span class="label">SERVICE TYPE : ${ticket.service_type || ticket.serviceType || ''}</span></div>
+      <div class="cell" style="width:50%;"><span class="label">BRAND : ${ticket.brand || ''}</span></div>
     </div>
 
     <div class="row" style="min-height:90px;">
@@ -49,7 +63,7 @@ function generateInwardReceiptHtml(ticket, settings) {
           <span class="label">SERIAL NO. ${ticket.serial_number || ''}</span>
         </div>
         <div style="padding:8px;min-height:30px;">
-          <span class="label">WARRANTY ${ticket.warranty ? 'YES' : 'NO'}</span>
+          <span class="label">WARRANTY : ${ticket.warranty ? 'YES' : 'NO'}</span>
         </div>
       </div>
     </div>
@@ -60,13 +74,13 @@ function generateInwardReceiptHtml(ticket, settings) {
 
     <div class="row" style="min-height:28px;">
       <div class="cell" style="width:100%;flex-direction:column;align-items:flex-start;padding:8px;">
-        <span class="label">CUSTOMER COMPLAINT : ${ticket.problem_description || ''}</span>
+        <span class="label">CUSTOMER COMPLAINT : ${ticket.issue_category || ticket.issue || ''}</span>
       </div>
     </div>
 
     <div class="row" style="min-height:28px;">
       <div class="cell" style="width:100%;flex-direction:column;align-items:flex-start;padding:8px;">
-        <span class="label">ISSUE IF ANY : ${ticket.issue || ticket.problem_description || ''}</span>
+        <span class="label">SOLUTION WE PROVIDE : ${ticket.problem_description || ticket.issue || ''}</span>
       </div>
     </div>
 

@@ -6,6 +6,7 @@ const { query } = require('../config/database');
 const { generateInwardReceiptHtml } = require('./inwardPdfHtml');
 const { populateInwardTemplate } = require('./inwardTemplateService');
 const { populateOrderTemplate } = require('./orderTemplateService');
+const { populateServiceInvoiceTemplate } = require('./serviceInvoiceTemplateService');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs');
 if (!fs.existsSync(PDF_DIR)) fs.mkdirSync(PDF_DIR, { recursive: true });
@@ -737,4 +738,55 @@ async function generateOrderPdfFromHTML(orderId) {
   return { filePath, fileName, fileSize: stats.size };
 }
 
-module.exports = { generateInwardReceipt, generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdf, generateOrderPdfFromHTML };
+async function generateServiceInvoiceFromHTML(ticketId) {
+  const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
+  if (tRes.rows.length === 0) throw new Error('Ticket not found');
+  const ticket = tRes.rows[0];
+
+  const store = await getStoreData(ticket.store_id);
+
+  let lineItems = ticket.line_items;
+  if (lineItems && typeof lineItems === 'string') {
+    try { lineItems = JSON.parse(lineItems); } catch { lineItems = null; }
+  }
+  if (!Array.isArray(lineItems)) lineItems = [];
+
+  const dir = path.join(PDF_DIR, 'service-invoices');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const fileName = `Service_Invoice_${ticket.ticket_id}.pdf`;
+  const filePath = path.join(dir, fileName);
+  const invoiceNumber = `SI-${ticket.ticket_id}`;
+  const invoiceDate = ticket.actual_completion_date || new Date();
+
+  let html = populateServiceInvoiceTemplate(ticket, store, {
+    items: lineItems,
+    invoiceNumber,
+    invoiceDate,
+    taxRate: ticket.tax_rate,
+    discount: ticket.discount,
+  });
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.pdf({
+      path: filePath,
+      format: 'A4',
+      printBackground: true,
+      preferCSSPageSize: true,
+    });
+  } finally {
+    await browser.close();
+  }
+
+  const stats = fs.statSync(filePath);
+  return { filePath, fileName, fileSize: stats.size, invoiceNumber };
+}
+
+module.exports = { generateInwardReceipt, generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdf, generateOrderPdfFromHTML, generateServiceInvoiceFromHTML };

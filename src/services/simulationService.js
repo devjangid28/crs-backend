@@ -1,5 +1,6 @@
 const { query } = require('../config/database');
 const { logAudit, actions } = require('./auditService');
+const { nowIST } = require('./messagingService');
 
 const SIMULATION_PREFIX = '[SIMULATION MODE]';
 
@@ -10,7 +11,7 @@ async function createSimulationEvent({
   itemType,
   itemName,
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, event, text, description, status, created_at)
      VALUES ($1, 'System', $2, $3, 'event', 'simulation_delivery', $4, $5, 'sent', $6) RETURNING id`,

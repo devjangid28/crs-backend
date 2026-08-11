@@ -3,7 +3,7 @@ const router = express.Router();
 const path = require('path');
 const fs = require('fs');
 const { query } = require('../config/database');
-const { generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { generateInwardReceiptFromHTML, generateInvoicePdf, generateOrderPdfFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 const { populateOrderTemplate } = require('../services/orderTemplateService');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
@@ -181,6 +181,64 @@ router.get('/download/invoice/:invoiceId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// POST /api/pdf/generate-service-invoice/:ticketId - Generate Service Invoice PDF from a ticket
+router.post('/generate-service-invoice/:ticketId', authenticate, async (req, res, next) => {
+  try {
+    const ticketId = parseInt(req.params.ticketId);
+    const pdf = await generateServiceInvoiceFromHTML(ticketId);
+
+    await logAudit({
+      action: actions.PDF_GENERATED,
+      ticketId,
+      entityType: 'service_invoice',
+      entityId: pdf.invoiceNumber,
+      performedBy: req.user?.full_name || 'Staff',
+      details: { fileName: pdf.fileName, fileSize: pdf.fileSize, invoiceNumber: pdf.invoiceNumber },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        fileName: pdf.fileName,
+        fileSize: pdf.fileSize,
+        invoiceNumber: pdf.invoiceNumber,
+        downloadUrl: `/api/pdf/download/service-invoice/${ticketId}`,
+      }
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /api/pdf/download/service-invoice/:ticketId - Download Service Invoice PDF
+router.get('/download/service-invoice/:ticketId', async (req, res, next) => {
+  try {
+    const ticketId = parseInt(req.params.ticketId);
+    const tRes = await query('SELECT ticket_id FROM tickets WHERE id = $1', [ticketId]);
+    if (tRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Ticket not found' });
+
+    const diskPath = path.join(PDF_DIR, 'service-invoices', `Service_Invoice_${tRes.rows[0].ticket_id}.pdf`);
+    let filePath = null;
+    if (fs.existsSync(diskPath)) filePath = diskPath;
+
+    // Last resort: generate on the fly
+    if (!filePath) {
+      const pdf = await generateServiceInvoiceFromHTML(ticketId);
+      filePath = pdf.filePath;
+    }
+
+    const fileName = path.basename(filePath);
+
+    await logAudit({
+      action: actions.PDF_VIEWED,
+      ticketId,
+      entityType: 'service_invoice',
+      entityId: fileName,
+      performedBy: req.user?.full_name || 'Staff',
+    });
+
+    res.download(filePath, fileName);
+  } catch (err) { next(err); }
+});
+
 // POST /api/pdf/generate-order/:orderId - Generate order inward PDF
 router.post('/generate-order/:orderId', authenticate, async (req, res, next) => {
   try {
@@ -266,6 +324,9 @@ router.get('/preview/:type/:id', async (req, res, next) => {
       const oRes = await query('SELECT order_number FROM orders WHERE id = $1', [parseInt(id)]);
       if (oRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Order not found' });
       filePath = path.join(PDF_DIR, 'orders', `Order_Inward_${oRes.rows[0].order_number}.pdf`);
+    } else if (type === 'service-invoice') {
+      const pdf = await generateServiceInvoiceFromHTML(parseInt(id));
+      filePath = pdf.filePath;
     } else {
       return res.status(400).json({ success: false, message: 'Invalid type' });
     }

@@ -62,7 +62,8 @@ router.post('/login', async (req, res, next) => {
           mobileNumber: user.mobile_number,
           email: user.email,
           username: user.username,
-          role: user.role
+          role: user.role,
+          storeId: user.store_id
         },
         sessionToken,
         expiresAt: expiresAt.toISOString()
@@ -112,7 +113,8 @@ router.get('/me', authenticate, async (req, res, next) => {
         mobileNumber: req.user.mobile_number,
         email: req.user.email,
         username: req.user.username,
-        role: req.user.role
+        role: req.user.role,
+        storeId: req.user.store_id
       }
     });
   } catch (err) {

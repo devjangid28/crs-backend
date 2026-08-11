@@ -10,11 +10,6 @@ const validateTicket = (req, res, next) => {
   const b = req.body;
   const customerName = pick(b, ['customerName', 'customer_name']);
   const primaryPhone = pick(b, ['primaryPhone', 'primary_phone', 'customerPhone', 'customer_phone', 'phone', 'mobile_number']);
-  const deviceType = pick(b, ['deviceType', 'device_type']);
-  const brand = pick(b, ['brand']);
-  const model = pick(b, ['model']);
-  const issueCategory = pick(b, ['issueCategory', 'issue_category']);
-  const problemDescription = pick(b, ['problemDescription', 'problem_description', 'issue']);
 
   const errors = [];
 
@@ -23,21 +18,6 @@ const validateTicket = (req, res, next) => {
   }
   if (!primaryPhone || !String(primaryPhone).trim()) {
     errors.push({ field: 'primaryPhone', message: 'Phone Number is required' });
-  }
-  if (!deviceType || !String(deviceType).trim()) {
-    errors.push({ field: 'deviceType', message: 'Device Type is required' });
-  }
-  if (!brand || !String(brand).trim()) {
-    errors.push({ field: 'brand', message: 'Brand is required' });
-  }
-  if (!model || !String(model).trim()) {
-    errors.push({ field: 'model', message: 'Model is required' });
-  }
-  if (!issueCategory || !String(issueCategory).trim()) {
-    errors.push({ field: 'issueCategory', message: 'Issue Category is required' });
-  }
-  if (!problemDescription || !String(problemDescription).trim()) {
-    errors.push({ field: 'problemDescription', message: 'Problem Description is required' });
   }
 
   if (errors.length > 0) {

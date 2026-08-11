@@ -135,6 +135,83 @@ const runMigrations = async () => {
       END $$;
     `);
 
+    // Add 'Partially Completed' to ticket_status enum if missing (existing DBs)
+    // Fresh installs get it from the schema below; existing DBs need an ALTER.
+    try {
+      await targetPool.query(`
+        DO $$ BEGIN
+          IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ticket_status') AND NOT EXISTS (
+            SELECT 1 FROM pg_enum
+            WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'ticket_status')
+              AND enumlabel = 'Partially Completed'
+          ) THEN
+            ALTER TYPE ticket_status ADD VALUE 'Partially Completed';
+          END IF;
+        END $$;
+      `);
+    } catch (e) {
+      // Failed to add (e.g. enum already altered / used in a transaction); log only
+      console.log('Pre-migration ticket_status check:', e.message);
+    }
+
+    // Add service_type column to tickets if missing (existing DBs)
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'service_type'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN service_type VARCHAR(50) DEFAULT 'Out of Warranty';
+        END IF;
+      END $$;
+    `);
+
+    // Add partial-completion columns to tickets if missing (existing DBs).
+    // remaining_work = work still to be done, pending_amount = amount for it,
+    // expected_completion_date = when the remaining work will be finished.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'remaining_work'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN remaining_work TEXT DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'pending_amount'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN pending_amount DECIMAL(12,2) DEFAULT 0.00;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'expected_completion_date'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN expected_completion_date DATE DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Add error_message column to messages if missing (webhook stores Meta failure reasons)
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'messages' AND column_name = 'error_message'
+        ) THEN
+          ALTER TABLE messages ADD COLUMN error_message TEXT DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
     await targetPool.query(schema);
 
     console.log('Database migrations completed successfully!');

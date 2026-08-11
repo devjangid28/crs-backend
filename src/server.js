@@ -8,6 +8,7 @@ const { pool, query, waitForPool } = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
 
 const ticketRoutes = require('./routes/tickets');
+const staffTicketRoutes = require('./routes/staffTickets');
 const customerRoutes = require('./routes/customers');
 const invoiceRoutes = require('./routes/invoices');
 const dashboardRoutes = require('./routes/dashboard');
@@ -30,6 +31,9 @@ const amcRoutes = require('./routes/amc');
 const amcPortalRoutes = require('./routes/amc_portal');
 const tallyRoutes = require('./routes/tally');
 const supplierRoutes = require('./routes/suppliers');
+const demoModelRoutes = require('./routes/demoModels');
+const notificationRoutes = require('./routes/notifications');
+const notificationService = require('./services/notificationService');
 
 const app = express();
 const server = http.createServer(app);
@@ -85,6 +89,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('/api/tickets', ticketRoutes);
+app.use('/api/staff/tickets', staffTicketRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/dashboard', dashboardRoutes);
@@ -107,6 +112,8 @@ app.use('/api/amc', amcRoutes);
 app.use('/api/amc', amcPortalRoutes);
 app.use('/api/tally', tallyRoutes);
 app.use('/api/suppliers', supplierRoutes);
+app.use('/api/demo-models', demoModelRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -172,6 +179,16 @@ const tallyService = require('./services/tallyService');
         console.log('Starting Tally poller...');
         tallyService.startPoller(pool);
       }
+      // Demo-model sellable check: notify owner once a demo unit's
+      // 60-day lock period is over. Runs at startup + every 6 hours.
+      notificationService.runSellableCheck(io).then(r =>
+        console.log(`[Demo Check] Startup check -> ${JSON.stringify(r)}`)
+      ).catch(e => console.error('[Demo Check] Startup error:', e.message));
+      setInterval(() => {
+        notificationService.runSellableCheck(io).then(r =>
+          console.log(`[Demo Check] Scheduled check -> ${JSON.stringify(r)}`)
+        ).catch(e => console.error('[Demo Check] Scheduled error:', e.message));
+      }, 6 * 60 * 60 * 1000);
     }
   } catch (e) {
     console.warn('Database not available:', e.message);

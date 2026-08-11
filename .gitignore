@@ -7,6 +7,10 @@ node_modules/
 .env.production
 # .env.example is meant to be committed (template)
 
+# Firebase service account keys - NEVER commit these
+serviceAccountKey.json
+*service-account*.json
+
 # Build output
 dist/
 build/

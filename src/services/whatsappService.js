@@ -1,6 +1,7 @@
 const config = require('../config');
 const { query } = require('../config/database');
-const { createTextMessage, createTemplateMessage, createPdfMessage } = require('./messagingService');
+const { createTextMessage, createTemplateMessage, createPdfMessage, createLinkMessage, nowIST } = require('./messagingService');
+const { getOrCreateToken } = require('./tokenService');
 const { wa } = require('./logger');
 
 const API_VERSION = 'v21.0';
@@ -126,7 +127,7 @@ async function logMessage(recipientPhone, messageBody, status, providerMessageId
         status,
         providerMessageId || null,
         errorMessage || null,
-        status === 'sent' ? new Date().toISOString().slice(0, 19).replace('T', ' ') : null,
+        status === 'sent' ? nowIST() : null,
       ]
     );
   } catch (e) {
@@ -312,8 +313,8 @@ async function sendTextMessage(to, text, context = {}, options = {}) {
   return result;
 }
 
-async function sendTemplateMessage(to, templateName, params, context = {}) {
-  wa.info('sendTemplateMessage called', { to, templateName, params, context });
+async function sendTemplateMessage(to, templateName, params, context = {}, extra = {}) {
+  wa.info('sendTemplateMessage called', { to, templateName, params, context, extra });
 
   if (!isEnabled()) {
     return { success: false, skipped: true };
@@ -327,6 +328,40 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
   const bodyParams = (params || []).map(p => ({ type: 'text', text: String(p) }));
   const displayText = `[Template: ${templateName}] ` + (params || []).join(' | ');
 
+  const components = [
+    {
+      type: 'body',
+      parameters: bodyParams,
+    },
+  ];
+
+  // Header with an attached PDF (inward receipt). The document is delivered
+  // as a real file inside the template — no link pasted in the body.
+  if (extra.headerDocumentLink) {
+    components.unshift({
+      type: 'header',
+      parameters: [
+        {
+          type: 'document',
+          document: {
+            link: extra.headerDocumentLink,
+            filename: extra.documentFilename || 'receipt.pdf',
+          },
+        },
+      ],
+    });
+  }
+
+  // URL button that opens the collection page (clean button, not pasted text).
+  if (extra.buttonUrlSuffix) {
+    components.push({
+      type: 'button',
+      sub_type: 'url',
+      index: '0',
+      parameters: [{ type: 'text', text: String(extra.buttonUrlSuffix) }],
+    });
+  }
+
   const payload = {
     messaging_product: 'whatsapp',
     to: phone,
@@ -334,12 +369,7 @@ async function sendTemplateMessage(to, templateName, params, context = {}) {
     template: {
       name: templateName,
       language: { code: config.whatsapp.templateLanguages[templateName] || 'en_GB' },
-      components: [
-        {
-          type: 'body',
-          parameters: bodyParams,
-        },
-      ],
+      components,
     },
   };
 
@@ -413,6 +443,7 @@ async function sendTicketStatusTemplate(ticket, newStatus, store) {
   const templateMap = {
     'Pending': config.whatsapp.templatePending,
     'In Progress': config.whatsapp.templateInProgress,
+    'Partially Completed': config.whatsapp.templatePartiallyCompleted,
     'Ready for Pickup': config.whatsapp.templateReadyForPickup,
     'Completed': config.whatsapp.templateCompleted,
     'Cancelled': config.whatsapp.templateCancelled,
@@ -434,6 +465,14 @@ async function sendTicketStatusTemplate(ticket, newStatus, store) {
     ticket.ticket_id || '',
     `${ticket.device_type || ''} ${ticket.brand || ''} ${ticket.model || ''}`.trim() || 'Device',
   ];
+
+  // Partially Completed template carries the remaining work + pending amount
+  // so the customer knows exactly what is still left and what it will cost.
+  if (newStatus === 'Partially Completed') {
+    params.push(ticket.remaining_work || 'Details will be shared soon.');
+    const pending = parseFloat(ticket.pending_amount || 0);
+    params.push(pending > 0 ? `\u20B9${pending.toFixed(2)}` : 'To be confirmed');
+  }
 
   const context = { ticketId: ticket.id, customerId: ticket.customer_id, phone, templateName, sender: 'System', conversationId: getConversationIdFromPhone(phone) };
   const result = await sendTemplateMessage(phone, templateName, params, context);
@@ -529,6 +568,68 @@ async function sendOrderTemplate(order, store) {
   return sendTemplateMessage(order.mobile_number, config.whatsapp.orderTemplateName, params, context);
 }
 
+function getPublicBaseUrl() {
+  return config.server.publicUrl || `http://localhost:${process.env.PORT || 5000}`;
+}
+
+async function sendCollectionLink(ticket) {
+  const ticketId = parseInt(ticket.id, 10);
+  const phone = ticket.customer_phone;
+  if (!ticketId || !phone) return { success: false, error: 'No ticket id or customer phone' };
+
+  const token = await getOrCreateToken(ticketId, 'collection', 168);
+  const linkUrl = `${getPublicBaseUrl()}/collect/${ticketId}/${token.token}`;
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId };
+
+  // Direct text send. NOTE: Meta only delivers free-form text inside a 24h
+  // window that the customer opens by messaging first; otherwise Meta
+  // rejects it (this is why template delivery needs an approved template,
+  // which the business has chosen not to create).
+  const text = `*Device Collection*\nYour device has been repaired and is ready for collection.\n\nClick the link below to complete the collection process:\n${linkUrl}`;
+  const waResult = await sendTextMessage(phone, text, ctx, { skipSave: true });
+
+  try {
+    await createLinkMessage({
+      conversationId: convId,
+      ticketId,
+      customerId: ticket.customer_id,
+      sender: 'System',
+      linkType: 'collection',
+      linkUrl,
+      text: 'Device Collection',
+      description: 'Your device is repaired and ready for collection. Click to complete the collection process.',
+      providerMessageId: waResult.success ? waResult.messageId : null,
+      phone,
+      status: waResult.success ? 'sent' : 'failed',
+    });
+  } catch (e) {
+    wa.error('sendCollectionLink: createLinkMessage failed', e, { ticketId });
+  }
+
+  return waResult;
+}
+
+async function sendInwardReceiptLink(ticket, filePath) {
+  const ticketId = parseInt(ticket.id, 10);
+  const phone = ticket.customer_phone;
+  if (!ticketId || !phone) return { success: false, error: 'No ticket id or customer phone' };
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId };
+
+  // Direct PDF document send. NOTE: Meta only delivers free-form documents
+  // inside a 24h window that the customer opens by messaging first;
+  // otherwise Meta rejects it.
+  if (!filePath) {
+    return { success: false, error: 'No PDF file path to send' };
+  }
+  const waResult = await sendDocumentFile(phone, filePath, `Inward Receipt - ${ticket.ticket_id || ''}`, ctx);
+
+  return waResult;
+}
+
 async function sendDocumentFile(to, filePath, caption, context = {}) {
   wa.info('sendDocumentFile called', { to, filePath, caption });
 
@@ -613,6 +714,8 @@ module.exports = {
   sendTicketTemplate,
   sendTicketStatusTemplate,
   sendOrderTemplate,
+  sendCollectionLink,
+  sendInwardReceiptLink,
   sendWelcome,
   sendTicketDetails,
   sendOrderDetails,

@@ -5,10 +5,10 @@ const {
   createTextMessage, createPdfMessage, createLinkMessage,
   createStatusEvent, storeIncomingMessage, getOrCreateConversation,
   markConversationRead, getConversationsWithDetails,
-  saveCustomerContact, updateMessageStatus,
+  saveCustomerContact, updateMessageStatus, nowIST,
 } = require('../services/messagingService');
 const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
-const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 const { simulateDelivery } = require('../services/simulationService');
@@ -297,6 +297,10 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       pdf = await generateOrderPdfFromHTML(orderId);
       entityId = orderId;
       entityType = 'order';
+    } else if (documentType === 'service_invoice' && ticketId) {
+      pdf = await generateServiceInvoiceFromHTML(ticketId);
+      entityId = ticketId;
+      entityType = 'service_invoice';
     } else {
       return res.status(400).json({ success: false, message: 'Invalid documentType/id combination' });
     }
@@ -306,6 +310,8 @@ router.post('/send-document', authenticate, async (req, res, next) => {
     let publicUrl;
     if (entityType === 'inward') {
       publicUrl = `${baseUrl}/api/pdf/download/inward/${entityId}`;
+    } else if (entityType === 'service_invoice') {
+      publicUrl = `${baseUrl}/api/pdf/download/service-invoice/${entityId}`;
     } else {
       publicUrl = `${baseUrl}/api/pdf/download/order/${entityId}`;
     }
@@ -327,7 +333,9 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       try {
         const caption = documentType === 'inward'
           ? `*Inward Receipt*\nYour service receipt is attached.`
-          : `*Order Form*\nYour order details are attached.`;
+          : documentType === 'service_invoice'
+            ? `*Service Invoice*\nYour service invoice is attached.`
+            : `*Order Form*\nYour order details are attached.`;
         const waResult = await sendDocumentFile(resolvedPhone, pdf.filePath, caption, {
           conversationId: convId,
           ticketId: ticketId || null,
@@ -356,8 +364,12 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       sender: req.user?.full_name || 'Staff',
       fileName: pdf.fileName,
       fileSize: String(pdf.fileSize || ''),
-      documentType: documentType === 'inward' ? 'Inward Receipt' : 'Order Form',
-      event: documentType === 'inward' ? 'inward_receipt' : 'order_form',
+      documentType: documentType === 'inward' ? 'Inward Receipt'
+        : documentType === 'service_invoice' ? 'Service Invoice'
+        : 'Order Form',
+      event: documentType === 'inward' ? 'inward_receipt'
+        : documentType === 'service_invoice' ? 'service_invoice_sent'
+        : 'order_form',
       providerMessageId,
       phone: resolvedPhone,
       status: msgStatus,
@@ -549,7 +561,7 @@ router.post('/upload', authenticate, async (req, res, next) => {
 
     const msgType = fileType?.startsWith('image/') ? 'image' : 'file';
 
-    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const now = nowIST();
     const result = await query(
       `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, file_name, file_size, document_type, text, status, phone, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'sent', $10, $11) RETURNING id`,

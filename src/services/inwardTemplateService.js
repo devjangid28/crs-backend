@@ -59,16 +59,26 @@ function populateInwardTemplate(ticket, settings) {
     );
   }
 
+  const cleanAddress = (str) => {
+    if (!str) return '';
+    return String(str)
+      .replace(/,?\s*201,\s*Vrundavan\s+Complex\s*,?\s*/i, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .toUpperCase();
+  };
   const addressParts = [
-    settings.address,
-    [settings.city, settings.state].filter(Boolean).join(', '),
-    settings.pincode,
+    cleanAddress(settings.address),
+    cleanAddress([settings.city, settings.state].filter(Boolean).join(', ')),
+    cleanAddress(settings.pincode),
   ].filter(Boolean);
   const contactEmail = settings.email || 'bluechipcs@yahoo.com';
   const website = 'www.bccsgroup.in';
+  const storeNo = settings.mobile || '9904991819';
+  const serviceInfoNo = '9099128072';
   let addressHtml = addressParts.join('<br>');
   addressHtml += '<br>' +
-    '9099128072 | ' +
+    'STORE NO. : ' + storeNo + ' | SERVICE INFO NO. : ' + serviceInfoNo + '<br>' +
     '<a href="mailto:' + contactEmail + '" style="color:#1a73e8;">' + contactEmail + '</a>' +
     ' , <a href="https://' + website + '" target="_blank" style="color:#1a73e8;">' + website + '</a>';
 
@@ -88,8 +98,8 @@ function populateInwardTemplate(ticket, settings) {
   );
 
   html = html.replace(
-    /(SERVICE TYPE\s*:<\/span><br>)[^<]*(?=<)/,
-    `$1${ticket.issue_category || ''}`
+    /(<span class="field-label">SERVICE TYPE\s*:<\/span>\s*)(?:<br>)?\s*(?:<select[^>]*>[\s\S]*?<\/select>)?/i,
+    `$1<br>${ticket.service_type || ticket.serviceType || ''}`
   );
 
   html = html.replace(
@@ -120,8 +130,8 @@ function populateInwardTemplate(ticket, settings) {
   );
 
   html = html.replace(
-    /WARRANTY\s*(YES|NO)?/,
-    `WARRANTY ${ticket.warranty ? 'YES' : 'NO'}`
+    /WARRANTY\s*:?\s*(YES|NO)?/,
+    `WARRANTY : ${ticket.warranty ? 'YES' : 'NO'}`
   );
 
   html = html.replace(
@@ -131,12 +141,12 @@ function populateInwardTemplate(ticket, settings) {
 
   html = html.replace(
     /(CUSTOMER COMPLAINT\s*:<\/span>\s*)[^<]*(?=<)/,
-    `$1${ticket.problem_description || ''}`
+    `$1${ticket.issue_category || ticket.issue || ''}`
   );
 
   html = html.replace(
-    /(ISSUE IF ANY\s*:<\/span>\s*)[^<]*(?=<)/,
-    `$1${ticket.issue || ticket.problem_description || ''}`
+    /(SOLUTION WE PROVIDE\s*:<\/span>\s*)[^<]*(?=<)/,
+    `$1${ticket.problem_description || ticket.issue || ''}`
   );
 
   html = html.replace(

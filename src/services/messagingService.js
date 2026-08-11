@@ -1,5 +1,10 @@
 const { query } = require('../config/database');
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+function nowIST() {
+  return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 async function createSystemMessage({
   conversationId,
   ticketId,
@@ -17,7 +22,7 @@ async function createSystemMessage({
   providerMessageId = null,
   phone = null,
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, event, text, description, file_name, file_size, document_type, link_type, link_url, status, provider_message_id, phone, created_at)
@@ -39,7 +44,7 @@ async function createTextMessage({
   phone = null,
   status = 'sending',
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, text, status, provider_message_id, phone, created_at)
@@ -62,7 +67,7 @@ async function createTemplateMessage({
   phone = null,
   status = 'sending',
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, template_name, text, status, provider_message_id, phone, created_at)
@@ -87,7 +92,7 @@ async function createPdfMessage({
   phone = null,
   status = 'sending',
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, event, file_name, file_size, document_type, status, provider_message_id, phone, created_at)
@@ -112,7 +117,7 @@ async function createLinkMessage({
   phone = null,
   status = 'sending',
 }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
 
   const result = await query(
     `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, order_id, type, link_type, link_url, text, description, status, provider_message_id, phone, created_at)
@@ -129,6 +134,8 @@ const EVENT_MAP = {
   'Awaiting Approval': { event: 'awaiting_approval', text: 'Awaiting Approval', description: 'Estimate sent. Awaiting customer approval.' },
   'In Progress': { event: 'repair_in_progress', text: 'Repair In Progress', description: 'Repair work is in progress.' },
   'Waiting For Parts': { event: 'parts_ordered', text: 'Parts Ordered', description: 'Parts have been ordered for the repair.' },
+  'Waiting for Parts': { event: 'parts_ordered', text: 'Parts Ordered', description: 'Parts have been ordered for the repair.' },
+  'Partially Completed': { event: 'partially_completed', text: 'Partially Completed', description: 'Repair is partially completed.' },
   'Completed': { event: 'repair_completed', text: 'Repair Completed', description: 'Repair has been completed.' },
   'Ready for Pickup': { event: 'ready_for_pickup', text: 'Ready For Pickup', description: 'Device is ready for pickup.' },
   'Delivered': { event: 'delivered', text: 'Delivered', description: 'Device has been delivered to customer.' },
@@ -202,7 +209,7 @@ async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'Sy
 }
 
 async function storeIncomingMessage({ from, waId, text, profileName }) {
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const now = nowIST();
   const normalizedFrom = normalizePhone(from);
   const cleanFrom = (normalizedFrom || from).replace(/[^\d]/g, '').replace(/^0+/, '');
   const convId = 'cust_' + (normalizedFrom || cleanFrom);
@@ -443,6 +450,7 @@ module.exports = {
   createLinkMessage,
   createStatusEvent,
   storeIncomingMessage,
+  nowIST,
   getOrCreateConversation,
   markConversationRead,
   getUnreadCount,

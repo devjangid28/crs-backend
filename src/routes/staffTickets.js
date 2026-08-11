@@ -1,37 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
-
-async function getStoreInfo(storeId) {
-  if (storeId) {
-    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
-    if (sRes.rows.length > 0) return sRes.rows[0];
-  }
-  const dRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
-  if (dRes.rows.length > 0) return dRes.rows[0];
-  const fRes = await query('SELECT * FROM store_settings LIMIT 1');
-  return fRes.rows[0] || {};
-}
-const { generateTicketId, peekNextTicketId } = require('../services/ticketIdGenerator');
+const { authenticate } = require('../middleware/auth');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
-const { validateTicket } = require('../middleware/validation');
-const { optionalAuth } = require('../middleware/optionalAuth');
-const { generateInwardReceiptFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
-const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
-const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendCollectionLink, sendInwardReceiptLink, getConversationIdFromPhone } = require('../services/whatsappService');
-
-// Accept both camelCase (web) and snake_case (mobile) request bodies
-function pick(body, names) {
-  for (const n of names) {
-    const v = body[n];
-    if (v !== undefined && v !== null) return v;
-  }
-  return undefined;
-}
+const { createStatusEvent, getOrCreateConversation, createPdfMessage } = require('../services/messagingService');
+const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
+const { generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 
 // Normalize line items from any source shape into { description, qty, unitPrice, total }.
-// Falls back to splitting the work description line-by-line so a Service Invoice
-// can always be generated even when no explicit items were saved.
 function normalizeLineItems(raw, fallbackSource) {
   let items = raw;
   if (typeof items === 'string') {
@@ -87,56 +63,40 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
   });
 }
 
-function normalizePhoneDigits(phone) {
-  if (!phone) return null;
-  const cleaned = String(phone).replace(/[^\d]/g, '').replace(/^0+/, '');
-  if (!cleaned) return null;
-  return cleaned.length > 10 ? cleaned.slice(-10) : cleaned;
+// All staff ticket routes require an authenticated session. The web ticket
+// routes are untouched, so existing functionality is not affected.
+router.use(authenticate);
+
+async function getStoreInfo(storeId) {
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) return sRes.rows[0];
+  }
+  const dRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+  if (dRes.rows.length > 0) return dRes.rows[0];
+  const fRes = await query('SELECT * FROM store_settings LIMIT 1');
+  return fRes.rows[0] || {};
 }
 
-// Find an existing customer by phone/email, otherwise create one.
-// Mirrors the web app's logic (find by phone -> find by email -> create) so
-// tickets created from the mobile app link to the same customer record.
-async function resolveCustomer(client, { name, phone, email, company }) {
-  const shortPhone = normalizePhoneDigits(phone);
-  let customer = null;
-
-  if (shortPhone) {
-    const r1 = await client.query(
-      `SELECT * FROM customers
-       WHERE phone LIKE $1 OR phone2 LIKE $1 OR phone LIKE $2 OR phone2 LIKE $2
-       ORDER BY id ASC LIMIT 1`,
-      [`%${shortPhone}`, `%${shortPhone}`]
-    );
-    if (r1.rows.length > 0) customer = r1.rows[0];
+// Does this staff member own the ticket? Owned means they created it
+// (created_by_user_id matches) or, for older records, their full name was
+// recorded in checked_in_by.
+function isOwner(ticket, user) {
+  if (ticket.created_by_user_id && user.id) {
+    return String(ticket.created_by_user_id) === String(user.id);
   }
-
-  if (!customer && email) {
-    const r2 = await client.query(
-      'SELECT * FROM customers WHERE LOWER(email) = LOWER($1) LIMIT 1',
-      [String(email).trim()]
-    );
-    if (r2.rows.length > 0) customer = r2.rows[0];
+  if (ticket.checked_in_by && user.full_name) {
+    return String(ticket.checked_in_by).trim().toLowerCase() === String(user.full_name).trim().toLowerCase();
   }
-
-  if (!customer && (shortPhone || email) && name) {
-    const r3 = await client.query(
-      `INSERT INTO customers (name, phone, email, company, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *`,
-      [String(name).trim(), phone || null, email || null, company || null]
-    );
-    customer = r3.rows[0];
-  }
-
-  return customer || null;
+  return false;
 }
 
-// GET /api/tickets - Get all tickets with search & filter
+// GET /api/staff/tickets - List tickets created by the logged-in staff member
 router.get('/', async (req, res, next) => {
   try {
     const { search, status, priority, page = 1, limit = 50 } = req.query;
-    let whereClause = 'WHERE 1=1';
-    const params = [];
+    let whereClause = 'WHERE (created_by_user_id = ? OR (created_by_user_id IS NULL AND checked_in_by ILIKE ?))';
+    const params = [req.user.id, String(req.user.full_name || '').trim()];
 
     if (search) {
       whereClause += ` AND (customer_name ILIKE ? OR customer_phone ILIKE ? OR customer_email ILIKE ? OR brand ILIKE ? OR model ILIKE ? OR issue_category ILIKE ? OR ticket_id ILIKE ?)`;
@@ -186,17 +146,7 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// GET /api/tickets/next-id - Preview next ticket ID (without advancing sequence)
-router.get('/next-id', async (req, res, next) => {
-  try {
-    const ticketId = await peekNextTicketId();
-    res.json({ success: true, data: { ticketId } });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/tickets/:id - Get single ticket
+// GET /api/staff/tickets/:id - Get one of the staff member's tickets
 router.get('/:id', async (req, res, next) => {
   try {
     const result = await query('SELECT * FROM tickets WHERE id = ?', [req.params.id]);
@@ -204,6 +154,9 @@ router.get('/:id', async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Ticket not found' });
     }
     const ticket = result.rows[0];
+    if (!isOwner(ticket, req.user)) {
+      return res.status(403).json({ success: false, message: 'You do not have access to this ticket' });
+    }
     ticket.statusHistory = await getStatusHistory(req.params.id);
     res.json({ success: true, data: ticket });
   } catch (err) {
@@ -211,199 +164,7 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-// POST /api/tickets - Create ticket
-router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
-  const client = await getConnection();
-  try {
-    await client.query('BEGIN');
-
-    const ticketId = await generateTicketId(client);
-    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-    const b = req.body;
-    const customerId = pick(b, ['customerId', 'customer_id']);
-    const customerName = pick(b, ['customerName', 'customer_name']);
-    const primaryPhone = pick(b, ['primaryPhone', 'primary_phone', 'customerPhone', 'customer_phone', 'phone', 'mobile_number']);
-    const emailAddr = pick(b, ['email', 'customerEmail', 'customer_email']);
-    const serviceAddress = pick(b, ['serviceAddress', 'service_address']);
-    const addressLine2 = pick(b, ['addressLine2', 'address_line2']);
-    const city = pick(b, ['city']);
-    const state = pick(b, ['state']);
-    const postCode = pick(b, ['postcode', 'pincode']);
-    const country = pick(b, ['country']);
-    const deviceType = pick(b, ['deviceType', 'device_type']);
-    const brand = pick(b, ['brand']);
-    const model = pick(b, ['model']);
-    const serialNumber = pick(b, ['serialNumber', 'serial_number']);
-    const serialIMEI = pick(b, ['serialIMEI', 'serial_imei']);
-    const imei = pick(b, ['imei']);
-    const macAddress = pick(b, ['macAddress', 'mac_address']);
-    const password = pick(b, ['password', 'device_password']);
-    const issueCategory = pick(b, ['issueCategory', 'issue_category']);
-    const serviceType = pick(b, ['serviceType', 'service_type']);
-    const customIssueCategory = pick(b, ['customIssueCategory', 'custom_issue_category']);
-    const problemDesc = pick(b, ['problemDescription', 'problem_description', 'issue']);
-    const solutionDesc = pick(b, ['solutionDescription', 'solution_description']);
-    const secondaryName = pick(b, ['secondaryName', 'secondary_name']);
-    const secondaryPhone = pick(b, ['secondaryPhone', 'secondary_phone']);
-    const secondaryEmail = pick(b, ['secondaryEmail', 'secondary_email']);
-    const accessories = pick(b, ['accessories']);
-    const bodyDamage = pick(b, ['bodyDamage', 'body_damage']);
-    const dataBackup = pick(b, ['dataBackup', 'data_backup']);
-    const estimatedCost = pick(b, ['estimatedCost', 'estimated_cost']);
-    const estimatedPrice = pick(b, ['estimatedPrice', 'estimated_price']);
-    const advancePayment = pick(b, ['advancePayment', 'advance_payment']);
-    const lineItemsRaw = pick(b, ['lineItems', 'line_items', 'invoiceItems', 'invoice_items']);
-    const taxRate = pick(b, ['taxRate', 'tax_rate']);
-    const discount = pick(b, ['discount']);
-    const priority = pick(b, ['priority']);
-    const location = pick(b, ['location', 'asset_location']);
-    const warranty = pick(b, ['warranty']);
-    const company = pick(b, ['company']);
-    const storeId = pick(b, ['storeId', 'store_id']);
-    const createdBy = pick(b, ['createdBy', 'created_by', 'checkedInBy', 'checked_in_by', 'technician']);
-    const assignedTechnician = pick(b, ['assignedTechnician', 'assigned_technician']);
-    const status = pick(b, ['status']) || 'New';
-
-    const phone = primaryPhone;
-
-    // Resolve store_id: prefer provided storeId, then default store, then first active store
-    let resolvedStoreId = storeId || null;
-    if (!resolvedStoreId) {
-      const defStore = await client.query('SELECT id FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
-      if (defStore.rows.length > 0) {
-        resolvedStoreId = defStore.rows[0].id;
-      } else {
-        const firstStore = await client.query('SELECT id FROM stores WHERE is_active = true ORDER BY id ASC LIMIT 1');
-        if (firstStore.rows.length > 0) resolvedStoreId = firstStore.rows[0].id;
-      }
-    }
-
-    // Resolve the customer record (match by phone -> email, create if new) so tickets
-    // created from the web AND mobile app are linked to the same customer.
-    let resolvedCustomer = null;
-    if (customerId && /^\d+$/.test(String(customerId))) {
-      const existing = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
-      if (existing.rows.length > 0) resolvedCustomer = existing.rows[0];
-    }
-    if (!resolvedCustomer) {
-      resolvedCustomer = await resolveCustomer(client, {
-        name: customerName, phone, email: emailAddr, company,
-      });
-    }
-    const resolvedCustomerId = resolvedCustomer ? resolvedCustomer.id : null;
-
-    const enteredEstimate = (estimatedPrice || estimatedCost) || 0;
-    const lineItems = normalizeLineItems(lineItemsRaw, solutionDesc || problemDesc);
-
-    const fields = {
-      ticket_id: ticketId, customer_id: resolvedCustomerId,
-      customer_name: customerName, customer_phone: phone,
-      customer_email: emailAddr, service_address: serviceAddress || '',
-      address_line2: addressLine2 || null, city: city || null,
-      state: state || null, postcode: postCode || null, country: country || 'India',
-      device_type: deviceType || null, brand: brand || null, model: model || null,
-      serial_number: serialNumber || null, serial_imei: serialIMEI || null,
-      imei: imei || null, mac_address: macAddress || null, device_password: password || null,
-      issue_category: issueCategory, custom_issue_category: customIssueCategory || null,
-      service_type: serviceType || 'Out of Warranty',
-      problem_description: problemDesc, solution_description: solutionDesc || null,
-      secondary_name: secondaryName || null, secondary_phone: secondaryPhone || null,
-      secondary_email: secondaryEmail || null,
-      accessories: accessories || null,
-      body_damage: bodyDamage || 'No', data_backup: dataBackup || 'No',
-      estimated_cost: enteredEstimate, estimated_price: enteredEstimate, advance_payment: advancePayment || 0,
-      line_items: lineItems.length > 0 ? JSON.stringify(lineItems) : null,
-      tax_rate: taxRate, discount: discount,
-      priority: priority || 'Medium', asset_location: location || 'In Shop',
-      warranty: warranty ? true : false, company: company || null,
-      store_id: resolvedStoreId,
-      checked_in_by: createdBy || null,
-      assigned_technician: assignedTechnician || null,
-      created_by_user_id: req.user ? req.user.id : null,
-      status, created_at: now, updated_at: now
-    };
-
-    const keys = Object.keys(fields);
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-    const values = keys.map(k => fields[k]);
-
-    const insertResult = await client.query(
-      `INSERT INTO tickets (${keys.join(', ')}) VALUES (${placeholders}) RETURNING id`,
-      values
-    );
-
-    const insertId = insertResult.rows[0].id;
-
-    await recordStatusChange(insertId, null, status, 'System', client, ticketId);
-
-    await client.query('COMMIT');
-
-    const newTicket = await client.query('SELECT * FROM tickets WHERE id = $1', [insertId]);
-
-    // Auto-create conversation and send WhatsApp notification (fire-and-forget)
-    const custConvId = getConversationIdFromPhone(phone);
-    setImmediate(async () => {
-      try {
-        await getOrCreateConversation(insertId, resolvedCustomerId, phone);
-      } catch (e) {
-        console.error('Auto-create conversation failed:', e.message);
-      }
-      // Send template message first
-      try {
-        const store = await getStoreInfo(newTicket.rows[0]?.store_id);
-        const waResult = await notifyTicketCreated(newTicket.rows[0], store);
-        if (!waResult?.template?.success) {
-          const errMsg = waResult?.template?.error || waResult?.template?.reason || 'Unknown error';
-          console.error('WhatsApp template send failed:', errMsg, JSON.stringify(waResult));
-          // Fallback: send a plain text message if template fails
-          if (phone) {
-            const ticketData = newTicket.rows[0];
-            const fallbackText = `*Ticket Created*\n\nCustomer: ${ticketData.customer_name || 'N/A'}\nTicket: ${ticketData.ticket_id || ticketData.id}\nDevice: ${ticketData.device_type || ''} ${ticketData.brand || ''} ${ticketData.model || ''}`.trim();
-            await sendTextMessage(phone, fallbackText, { ticketId: insertId, customerId: resolvedCustomerId, phone, sender: 'System', conversationId: custConvId });
-          }
-        }
-      } catch (e) {
-        console.error('WhatsApp notification failed:', e.message);
-      }
-      // Wait 30 seconds before sending the receipt
-      try {
-        await new Promise(resolve => setTimeout(resolve, 30000));
-        const pdf = await generateInwardReceiptFromHTML(insertId);
-        await createPdfMessage({
-          conversationId: custConvId,
-          ticketId: insertId,
-          customerId: resolvedCustomerId,
-          sender: 'System',
-          fileName: pdf.fileName,
-          fileSize: pdf.fileSize,
-          documentType: 'inward_receipt',
-          event: 'Receipt generated',
-          phone: phone,
-        });
-        // Auto-send the receipt via WhatsApp template (always delivers). Falls
-        // back to the raw PDF document if the template is not approved yet.
-        if (phone && pdf.filePath) {
-          sendInwardReceiptLink(newTicket.rows[0], pdf.filePath)
-            .catch(e => console.error('Auto-send inward receipt failed:', e.message));
-        }
-      } catch (e) {
-        console.error('Auto-generate inward receipt failed:', e.message);
-      }
-    });
-
-    scheduleServiceInvoiceGeneration(insertId, status);
-
-    res.status(201).json({ success: true, message: 'Ticket created successfully', data: newTicket.rows[0] });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    next(err);
-  } finally {
-    client.release();
-  }
-});
-
-// PUT /api/tickets/:id - Update ticket
+// PUT /api/staff/tickets/:id - Update one of the staff member's tickets
 router.put('/:id', async (req, res, next) => {
   const client = await getConnection();
   try {
@@ -416,9 +177,15 @@ router.put('/:id', async (req, res, next) => {
     }
 
     const oldTicket = existing.rows[0];
+    if (!isOwner(oldTicket, req.user)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, message: 'You do not have access to this ticket' });
+    }
+
     const updates = req.body;
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     updates.updated_at = now;
+    updates.changedBy = req.user.full_name || updates.changedBy || 'System';
 
     // Normalize partial-completion fields before saving.
     if (updates.pendingAmount !== undefined) {
@@ -435,7 +202,7 @@ router.put('/:id', async (req, res, next) => {
     let statusChanged = false;
     if (updates.status && updates.status !== oldTicket.status) {
       statusChanged = true;
-      await recordStatusChange(req.params.id, oldTicket.status, updates.status, updates.changedBy || 'System', client, oldTicket.ticket_id);
+      await recordStatusChange(req.params.id, oldTicket.status, updates.status, updates.changedBy, client, oldTicket.ticket_id);
     }
 
     // Partial completion details: notify the customer whenever the ticket is
@@ -507,22 +274,6 @@ router.put('/:id', async (req, res, next) => {
       }
     }
 
-    // Keep estimated_cost and estimated_price in sync so the same amount is
-    // used everywhere (print preview, PDF, PDFs generated later).
-    if (updates.estimatedCost !== undefined || updates.estimatedPrice !== undefined) {
-      const est = updates.estimatedCost !== undefined ? updates.estimatedCost : updates.estimatedPrice;
-      if (!seenCols.has('estimated_cost')) {
-        seenCols.add('estimated_cost');
-        setClauses.push(`estimated_cost = $${setClauses.length + 1}`);
-        updateValues.push(est);
-      }
-      if (!seenCols.has('estimated_price')) {
-        seenCols.add('estimated_price');
-        setClauses.push(`estimated_price = $${setClauses.length + 1}`);
-        updateValues.push(est);
-      }
-    }
-
     if (setClauses.length > 0) {
       setClauses.push(`updated_at = $${setClauses.length + 1}`);
       updateValues.push(now);
@@ -544,7 +295,7 @@ router.put('/:id', async (req, res, next) => {
     if (statusChanged || shouldNotifyPartial) {
       setImmediate(async () => {
         try {
-          await createStatusEvent(parseInt(req.params.id), oldTicket.status, effectiveStatus, updates.changedBy || 'System');
+          await createStatusEvent(parseInt(req.params.id), oldTicket.status, effectiveStatus, updates.changedBy);
         } catch (e) {
           console.error('Auto-create status event failed:', e.message);
         }
@@ -553,7 +304,6 @@ router.put('/:id', async (req, res, next) => {
           const waResult = await sendTicketStatusTemplate(updated.rows[0], effectiveStatus, store);
           if (!waResult.success) {
             console.error('Status change WhatsApp template failed:', waResult.error || waResult.reason || JSON.stringify(waResult));
-            // Fallback: send text notification
             const ticketData = updated.rows[0];
             if (ticketData.customer_phone) {
               const convId = getConversationIdFromPhone(ticketData.customer_phone);
@@ -564,8 +314,6 @@ router.put('/:id', async (req, res, next) => {
               await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System', conversationId: convId });
             }
           }
-          // After the template message, auto-send the collection link when the
-          // ticket is marked Completed so the customer can collect the device.
           if (effectiveStatus === 'Completed') {
             await sendCollectionLink(updated.rows[0]);
           }
@@ -584,37 +332,16 @@ router.put('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /api/tickets/:id - Delete ticket
-router.delete('/:id', async (req, res, next) => {
-  try {
-    const result = await query('DELETE FROM tickets WHERE id = ?', [req.params.id]);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, message: 'Ticket not found' });
-    }
-    res.json({ success: true, message: 'Ticket deleted successfully' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/tickets/:id/status-history - Get status history
-router.get('/:id/status-history', async (req, res, next) => {
-  try {
-    const history = await getStatusHistory(req.params.id);
-    res.json({ success: true, data: history });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// PUT /api/tickets/:id/status - Update status only
+// PUT /api/staff/tickets/:id/status - Update status only
 router.put('/:id/status', async (req, res, next) => {
   const client = await getConnection();
   try {
     await client.query('BEGIN');
 
-    const { status, changedBy } = req.body;
+    const { status } = req.body;
+    const changedBy = req.body.changedBy || req.user.full_name || 'System';
     if (!status) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'Status is required' });
     }
 
@@ -625,6 +352,11 @@ router.put('/:id/status', async (req, res, next) => {
     }
 
     const oldTicket = existing.rows[0];
+    if (!isOwner(oldTicket, req.user)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, message: 'You do not have access to this ticket' });
+    }
+
     const oldStatus = oldTicket.status;
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
@@ -672,7 +404,7 @@ router.put('/:id/status', async (req, res, next) => {
       );
     }
     // Persist line items (JSONB) when the status endpoint receives them.
-    const lineItemsRaw = pick(req.body, ['lineItems', 'line_items', 'invoiceItems', 'invoice_items']);
+    const lineItemsRaw = req.body.lineItems ?? req.body.line_items ?? req.body.invoiceItems ?? req.body.invoice_items;
     if (lineItemsRaw !== undefined) {
       const normalized = normalizeLineItems(lineItemsRaw, oldTicket.solution_description || oldTicket.problem_description);
       await client.query(
@@ -680,7 +412,7 @@ router.put('/:id/status', async (req, res, next) => {
         [normalized.length > 0 ? JSON.stringify(normalized) : null, req.params.id]
       );
     }
-    await recordStatusChange(req.params.id, oldStatus, status, changedBy || 'System', client, oldTicket.ticket_id);
+    await recordStatusChange(req.params.id, oldStatus, status, changedBy, client, oldTicket.ticket_id);
 
     await client.query('COMMIT');
 
@@ -692,7 +424,7 @@ router.put('/:id/status', async (req, res, next) => {
     if (status !== oldStatus || (status === 'Partially Completed' && partialTouched)) {
       setImmediate(async () => {
         try {
-          await createStatusEvent(parseInt(req.params.id), oldStatus, status, changedBy || 'System');
+          await createStatusEvent(parseInt(req.params.id), oldStatus, status, changedBy);
         } catch (e) {
           console.error('Auto-create status event failed:', e.message);
         }
@@ -711,8 +443,6 @@ router.put('/:id/status', async (req, res, next) => {
               await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System', conversationId: convId });
             }
           }
-          // After the template message, auto-send the collection link when the
-          // ticket is marked Completed so the customer can collect the device.
           if (status === 'Completed') {
             await sendCollectionLink(updated.rows[0]);
           }

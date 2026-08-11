@@ -487,8 +487,24 @@ router.post('/', authenticate, async (req, res, next) => {
       supplierId, tallyCategory, tallyCategoryType,
       gstApplicability, hsnCode, hsnDescription, hsnSource,
       gstRate, gstSource, gstTaxability, gstRateType, typeOfSupply,
-      purchaseOrderNo, supplierInvoiceNo, purchaseLedger
+      purchaseOrderNo, supplierInvoiceNo, purchaseLedger,
+      checkNo, partNo, purchasePlace, invoiceDate, basicAmount,
+      gstAmount, amountWithGst,
+      checkNos, partNos, colors,
+      skipTally
     } = req.body;
+
+    // Compute GST amounts when only the basic (net) amount + GST rate
+    // are provided (ASUS store flow): gross = basic * (1 + rate/100).
+    let effGstAmount = gstAmount;
+    let effAmountWithGst = amountWithGst;
+    const basicAmt = (basicAmount !== undefined && basicAmount !== null && basicAmount !== '')
+      ? parseFloat(basicAmount) : null;
+    const gstPct = parseFloat(gstRate);
+    if (basicAmt !== null && !isNaN(gstPct) && gstPct >= 0) {
+      effGstAmount = parseFloat(((basicAmt * gstPct) / 100).toFixed(2));
+      effAmountWithGst = parseFloat((basicAmt + effGstAmount).toFixed(2));
+    }
 
     const stockMeta = {
       category: tallyCategory,
@@ -570,7 +586,15 @@ router.post('/', authenticate, async (req, res, next) => {
       const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
       const createdItems = [];
 
-      for (const sn of trimmedSerials) {
+      for (let i = 0; i < trimmedSerials.length; i++) {
+        const sn = trimmedSerials[i];
+        // ASUS batch: each unit keeps its own Check No / Part No / Color.
+        // Falls back to the shared single-value fields when per-unit arrays
+        // are not provided (non-ASUS batch or older clients).
+        const unitCheckNo = Array.isArray(checkNos) ? (checkNos[i] || null) : (checkNo || null);
+        const unitPartNo = Array.isArray(partNos) ? (partNos[i] || null) : (partNo || null);
+        const unitColor = Array.isArray(colors) ? (colors[i] || null) : (color || null);
+
         const insertResult = await client.query(
           `INSERT INTO inventory_items (
             product_name, brand, model, processor, ram, storage, graphics_card,
@@ -582,14 +606,16 @@ router.post('/', authenticate, async (req, res, next) => {
             supplier_id, tally_category, tally_category_type,
             gst_applicability, hsn_code, hsn_description, hsn_source,
             gst_rate, gst_source, gst_taxability, gst_rate_type, type_of_supply,
-            purchase_order_no, supplier_invoice_no, purchase_ledger
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+            purchase_order_no, supplier_invoice_no, purchase_ledger,
+            check_no, part_no, purchase_place, invoice_date,
+            basic_amount, gst_amount, amount_with_gst
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52)
           RETURNING *`,
           [
             productName.trim(), brand || null, model || null, processor || null, ram || null,
             storage || null, graphicsCard || null, displaySize || null,
             displayResolution || null, operatingSystem || null, batteryCondition || null,
-            chargerIncluded || null, color || null, generation || null, otherSpecifications || null,
+            chargerIncluded || null, unitColor || null, generation || null, otherSpecifications || null,
             warranty || null, purchaseDate || null, supplier || null,
             purchasePrice || 0, effectiveSellingPrice, sn,
             barcode || null, sku || null, storeId,
@@ -599,7 +625,9 @@ router.post('/', authenticate, async (req, res, next) => {
             gstApplicability || 'Applicable', hsnCode || null, hsnDescription || null, hsnSource || null,
             parseFloat(gstRate) || 0, gstSource || null, gstTaxability || null, gstRateType || null,
             typeOfSupply || 'Goods',
-            purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null
+            purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null,
+            unitCheckNo || null, unitPartNo || null, purchasePlace || null, invoiceDate || null,
+            basicAmt, effGstAmount, effAmountWithGst
           ]
         );
         const newItem = insertResult.rows[0];
@@ -624,7 +652,8 @@ router.post('/', authenticate, async (req, res, next) => {
       );
 
       // Fire-and-forget Tally purchase-voucher push (non-blocking - response returns immediately)
-      if (createdItems.length > 0) {
+      // skipTally=true (mobile adds) registers items in CRS only and never touches Tally.
+      if (!skipTally && createdItems.length > 0) {
         pushStockToTallyBackground(
           productName.trim(),
           sellingPrice || purchasePrice,
@@ -645,7 +674,9 @@ router.post('/', authenticate, async (req, res, next) => {
         success: true,
         message: `Batch created: ${createdItems.length} item(s)`,
         data: fullItems.rows,
-        tally: { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
+        tally: skipTally
+          ? { pushed: 'skipped', message: 'Registered in CRS only (not synced to Tally).' }
+          : { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
       });
       return;
     }
@@ -678,8 +709,10 @@ router.post('/', authenticate, async (req, res, next) => {
         supplier_id, tally_category, tally_category_type,
         gst_applicability, hsn_code, hsn_description, hsn_source,
         gst_rate, gst_source, gst_taxability, gst_rate_type, type_of_supply,
-        purchase_order_no, supplier_invoice_no, purchase_ledger
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+        purchase_order_no, supplier_invoice_no, purchase_ledger,
+        check_no, part_no, purchase_place, invoice_date,
+        basic_amount, gst_amount, amount_with_gst
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52)
       RETURNING *`,
       [
         productName, brand || null, model || null, processor || null, ram || null,
@@ -695,7 +728,9 @@ router.post('/', authenticate, async (req, res, next) => {
         gstApplicability || 'Applicable', hsnCode || null, hsnDescription || null, hsnSource || null,
         parseFloat(gstRate) || 0, gstSource || null, gstTaxability || null, gstRateType || null,
         typeOfSupply || 'Goods',
-        purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null
+        purchaseOrderNo || null, supplierInvoiceNo || null, purchaseLedger || null,
+        checkNo || null, partNo || null, purchasePlace || null, invoiceDate || null,
+        basicAmt, effGstAmount, effAmountWithGst
       ]
     );
 
@@ -720,26 +755,31 @@ router.post('/', authenticate, async (req, res, next) => {
     );
 
     // Fire-and-forget Tally purchase-voucher push (non-blocking - response returns immediately)
-    pushStockToTallyBackground(
-      productName.trim(),
-      sellingPrice || purchasePrice,
-      [serialNumber.trim()],
-      { singlePush: true, productName: productName.trim(), userId: req.user.id },
-      stockMeta,
-      {
-        partyLedger: supplier,
-        purchaseLedger: purchaseLedger || 'PURCHASE @ 18%',
-        purchaseOrderNo,
-        supplierInvoiceNo,
-        date: voucherDateFrom(purchaseDate),
-      }
-    );
+    // skipTally=true (mobile adds) registers items in CRS only and never touches Tally.
+    if (!skipTally) {
+      pushStockToTallyBackground(
+        productName.trim(),
+        sellingPrice || purchasePrice,
+        [serialNumber.trim()],
+        { singlePush: true, productName: productName.trim(), userId: req.user.id },
+        stockMeta,
+        {
+          partyLedger: supplier,
+          purchaseLedger: purchaseLedger || 'PURCHASE @ 18%',
+          purchaseOrderNo,
+          supplierInvoiceNo,
+          date: voucherDateFrom(purchaseDate),
+        }
+      );
+    }
 
     res.status(201).json({
       success: true,
       message: 'Inventory item created successfully',
       data: fullItem.rows[0],
-      tally: { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
+      tally: skipTally
+        ? { pushed: 'skipped', message: 'Registered in CRS only (not synced to Tally).' }
+        : { pushed: 'pending', message: 'Tally purchase-voucher push running in background.' }
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -802,7 +842,10 @@ router.put('/:id', authenticate, async (req, res, next) => {
       supplierId: 'supplier_id', tallyCategory: 'tally_category', tallyCategoryType: 'tally_category_type',
       gstApplicability: 'gst_applicability', hsnCode: 'hsn_code', hsnDescription: 'hsn_description',
       hsnSource: 'hsn_source', gstRate: 'gst_rate', gstSource: 'gst_source',
-      gstTaxability: 'gst_taxability', gstRateType: 'gst_rate_type', typeOfSupply: 'type_of_supply'
+      gstTaxability: 'gst_taxability', gstRateType: 'gst_rate_type', typeOfSupply: 'type_of_supply',
+      checkNo: 'check_no', partNo: 'part_no', purchasePlace: 'purchase_place',
+      invoiceDate: 'invoice_date', basicAmount: 'basic_amount', gstAmount: 'gst_amount',
+      amountWithGst: 'amount_with_gst'
     };
 
     const setClauses = ['updated_at = $1'];
