@@ -124,6 +124,18 @@ function populateOrderTemplate(order, components, settings) {
     '$1' + modelSerial + '$2'
   );
 
+  // ── DESCRIPTION ──
+  if (order.problem_description && String(order.problem_description).trim()) {
+    html = html.replace(
+      /(<p[^>]*id="orderDescription"[^>]*>)[\s\S]*?(<\/p>)/,
+      '$1' + String(order.problem_description).trim() + '$2'
+    );
+    html = html.replace(
+      /(id="descriptionSection")\s*style="display:none;"/,
+      'id="descriptionSection" style="display:block;"'
+    );
+  }
+
   // ── COMPONENTS TABLE ──
   if (components && components.length > 0) {
     let rows = '';

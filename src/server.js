@@ -33,6 +33,7 @@ const tallyRoutes = require('./routes/tally');
 const supplierRoutes = require('./routes/suppliers');
 const demoModelRoutes = require('./routes/demoModels');
 const notificationRoutes = require('./routes/notifications');
+const quotationRoutes = require('./routes/quotation');
 const notificationService = require('./services/notificationService');
 
 const app = express();
@@ -114,6 +115,7 @@ app.use('/api/tally', tallyRoutes);
 app.use('/api/suppliers', supplierRoutes);
 app.use('/api/demo-models', demoModelRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/quotations', quotationRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
