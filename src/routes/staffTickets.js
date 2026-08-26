@@ -7,6 +7,26 @@ const { createStatusEvent, getOrCreateConversation, createPdfMessage } = require
 const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 
+// Normalize status strings to exact DB enum values (handles casing differences
+// between mobile app, web frontend, and the PostgreSQL enum).
+const VALID_STATUSES = new Set([
+  'New', 'Pending', 'In Progress', 'Waiting For Parts', 'Partially Completed',
+  'Ready For Pickup', 'Completed', 'Delivered', 'Cancelled', 'Collected'
+]);
+const STATUS_ALIAS_MAP = Object.fromEntries([
+  ['waiting for parts', 'Waiting For Parts'],
+  ['ready for pickup', 'Ready For Pickup'],
+  ['partially completed', 'Partially Completed'],
+  ['in progress', 'In Progress'],
+]);
+function normalizeStatus(raw) {
+  if (!raw || typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (VALID_STATUSES.has(trimmed)) return trimmed;
+  const alias = STATUS_ALIAS_MAP[trimmed.toLowerCase()];
+  return alias || trimmed;
+}
+
 // Normalize line items from any source shape into { description, qty, unitPrice, total }.
 function normalizeLineItems(raw, fallbackSource) {
   let items = raw;
@@ -199,6 +219,8 @@ router.put('/:id', async (req, res, next) => {
       updates.expectedCompletionDate = updates.expectedCompletionDate ? updates.expectedCompletionDate : null;
     }
 
+    if (updates.status) updates.status = normalizeStatus(updates.status);
+
     let statusChanged = false;
     if (updates.status && updates.status !== oldTicket.status) {
       statusChanged = true;
@@ -338,7 +360,7 @@ router.put('/:id/status', async (req, res, next) => {
   try {
     await client.query('BEGIN');
 
-    const { status } = req.body;
+    const status = normalizeStatus(req.body.status);
     const changedBy = req.body.changedBy || req.user.full_name || 'System';
     if (!status) {
       await client.query('ROLLBACK');

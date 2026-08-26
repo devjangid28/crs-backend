@@ -20,6 +20,26 @@ const { generateInwardReceiptFromHTML, generateServiceInvoiceFromHTML } = requir
 const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
 const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendCollectionLink, sendInwardReceiptLink, getConversationIdFromPhone } = require('../services/whatsappService');
 
+// Normalize status strings to exact DB enum values (handles casing differences
+// between mobile app, web frontend, and the PostgreSQL enum).
+const VALID_STATUSES = new Set([
+  'New', 'Pending', 'In Progress', 'Waiting For Parts', 'Partially Completed',
+  'Ready For Pickup', 'Completed', 'Delivered', 'Cancelled', 'Collected'
+]);
+const STATUS_ALIAS_MAP = Object.fromEntries([
+  ['waiting for parts', 'Waiting For Parts'],
+  ['ready for pickup', 'Ready For Pickup'],
+  ['partially completed', 'Partially Completed'],
+  ['in progress', 'In Progress'],
+]);
+function normalizeStatus(raw) {
+  if (!raw || typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (VALID_STATUSES.has(trimmed)) return trimmed;
+  const alias = STATUS_ALIAS_MAP[trimmed.toLowerCase()];
+  return alias || trimmed;
+}
+
 // Accept both camelCase (web) and snake_case (mobile) request bodies
 function pick(body, names) {
   for (const n of names) {
@@ -264,6 +284,12 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
     const createdBy = pick(b, ['createdBy', 'created_by', 'checkedInBy', 'checked_in_by', 'technician']);
     const assignedTechnician = pick(b, ['assignedTechnician', 'assigned_technician']);
     const status = pick(b, ['status']) || 'New';
+    const isReplacement = pick(b, ['isReplacement', 'is_replacement']);
+    const replacementTakenBy = pick(b, ['replacementTakenBy', 'replacement_taken_by']);
+    const replacementServiceCenter = pick(b, ['replacementServiceCenter', 'replacement_service_center']);
+    const replacementReceiptNo = pick(b, ['replacementReceiptNo', 'replacement_receipt_no']);
+    const replacementInvoiceNo = pick(b, ['replacementInvoiceNo', 'replacement_invoice_no']);
+    const replacementGivenDate = pick(b, ['replacementGivenDate', 'replacement_given_date']);
 
     const phone = primaryPhone;
 
@@ -296,6 +322,10 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
     const enteredEstimate = (estimatedPrice || estimatedCost) || 0;
     const lineItems = normalizeLineItems(lineItemsRaw, solutionDesc || problemDesc);
 
+    // Replacement tickets are only handled under warranty, so force the
+    // service type to 'In Warranty' regardless of what the client sent.
+    const effectiveServiceType = isReplacement ? 'In Warranty' : (serviceType || 'Out of Warranty');
+
     const fields = {
       ticket_id: ticketId, customer_id: resolvedCustomerId,
       customer_name: customerName, customer_phone: phone,
@@ -306,7 +336,7 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
       serial_number: serialNumber || null, serial_imei: serialIMEI || null,
       imei: imei || null, mac_address: macAddress || null, device_password: password || null,
       issue_category: issueCategory, custom_issue_category: customIssueCategory || null,
-      service_type: serviceType || 'Out of Warranty',
+      service_type: effectiveServiceType,
       problem_description: problemDesc, solution_description: solutionDesc || null,
       secondary_name: secondaryName || null, secondary_phone: secondaryPhone || null,
       secondary_email: secondaryEmail || null,
@@ -321,6 +351,12 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
       checked_in_by: createdBy || null,
       assigned_technician: assignedTechnician || null,
       created_by_user_id: req.user ? req.user.id : null,
+      is_replacement: isReplacement ? true : false,
+      replacement_taken_by: replacementTakenBy || null,
+      replacement_service_center: replacementServiceCenter || null,
+      replacement_receipt_no: replacementReceiptNo || null,
+      replacement_invoice_no: replacementInvoiceNo || null,
+      replacement_given_date: replacementGivenDate || null,
       status, created_at: now, updated_at: now
     };
 
@@ -432,6 +468,8 @@ router.put('/:id', async (req, res, next) => {
       updates.expectedCompletionDate = updates.expectedCompletionDate ? updates.expectedCompletionDate : null;
     }
 
+    if (updates.status) updates.status = normalizeStatus(updates.status);
+
     let statusChanged = false;
     if (updates.status && updates.status !== oldTicket.status) {
       statusChanged = true;
@@ -480,7 +518,13 @@ router.put('/:id', async (req, res, next) => {
       remainingWork: 'remaining_work', pendingAmount: 'pending_amount',
       expectedCompletionDate: 'expected_completion_date',
       remaining_work: 'remaining_work', pending_amount: 'pending_amount',
-      expected_completion_date: 'expected_completion_date'
+      expected_completion_date: 'expected_completion_date',
+      isReplacement: 'is_replacement', is_replacement: 'is_replacement',
+      replacementTakenBy: 'replacement_taken_by', replacement_taken_by: 'replacement_taken_by',
+      replacementServiceCenter: 'replacement_service_center', replacement_service_center: 'replacement_service_center',
+      replacementReceiptNo: 'replacement_receipt_no', replacement_receipt_no: 'replacement_receipt_no',
+      replacementInvoiceNo: 'replacement_invoice_no', replacement_invoice_no: 'replacement_invoice_no',
+      replacementGivenDate: 'replacement_given_date', replacement_given_date: 'replacement_given_date'
     };
 
     const setClauses = [];
@@ -521,6 +565,14 @@ router.put('/:id', async (req, res, next) => {
         setClauses.push(`estimated_price = $${setClauses.length + 1}`);
         updateValues.push(est);
       }
+    }
+
+    // Replacement tickets are always under warranty; force the service type.
+    const replacementFlag = updates.isReplacement !== undefined ? updates.isReplacement : updates.is_replacement;
+    if (replacementFlag !== undefined && replacementFlag !== false && !seenCols.has('service_type')) {
+      seenCols.add('service_type');
+      setClauses.push(`service_type = $${setClauses.length + 1}`);
+      updateValues.push('In Warranty');
     }
 
     if (setClauses.length > 0) {
@@ -613,7 +665,8 @@ router.put('/:id/status', async (req, res, next) => {
   try {
     await client.query('BEGIN');
 
-    const { status, changedBy } = req.body;
+    const status = normalizeStatus(req.body.status);
+    const changedBy = req.body.changedBy || 'System';
     if (!status) {
       return res.status(400).json({ success: false, message: 'Status is required' });
     }

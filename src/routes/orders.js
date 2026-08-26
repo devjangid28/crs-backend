@@ -44,9 +44,14 @@ async function generateOrderNumber(client) {
 // GET /api/orders - Get all orders with search & filter
 router.get('/', async (req, res, next) => {
   try {
-    const { search, paymentStatus, deviceType, date, page = 1, limit = 50 } = req.query;
+    const { search, paymentStatus, deviceType, date, store_id, page = 1, limit = 50 } = req.query;
     let whereClause = 'WHERE o.is_active = true';
     const params = [];
+
+    if (store_id) {
+      whereClause += ` AND o.store_id = ?`;
+      params.push(parseInt(store_id));
+    }
 
     if (search) {
       whereClause += ` AND (o.customer_name ILIKE ? OR o.mobile_number ILIKE ? OR o.order_number ILIKE ?)`;

@@ -200,6 +200,70 @@ const runMigrations = async () => {
       END $$;
     `);
 
+    // Add replacement / service-center columns to tickets if missing.
+    // Used when a replacement ticket is created (laptop handed over to an
+    // external service center under warranty).
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'is_replacement'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN is_replacement BOOLEAN NOT NULL DEFAULT FALSE;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'replacement_taken_by'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN replacement_taken_by VARCHAR(150) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'replacement_service_center'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN replacement_service_center VARCHAR(150) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'replacement_receipt_no'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN replacement_receipt_no VARCHAR(50) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'replacement_invoice_no'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN replacement_invoice_no VARCHAR(50) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'replacement_given_date'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN replacement_given_date DATE DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
     // Add error_message column to messages if missing (webhook stores Meta failure reasons)
     await targetPool.query(`
       DO $$ BEGIN

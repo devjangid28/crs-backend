@@ -4,9 +4,9 @@ const bcrypt = require('bcryptjs');
 const { query } = require('../config/database');
 const { authenticate, requireRole } = require('../middleware/auth');
 
-// All user management routes require owner role
+// All user management routes require owner or admin role
 router.use(authenticate);
-router.use(requireRole('owner'));
+router.use(requireRole('owner', 'admin'));
 
 // GET /api/users - Get all users
 router.get('/', async (req, res, next) => {
@@ -50,6 +50,12 @@ router.post('/', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Full name, mobile number, and password are required' });
     }
 
+    const validRoles = ['staff', 'admin', 'owner'];
+    const finalRole = role || 'staff';
+    if (!validRoles.includes(finalRole)) {
+      return res.status(400).json({ success: false, message: 'Invalid role. Must be staff, admin, or owner' });
+    }
+
     // Check for existing mobile
     const existingMobile = await query('SELECT id FROM users WHERE mobile_number = $1', [mobileNumber]);
     if (existingMobile.rows.length > 0) {
@@ -78,7 +84,7 @@ router.post('/', async (req, res, next) => {
     const result = await query(
       `INSERT INTO users (full_name, mobile_number, email, username, password_hash, role, store_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [fullName, mobileNumber, email || null, username || null, passwordHash, role || 'staff', storeId || null]
+      [fullName, mobileNumber, email || null, username || null, passwordHash, finalRole, storeId || null]
     );
 
     const newUser = await query(

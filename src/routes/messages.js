@@ -7,7 +7,7 @@ const {
   markConversationRead, getConversationsWithDetails,
   saveCustomerContact, updateMessageStatus, nowIST,
 } = require('../services/messagingService');
-const { sendTextMessage, sendMediaMessage, sendDocumentFile, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
+const { sendTextMessage, sendMediaMessage, sendDocumentFile, sendMediaFile, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
@@ -539,10 +539,11 @@ router.post('/save-contact', authenticate, async (req, res, next) => {
 // POST /api/messages/upload - Upload file attachment
 router.post('/upload', authenticate, async (req, res, next) => {
   try {
-    const { conversationId, ticketId, customerId, fileName, fileData, fileType, phone } = req.body;
+    let { conversationId, ticketId, customerId, sender, fileName, fileData, fileType, phone, caption } = req.body;
     if (!fileData) {
       return res.status(400).json({ success: false, message: 'fileData is required' });
     }
+    phone = await resolvePhone(phone, ticketId);
 
     const ext = path.extname(fileName) || '.bin';
     const safeName = Date.now() + '_' + fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -560,14 +561,43 @@ router.post('/upload', authenticate, async (req, res, next) => {
     }
 
     const msgType = fileType?.startsWith('image/') ? 'image' : 'file';
+    const finalConvId = convId || getConversationIdFromPhone(phone) || `CONV-${Date.now()}`;
 
+    // Send via WhatsApp media API when a phone is available
+    let providerMessageId = null;
+    let waError = null;
+    if (isEnabled() && phone) {
+      try {
+        const mimeType = fileType || 'application/octet-stream';
+        const waResult = await sendMediaFile(phone, filePath, mimeType, caption || '', {
+          conversationId: finalConvId,
+          ticketId: ticketId || null,
+          orderId: null,
+          customerId: customerId || null,
+          sender: sender || req.user?.full_name || 'Staff',
+        });
+        if (waResult.success) {
+          providerMessageId = waResult.messageId || null;
+        } else if (!waResult.skipped) {
+          waError = waResult.error || 'WhatsApp API returned unsuccessful';
+          waError += waResult.details ? ' | Details: ' + JSON.stringify(waResult.details) : '';
+          waError += waResult.code ? ' | Code: ' + waResult.code : '';
+          console.error('WhatsApp media send failed:', waError, JSON.stringify(waResult));
+        }
+      } catch (waErr) {
+        waError = waErr.message;
+        console.error('WhatsApp media send exception:', waErr.message);
+      }
+    }
+
+    const status = providerMessageId ? 'sent' : (isEnabled() ? 'failed' : 'sending');
     const now = nowIST();
     const result = await query(
       `INSERT INTO messages (conversation_id, sender, customer_id, ticket_id, type, file_name, file_size, document_type, text, status, phone, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'sent', $10, $11) RETURNING id`,
-      [convId || `CONV-${Date.now()}`, req.user?.full_name || 'Staff', customerId, ticketId,
-       msgType, fileName, String(stats.size), fileType || 'document', `Sent ${fileType || 'file'}: ${fileName}`,
-       phone, now]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [finalConvId, sender || req.user?.full_name || 'Staff', customerId, ticketId,
+       msgType, fileName, String(stats.size), fileType || 'document', caption || `Sent ${fileType || 'file'}: ${fileName}`,
+       status, phone, now]
     );
 
     const msgResult = await query('SELECT * FROM messages WHERE id = $1', [result.rows[0].id]);
@@ -575,16 +605,38 @@ router.post('/upload', authenticate, async (req, res, next) => {
     // Emit socket event for real-time updates (room + global)
     const io = req.app?.get('io') || req.io;
     if (io) {
-      io.to('conv:' + convId).emit('new_message', { message: msgResult.rows[0], conversationId: convId });
-      io.emit('new_message', { message: msgResult.rows[0], conversationId: convId });
+      if (waError) {
+        const failPayload = { conversationId: finalConvId, providerMessageId, status: 'failed', error: waError, messageId: msgResult.rows[0].id };
+        io.to('conv:' + finalConvId).emit('message_status', failPayload);
+        io.emit('message_status', failPayload);
+      }
+      io.to('conv:' + finalConvId).emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId, waError: waError || undefined });
+      io.emit('new_message', { message: msgResult.rows[0], conversationId: finalConvId, waError: waError || undefined });
+    }
+
+    // Simulation: mark as delivered + create simulated event
+    if (!isEnabled()) {
+      query('UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2', ['delivered', msgResult.rows[0].id]).catch(e => console.error('Simulation status update failed:', e.message));
+      setImmediate(() => {
+        simulateDelivery({
+          conversationId: finalConvId,
+          ticketId: ticketId || null,
+          customerId: customerId || null,
+          itemType: msgType === 'image' ? 'Image' : 'File',
+          itemName: fileName,
+          performedBy: sender || req.user?.full_name || 'Staff',
+        }).catch(e => console.error('Simulation event failed:', e.message));
+      });
     }
 
     res.status(201).json({
       success: true,
       data: {
         ...msgResult.rows[0],
-        downloadUrl: `/api/messages/download/${result.rows[0].id}`,
-      }
+        downloadUrl: `/api/messages/download/${msgResult.rows[0].id}`,
+      },
+      providerMessageId,
+      waError: waError || undefined,
     });
   } catch (err) { next(err); }
 });
@@ -597,9 +649,20 @@ router.get('/download/:id', async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Message not found' });
     }
     const msg = result.rows[0];
-    const filePath = path.join(UPLOAD_DIR, msg.file_name);
-    if (!msg.file_name || !fs.existsSync(filePath)) {
+    if (!msg.file_name) {
       return res.status(404).json({ success: false, message: 'File not found' });
+    }
+    let filePath = path.join(UPLOAD_DIR, msg.file_name);
+    if (!fs.existsSync(filePath)) {
+      // Uploaded files are stored with a Date.now()_ prefix; locate the actual
+      // file on disk by matching the stored name as a suffix of a file in the dir.
+      const matches = fs.readdirSync(UPLOAD_DIR)
+        .filter((f) => f.endsWith(msg.file_name) && fs.statSync(path.join(UPLOAD_DIR, f)).isFile())
+        .sort((a, b) => fs.statSync(path.join(UPLOAD_DIR, b)).mtimeMs - fs.statSync(path.join(UPLOAD_DIR, a)).mtimeMs);
+      if (matches.length === 0) {
+        return res.status(404).json({ success: false, message: 'File not found' });
+      }
+      filePath = path.join(UPLOAD_DIR, matches[0]);
     }
     res.download(filePath, msg.file_name);
   } catch (err) { next(err); }

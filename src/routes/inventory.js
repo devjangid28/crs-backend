@@ -8,7 +8,7 @@ const tallyService = require('../services/tallyService');
 // HELPER: Get user's accessible store IDs
 // ════════════════════════════════════════════════════════════════
 async function getUserStoreIds(user) {
-  if (user.role === 'owner') {
+  if (user.role === 'owner' || user.role === 'admin') {
     const stores = await query('SELECT id FROM stores WHERE is_active = true');
     return stores.rows.map(s => s.id);
   }
@@ -134,7 +134,15 @@ router.get('/dashboard', authenticate, async (req, res, next) => {
       return res.json({ success: true, data: { totalProducts: 0, availableStock: 0, soldProducts: 0, reservedProducts: 0, lowStock: 0, outOfStock: 0, storeWise: [], recentActivity: [], monthlySales: [], categoryDistribution: [] } });
     }
 
-    const storeFilter = `AND ii.store_id IN (${storeIds.join(',')})`;
+    // Optional single-store view: when a store is selected, all stats reflect only that store
+    const requestedStore = parseInt(req.query.store_id, 10);
+    const effectiveStoreIds = requestedStore ? storeIds.filter(id => id === requestedStore) : storeIds;
+    if (effectiveStoreIds.length === 0) {
+      return res.json({ success: true, data: { totalProducts: 0, availableStock: 0, soldProducts: 0, reservedProducts: 0, lowStock: 0, outOfStock: 0, storeWise: [], recentActivity: [], monthlySales: [], categoryDistribution: [], statusDistribution: [] } });
+    }
+
+    const storeFilter = `AND ii.store_id IN (${effectiveStoreIds.join(',')})`;
+    const storeWiseFilter = requestedStore ? `WHERE s.id = ${requestedStore}` : 'WHERE s.is_active = true';
 
     const [statsRes, storeWiseRes, recentRes, monthlyRes, categoryRes, statusRes] = await Promise.all([
       query(`SELECT
@@ -155,14 +163,14 @@ router.get('/dashboard', authenticate, async (req, res, next) => {
         COUNT(*) FILTER (WHERE ii.status = 'Sold') as sold
       FROM stores s
       LEFT JOIN inventory_items ii ON ii.store_id = s.id AND ii.is_active = true
-      WHERE s.is_active = true
+      ${storeWiseFilter}
       GROUP BY s.id, s.store_name
       ORDER BY s.store_name`, []),
 
       query(`SELECT ih.*, ii.product_name, ii.serial_number, ii.brand, ii.model
       FROM inventory_history ih
       JOIN inventory_items ii ON ii.id = ih.inventory_item_id
-      WHERE ii.store_id IN (${storeIds.join(',')})
+      WHERE ii.store_id IN (${effectiveStoreIds.join(',')})
       ORDER BY ih.created_at DESC LIMIT 20`, []),
 
       query(`SELECT
@@ -172,21 +180,21 @@ router.get('/dashboard', authenticate, async (req, res, next) => {
       FROM inventory_items ii
       LEFT JOIN inventory_history ih ON ih.inventory_item_id = ii.id
       WHERE ii.created_at >= NOW() - INTERVAL '12 months'
-        AND ii.store_id IN (${storeIds.join(',')})
+        AND ii.store_id IN (${effectiveStoreIds.join(',')})
       GROUP BY TO_CHAR(ii.created_at, 'YYYY-MM')
       ORDER BY month ASC`, []),
 
       query(`SELECT ii.category,
         COUNT(*) as count
       FROM inventory_items ii
-      WHERE ii.is_active = true AND ii.store_id IN (${storeIds.join(',')})
+      WHERE ii.is_active = true AND ii.store_id IN (${effectiveStoreIds.join(',')})
       GROUP BY ii.category
       ORDER BY count DESC`, []),
 
       query(`SELECT ii.status,
         COUNT(*) as count
       FROM inventory_items ii
-      WHERE ii.is_active = true AND ii.store_id IN (${storeIds.join(',')})
+      WHERE ii.is_active = true AND ii.store_id IN (${effectiveStoreIds.join(',')})
       GROUP BY ii.status
       ORDER BY count DESC`, [])
     ]);

@@ -444,7 +444,7 @@ async function sendTicketStatusTemplate(ticket, newStatus, store) {
     'Pending': config.whatsapp.templatePending,
     'In Progress': config.whatsapp.templateInProgress,
     'Partially Completed': config.whatsapp.templatePartiallyCompleted,
-    'Ready for Pickup': config.whatsapp.templateReadyForPickup,
+    'Ready For Pickup': config.whatsapp.templateReadyForPickup,
     'Completed': config.whatsapp.templateCompleted,
     'Cancelled': config.whatsapp.templateCancelled,
   };
@@ -676,6 +676,52 @@ async function sendDocumentFile(to, filePath, caption, context = {}) {
   return result;
 }
 
+async function sendMediaFile(to, filePath, mimeType = 'application/pdf', caption = '', context = {}) {
+  wa.info('sendMediaFile called', { to, filePath, mimeType, caption });
+
+  if (!isEnabled()) {
+    return { success: false, skipped: true };
+  }
+
+  const phone = formatPhone(to);
+  if (!phone) {
+    return { success: false, error: 'Invalid phone number' };
+  }
+
+  // Upload the file to WhatsApp servers first
+  const uploadResult = await uploadMedia(filePath, mimeType);
+  if (!uploadResult.success) {
+    wa.error('sendMediaFile: media upload failed', { error: uploadResult.error });
+    await logMessage(phone, `[${mimeType}] upload failed: ${uploadResult.error}`, 'failed', null, uploadResult.error, context.ticketId, mimeType.startsWith('image/') ? 'image' : 'document', context.orderId);
+    return { success: false, error: 'Media upload failed: ' + uploadResult.error };
+  }
+
+  const mediaId = uploadResult.mediaId;
+  const isImage = mimeType.startsWith('image/');
+  const mediaKey = isImage ? 'image' : 'document';
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: mediaKey,
+    [mediaKey]: isImage
+      ? { id: mediaId, caption: caption || '' }
+      : { id: mediaId, caption: caption || '', filename: filePath.split('\\').pop().split('/').pop() },
+  };
+
+  const result = await callWhatsAppApi(payload);
+
+  if (result.success) {
+    wa.info('sendMediaFile: sent successfully', { to: phone, mimeType, caption, messageId: result.messageId });
+    await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'sent', result.messageId, null, context.ticketId, mediaKey, context.orderId);
+  } else {
+    wa.error('sendMediaFile: failed', { to: phone, mimeType, caption, error: result.error, code: result.code });
+    await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'failed', null, result.error, context.ticketId, mediaKey, context.orderId);
+  }
+
+  return result;
+}
+
 async function notifyOrderCreated(order, store) {
   const phone = order.mobile_number;
   if (!phone) {
@@ -711,6 +757,7 @@ module.exports = {
   sendMediaMessage,
   uploadMedia,
   sendDocumentFile,
+  sendMediaFile,
   sendTicketTemplate,
   sendTicketStatusTemplate,
   sendOrderTemplate,

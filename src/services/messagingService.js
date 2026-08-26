@@ -137,6 +137,7 @@ const EVENT_MAP = {
   'Waiting for Parts': { event: 'parts_ordered', text: 'Parts Ordered', description: 'Parts have been ordered for the repair.' },
   'Partially Completed': { event: 'partially_completed', text: 'Partially Completed', description: 'Repair is partially completed.' },
   'Completed': { event: 'repair_completed', text: 'Repair Completed', description: 'Repair has been completed.' },
+  'Ready For Pickup': { event: 'ready_for_pickup', text: 'Ready For Pickup', description: 'Device is ready for pickup.' },
   'Ready for Pickup': { event: 'ready_for_pickup', text: 'Ready For Pickup', description: 'Device is ready for pickup.' },
   'Delivered': { event: 'delivered', text: 'Delivered', description: 'Device has been delivered to customer.' },
   'Collected': { event: 'collected', text: 'Collected', description: 'Device has been collected.' },

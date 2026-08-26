@@ -177,6 +177,26 @@ const tallyService = require('./services/tallyService');
     dbReady = await waitForPool(20, 500);
     if (dbReady) {
       console.log('Database connected successfully to ' + config.db.database);
+      // Ensure the tally_sales table (customer purchase history from Tally) exists
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS tally_sales (
+          id SERIAL PRIMARY KEY,
+          voucher_number TEXT,
+          voucher_date DATE,
+          party_name TEXT NOT NULL,
+          party_ledger TEXT,
+          party_phone TEXT,
+          customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+          total_amount NUMERIC DEFAULT 0,
+          items JSONB DEFAULT '[]',
+          company_name TEXT,
+          raw_data JSONB,
+          synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE (voucher_number, party_name)
+        )`);
+      await pool.query(`ALTER TABLE tally_sales ADD COLUMN IF NOT EXISTS party_phone TEXT`).catch(() => {});
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_tally_sales_customer ON tally_sales(customer_id)`).catch(() => {});
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_tally_sales_party ON tally_sales(party_name)`).catch(() => {});
       if (process.env.TALLY_HOST) {
         console.log('Starting Tally poller...');
         tallyService.startPoller(pool);

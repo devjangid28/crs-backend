@@ -554,4 +554,66 @@ router.get('/serial-map', async (req, res) => {
   }
 });
 
+// GET /api/tally/customers - Fetch all customers (Sundry Debtors) from Tally
+router.get('/customers', async (req, res) => {
+  try {
+    const result = await tallyService.fetchCustomersFromTally();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Fetch customers error:', err.message);
+    res.status(500).json({ success: false, customers: [], count: 0, message: err.message });
+  }
+});
+
+// POST /api/tally/sync-customers - Pull all customers from Tally into the DB
+router.post('/sync-customers', async (req, res) => {
+  try {
+    const result = await tallyService.syncCustomersFromTally(pool, req.body?.company);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Sync customers error:', err.message);
+    res.status(500).json({ success: false, customers: [], count: 0, added: 0, existing: 0, message: err.message });
+  }
+});
+
+// POST /api/tally/sync-purchases - Pull per-customer sales/purchase history from Tally into the DB
+router.post('/sync-purchases', async (req, res) => {
+  try {
+    const result = await tallyService.syncTallySales(pool, { fromDate: req.body?.fromDate });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TallyRoute] Sync purchases error:', err.message);
+    res.status(500).json({ success: false, synced: 0, skipped: 0, errors: 1, message: err.message });
+  }
+});
+
+// GET /api/tally/purchases - List synced purchase history (search by customer name)
+router.get('/purchases', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 500);
+    const search = String(req.query.search || '').trim();
+    const offset = (page - 1) * limit;
+    let where = '';
+    const params = [];
+    if (search) {
+      params.push(`%${search}%`);
+      where = `WHERE party_name ILIKE $${params.length}`;
+    }
+    const countResult = await pool.query(`SELECT COUNT(*) as total FROM tally_sales ${where}`, params);
+    const pIdx = params.length;
+    const dataResult = await pool.query(
+      `SELECT * FROM tally_sales ${where} ORDER BY voucher_date DESC, id DESC LIMIT $${pIdx + 1} OFFSET $${pIdx + 2}`,
+      [...params, limit, offset]
+    );
+    res.json({
+      success: true,
+      data: dataResult.rows,
+      pagination: { page, limit, total: parseInt(countResult.rows[0].total, 10), totalPages: Math.ceil(parseInt(countResult.rows[0].total, 10) / limit) },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;

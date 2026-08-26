@@ -112,7 +112,7 @@ function buildListCompaniesRequest() {
   return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
 }
 
-function buildExportRequest(fromDate, companyName) {
+function buildExportRequest(fromDate, companyName, voucherType) {
   const cfg = getTallyConfig();
   const dateStr = fromDate || '01-Apr-2024';
   const company = companyName || cfg.company || '';
@@ -122,7 +122,18 @@ function buildExportRequest(fromDate, companyName) {
     companyTag = `<SVCURRENTCOMPANY>${company}</SVCURRENTCOMPANY>`;
   }
 
-  return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}<SVFROMDATE>${dateStr}</SVFROMDATE><SVTODATE>$$SysName:Today</SVTODATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME></STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+  // Tally filters the Day Book by one voucher type at a time. Pass an explicit
+  // type to restrict, or null / '*' to return every voucher on the current page.
+  // The actual sales types here are "Sales BCS" and "Sales Asus" - the old hard-
+  // coded "Sales" never matched anything, so purchases never synced.
+  let voucherTypeTag = '';
+  if (voucherType && String(voucherType).trim() && String(voucherType).trim() !== '*') {
+    voucherTypeTag = `<VOUCHERTYPENAME>${escapeXml(String(voucherType).trim())}</VOUCHERTYPENAME>`;
+  }
+
+  // SVMAXVOUCHERCOUNT is a best-effort "give me everything" hint; TallyPrime may
+  // still page-limit the Day Book export to the currently visible page.
+  return `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}<SVFROMDATE>${dateStr}</SVFROMDATE><SVTODATE>$$SysName:Today</SVTODATE><SVMAXVOUCHERCOUNT>-1</SVMAXVOUCHERCOUNT>${voucherTypeTag}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
 }
 
 function rawHttpRequest(url, method, headers, body, timeoutMs) {
@@ -518,6 +529,9 @@ function extractSerialNumbers(xmlResult) {
 
       for (const v of voucherArr) {
         const vchType = v?.VOUCHERTYPE || v?.['@_VCHTYPE'] || '';
+        // Only sales vouchers may mark inventory as Sold. The Day Book export is
+        // no longer restricted by VOUCHERTYPENAME, so guard here instead.
+        if (!/sales/i.test(vchType)) continue;
         const voucherNumber = v?.VOUCHERNUMBER || '';
         const voucherDate = v?.DATE || '';
         const partyName = v?.PARTYNAME || v?.PARTYLEDGERNAME || '';
@@ -728,6 +742,270 @@ async function syncSales(pool) {
   lastSyncDate = new Date().toISOString().split('T')[0];
   log('SYNC', `Complete: ${synced} synced, ${skipped} skipped, ${errors} errors across ${companies.length} company/companies`);
   return { synced, skipped, errors, serials: allSerials, companies: companyResults, message: `Sync complete: ${synced} synced, ${skipped} skipped, ${errors} errors across ${companies.length} company/companies` };
+}
+
+function parseTallyDate(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+  if (/^\d{8}$/.test(s)) {
+    return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  }
+  return s || null;
+}
+
+async function fetchSalesVouchers(fromDate, companyName) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const xml = buildExportRequest(fromDate || '01-Apr-2024', companyName);
+
+  log('FETCH-SALES', `Fetching sales vouchers from Tally (company: ${companyName || cfg.company || '(not set)'})`);
+  const response = await rawHttpRequest(url, 'POST', { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(xml) }, xml);
+
+  if (!response.body || response.body.trim().length === 0) {
+    logError('Tally returned empty response for sales voucher export');
+    return [];
+  }
+
+  const parsed = parser.parse(response.body);
+  const body = parsed?.ENVELOPE?.BODY;
+  let messages = body?.IMPORTDATA?.REQUESTDATA?.TALLYMESSAGE;
+  if (!messages) messages = body?.DATA?.TALLYMESSAGE;
+  if (!messages) return [];
+
+  const detectedCompany = extractCompanyName(response.body);
+  const msgArr = Array.isArray(messages) ? messages : [messages];
+  const sales = [];
+
+  for (const msg of msgArr) {
+    const vouchers = msg?.VOUCHER;
+    if (!vouchers) continue;
+    const voucherArr = Array.isArray(vouchers) ? vouchers : [vouchers];
+
+    for (const v of voucherArr) {
+      const vchType = v?.VOUCHERTYPE || v?.['@_VCHTYPE'] || '';
+      if (!/sales/i.test(vchType)) continue;
+
+      const voucherNumber = String(v?.VOUCHERNUMBER || '').trim();
+      const voucherDate = parseTallyDate(v?.DATE);
+      const partyName = String(v?.PARTYNAME || v?.BASICBUYERNAME || v?.PARTYLEDGERNAME || '').trim();
+      const partyLedger = String(v?.PARTYLEDGERNAME || '').trim();
+      const partyPhone = extractVoucherPhone(v);
+
+      const invAll = v?.['ALLINVENTORYENTRIES.LIST'] || v?.INVENTORYENTRIES?.LIST || [];
+      const invArr = Array.isArray(invAll) ? invAll : [invAll];
+      const items = [];
+      let total = 0;
+
+      for (const inv of invArr) {
+        const itemName = String(inv?.STOCKITEMNAME || '').trim();
+        if (!itemName) continue;
+        const amount = parseFloat(inv?.AMOUNT) || 0;
+        const qtyText = String(inv?.ACTUALQTY || inv?.BILLEDQTY || '').trim();
+        const qty = qtyText ? parseFloat(qtyText.split(/\s+/)[0]) || 1 : 1;
+        const rateText = String(inv?.RATE || '').trim();
+        const rate = rateText ? parseFloat(rateText.split('/')[0]) || 0 : 0;
+        total += amount;
+        items.push({ item: itemName, qty, rate: Math.round(rate * 100) / 100, amount: Math.round(amount * 100) / 100 });
+      }
+
+      if (!voucherNumber && !partyName && !items.length) continue;
+      sales.push({
+        voucher_number: voucherNumber,
+        voucher_date: voucherDate,
+        party_name: partyName,
+        party_ledger: partyLedger,
+        party_phone: partyPhone,
+        total_amount: Math.round(total * 100) / 100,
+        items,
+        voucher_type: vchType,
+        company_name: detectedCompany || companyName || null,
+      });
+    }
+  }
+
+  log('FETCH-SALES', `${sales.length} sales voucher(s) parsed`);
+  return sales;
+}
+
+// Enumerates EVERY voucher (party, number, date, amount, narration, line items
+// and buyer address) for a company using a Voucher collection. Unlike the Day
+// Book report - which only ever returns the current page of vouchers - a
+// collection streams the whole financial year in one request. It never triggers
+// Tally's report compiler, so it cannot wedge the TDL server the way Voucher
+// Register / Account Book / Ledger reports do.
+async function fetchAllSalesVouchers(company) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const companyName = company || cfg.company || '';
+  const xml = buildMasterCollectionRequest('Voucher', 'CRSVouchers', [
+    'VoucherNumber', 'Date', 'VoucherTypeName', 'PartyLedgerName', 'Amount',
+    'Narration', 'ALLINVENTORYENTRIES.LIST', 'ADDRESS.LIST',
+    'BASICBUYERADDRESS.LIST', 'DELIVERYADDRESS.LIST', 'GSTBUYERADDRESS.LIST',
+  ]);
+
+  log('SYNC-SALES', `Fetching all vouchers from Tally collection (company: ${companyName})`);
+  const response = await rawHttpRequest(url, 'POST', {
+    'Content-Type': 'text/xml',
+    'Content-Length': Buffer.byteLength(xml),
+  }, xml, 90000);
+
+  if (!response.body || response.body.trim().length < 1000) {
+    logError('Tally returned empty/too small response for voucher collection');
+    return [];
+  }
+
+  const parsed = parser.parse(response.body);
+  let collections = parsed?.ENVELOPE?.BODY?.DATA?.COLLECTION;
+  if (!collections) {
+    log('SYNC-SALES', 'No COLLECTION found in voucher collection response');
+    return [];
+  }
+
+  const collArr = Array.isArray(collections) ? collections : [collections];
+  const sales = [];
+
+  for (const coll of collArr) {
+    const entries = coll?.VOUCHER;
+    if (!entries) continue;
+    const list = Array.isArray(entries) ? entries : [entries];
+
+    for (const v of list) {
+      const vchType = v?.VOUCHERTYPE || v?.['@_VCHTYPE'] || fieldText(v?.VOUCHERTYPENAME) || '';
+      if (!/sales/i.test(vchType)) continue;
+
+      const voucherNumber = fieldText(v?.VOUCHERNUMBER);
+      const voucherDate = parseTallyDate(fieldText(v?.DATE));
+      const partyName = fieldText(v?.PARTYLEDGERNAME || v?.BASICBUYERNAME || v?.PARTYNAME);
+      const partyLedger = fieldText(v?.PARTYLEDGERNAME);
+      const partyPhone = extractVoucherPhone(v);
+
+      const invList = v?.['ALLINVENTORYENTRIES.LIST'];
+      const invArr = Array.isArray(invList) ? invList : [invList];
+      const items = [];
+      let total = 0;
+      for (const inv of invArr) {
+        const itemName = fieldText(inv?.STOCKITEMNAME);
+        if (!itemName) continue;
+        const amount = parseFloat(fieldText(inv?.AMOUNT)) || 0;
+        const qtyText = fieldText(inv?.BILLEDQTY || inv?.ACTUALQTY);
+        const qty = qtyText ? parseFloat(qtyText.split(/\s+/)[0]) || 1 : 1;
+        const rateText = fieldText(inv?.RATE);
+        const rate = rateText ? parseFloat(rateText.split('/')[0]) || 0 : 0;
+        total += amount;
+        items.push({ item: itemName, qty, rate: Math.round(rate * 100) / 100, amount: Math.round(amount * 100) / 100 });
+      }
+
+      if (!total) total = Math.abs(parseFloat(fieldText(v?.AMOUNT))) || 0;
+
+      if (!partyName && !items.length) continue;
+      sales.push({
+        voucher_number: voucherNumber,
+        voucher_date: voucherDate,
+        party_name: partyName,
+        party_ledger: partyLedger,
+        party_phone: partyPhone,
+        total_amount: Math.round(total * 100) / 100,
+        items,
+        voucher_type: vchType,
+        company_name: companyName || null,
+      });
+    }
+  }
+
+  log('SYNC-SALES', `${sales.length} sales voucher(s) parsed from collection`);
+  return sales;
+}
+
+async function syncTallySales(pool, options = {}) {
+  log('SYNC-SALES', 'Starting purchase-history sync...');
+  const fromDate = options.fromDate || process.env.TALLY_SALES_FROM_DATE || null;
+
+  const companies = await discoverCompanies(pool);
+  if (!companies.length) {
+    log('SYNC-SALES', 'No companies discovered.');
+    return { synced: 0, skipped: 0, errors: 0, message: 'No Tally companies found. Set TALLY_COMPANY in config.' };
+  }
+
+  let synced = 0, skipped = 0, errors = 0;
+  const companyResults = {};
+
+  for (const company of companies) {
+    log('SYNC-SALES', `--- Syncing purchases for company: ${company} ---`);
+    try {
+      const sales = await fetchAllSalesVouchers(company);
+      companyResults[company] = sales.length;
+
+      for (const v of sales) {
+        try {
+          const dup = await pool.query(
+            `SELECT id FROM tally_sales WHERE voucher_number = $1 AND party_name = $2 LIMIT 1`,
+            [v.voucher_number, v.party_name]
+          );
+          if (dup.rows.length) {
+            skipped++;
+            // Backfill phones/links the row missed on its first insert (e.g. the
+            // address-phone fix) - cheap UPDATE, never touches existing values.
+            if (v.party_phone || !dup.rows[0].customer_id) {
+              await pool.query(
+                `UPDATE tally_sales
+                 SET party_phone = COALESCE(party_phone, $2),
+                     customer_id = COALESCE(customer_id, (SELECT id FROM customers WHERE name ILIKE $3 ORDER BY id ASC LIMIT 1))
+                 WHERE id = $1`,
+                [dup.rows[0].id, v.party_phone || null, `%${v.party_name}%`]
+              );
+            }
+            if (v.party_phone) await topUpCustomerPhone(pool, v.party_name, v.party_phone);
+            continue;
+          }
+
+          let customerId = null;
+          if (v.party_name) {
+            const cust = await pool.query(
+              `SELECT id FROM customers WHERE name ILIKE $1 ORDER BY id ASC LIMIT 1`,
+              [`%${v.party_name}%`]
+            );
+            if (cust.rows.length) customerId = cust.rows[0].id;
+          }
+
+          await pool.query(
+            `INSERT INTO tally_sales (voucher_number, voucher_date, party_name, party_ledger, party_phone, customer_id, total_amount, items, company_name, raw_data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (voucher_number, party_name) DO NOTHING`,
+            [v.voucher_number, v.voucher_date, v.party_name, v.party_ledger, v.party_phone, customerId, v.total_amount, JSON.stringify(v.items), company, JSON.stringify(v)]
+          );
+          synced++;
+          log('SYNC-SALES', `Saved ${v.voucher_number || '(no no.)'} for ${v.party_name || '(unknown)'} (${v.voucher_date || 'no date'})${v.party_phone ? ' phone ' + v.party_phone : ''}`);
+
+          // Top-up the matched customer's missing phone number (never overwrite an existing one).
+          if (customerId && v.party_phone) await topUpCustomerPhone(pool, v.party_name, v.party_phone);
+        } catch (err) {
+          errors++;
+          logError(`Error saving sales voucher ${v.voucher_number}`, err);
+        }
+      }
+    } catch (err) {
+      errors++;
+      logError(`Failed to fetch sales for company "${company}"`, err);
+    }
+  }
+
+  log('SYNC-SALES', `Complete: ${synced} added, ${skipped} duplicates/skipped, ${errors} errors`);
+  return { synced, skipped, errors, companyResults, message: `Purchase history sync: ${synced} added, ${skipped} duplicates, ${errors} errors` };
+}
+
+// Fills in a missing customer phone from a Tally voucher/ledger phone number.
+// Matches by name (case-insensitive) and only updates customers that have no
+// phone yet - never overwrites an existing number.
+async function topUpCustomerPhone(pool, partyName, phone) {
+  if (!phone || !partyName) return;
+  const res = await pool.query(
+    `UPDATE customers SET phone = $2, updated_at = CURRENT_TIMESTAMP
+     WHERE (phone IS NULL OR phone = '') AND name ILIKE $1
+     RETURNING id`,
+    [`%${partyName}%`, phone]
+  );
+  if (res.rowCount > 0) log('SYNC-SALES', `Top-upped phone ${phone} for ${partyName}`);
+  else log('SYNC-SALES', `Phone ${phone} not applied for ${partyName} (already set or no match)`);
 }
 
 function startPoller(pool) {
@@ -1537,6 +1815,376 @@ async function fetchLedgers() {
   }
   log('LEDGERS', `Fetched ${ledgers.length} ledgers from Tally`);
   return { ledgers, count: ledgers.length };
+}
+
+// ============================================================
+// CUSTOMERS FROM TALLY
+// Fetches all party ledgers under "Sundry Debtors" (customers)
+// so the Manage Customers page can show every customer that
+// exists in Tally.
+// ============================================================
+// Tally XML parser returns field values in many shapes: plain strings,
+// { '#text': 'value' }, or arrays of either. This normalizes them all.
+function fieldText(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return decodeNumericEntities(value).replace(/\s+/g, ' ').trim();
+  if (typeof value === 'number') return String(value).trim();
+  if (Array.isArray(value)) {
+    return value.map(fieldText).filter(Boolean).join(', ');
+  }
+  if (typeof value === 'object') {
+    if (value['#text'] !== undefined) return fieldText(value['#text']);
+    // Never treat attribute values (fast-xml-parser emits them as "@_" keys)
+    // as text - an empty <FIELD TYPE="String"/> must come out as '' not "String".
+    const values = [];
+    for (const k of Object.keys(value)) {
+      if (k.startsWith('@_')) continue;
+      values.push(value[k]);
+    }
+    return values.map(fieldText).filter(Boolean).join(', ');
+  }
+  return '';
+}
+
+// Tally's XML uses numeric character references (&#10; newline, &#4; control
+// char) that fast-xml-parser leaves as-is - turn them into real text.
+function decodeNumericEntities(str) {
+  return String(str).replace(/&#(\d+);|&#x([0-9a-fA-F]+);/g, (m, dec, hex) => {
+    const cp = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+    if (cp === 10 || cp === 13 || (cp < 32 && cp !== 9)) return ' ';
+    try { return String.fromCodePoint(cp); } catch (e) { return m; }
+  });
+}
+
+async function fetchCustomersFromTally(company) {
+  const cfg = getTallyConfig();
+  const url = `http://${cfg.host}:${cfg.port}`;
+  const companyName = company || cfg.company || '';
+  const customers = [];
+
+  // NATIVEMETHOD list. `AddressLine1..4`, `Phone`, `MailingAddress`,
+  // `MailingContact` and `StateName` are silently dropped by Tally, so we
+  // request the fields it actually returns: `Address` (ADDRESS.LIST), the
+  // contact-number aliases (`LedgerMobile`, `MobileNumber`, `Contact`,
+  // `ContactDetails`, `LedgerPhone`, `LedgerContact`), `PinCode`, `CountryName`,
+  // `Email`, `MailingName`, `GSTNumber`/`GstNumber`. Tally silently drops
+  // methods that don't apply to a ledger, so requesting more than strictly
+  // needed is safe.
+  const xml = buildMasterCollectionRequest('Ledger', 'CRSCustomers', [
+    'Name', 'Parent', 'MailingName', 'Address', 'MobileNumber', 'Contact',
+    'ContactDetails', 'LedgerMobile', 'LedgerPhone', 'LedgerContact', 'Phone',
+    'Email', 'PinCode', 'CountryName', 'StateName', 'GSTNumber', 'GstNumber',
+    'OpeningBalance',
+  ], 'LEDGER', []);
+
+  try {
+    const response = await rawHttpRequest(url, 'POST', {
+      'Content-Type': 'text/xml',
+      'Content-Length': Buffer.byteLength(xml),
+    }, xml, 30000);
+    if (!response.body || response.body.length < 100) {
+      log('CUSTOMERS', 'Tally returned empty/too small response for customer ledgers');
+      return { customers, count: 0, message: 'Tally returned no data' };
+    }
+
+    const parsed = parser.parse(response.body);
+    const data = parsed?.ENVELOPE?.BODY?.DATA;
+    let collections = data?.COLLECTION;
+    if (!collections) {
+      log('CUSTOMERS', 'No COLLECTION found in Tally response');
+      return { customers, count: 0, message: 'No ledger collection found' };
+    }
+
+    const collArr = Array.isArray(collections) ? collections : [collections];
+    const seen = new Set();
+
+    for (const coll of collArr) {
+      const entries = coll?.LEDGER;
+      if (!entries) continue;
+      const list = Array.isArray(entries) ? entries : [entries];
+
+      for (const entry of list) {
+        const name = fieldText(entry?.NAME || entry?.['@_NAME']);
+        if (!name) continue;
+        // Skip obvious non-customer ledgers (only show ones under Sundry Debtors).
+        const parent = cleanMasterParent(fieldText(entry?.PARENT));
+        const isDebtor = /sundry debtor/i.test(parent);
+        if (!isDebtor) continue;
+        if (seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+
+        const gstin = fieldText(entry?.GSTNUMBER) || fieldText(entry?.GSTIN);
+        const mailingName = fieldText(entry?.MAILINGNAME);
+        const email = fieldText(entry?.EMAIL);
+        const state = fieldText(entry?.STATENAME) || fieldText(entry?.STATE) || fieldText(entry?.LEDSTATE);
+        const pincode = fieldText(entry?.PINCODE);
+        const country = fieldText(entry?.COUNTRYNAME) || 'India';
+
+        // Tally keeps the mailing address (and very often the mobile) inside
+        // ADDRESS.LIST rather than dedicated fields.
+        const rawAddress = collectStrings(entry?.['ADDRESS.LIST']) || [];
+        const addressLines = [];
+        for (const line of rawAddress) {
+          const clean = String(line)
+            .replace(/&#10;|&#13;|&#xD;/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/\s\?\s/g, ' - ')
+            .replace(/,\s*$/, '')
+            .trim();
+          if (!clean) continue;
+          // A bare phone number is a phone, not an address line.
+          if (/^\+?[\d\s\-().]{8,}$/.test(clean) && !/[a-z]/i.test(clean)) continue;
+          addressLines.push(clean);
+        }
+
+        let phone = null;
+        for (const source of [
+          entry?.['CONTACTDETAILS.LIST'],
+          entry?.LEDGERMOBILE,
+          entry?.LEDGERPHONE,
+          entry?.LEDGERCONTACT,
+          entry?.MOBILE,
+          entry?.PHONE,
+          entry?.CONTACT,
+        ]) {
+          if (!source) continue;
+          const cands = collectStrings(source);
+          if (!cands.length) continue;
+          for (const cand of cands) {
+            phone = extractPhoneFromText(cand);
+            if (phone) break;
+          }
+          if (phone) break;
+        }
+        if (!phone) {
+          // Some ledgers only carry the mobile inside an address line.
+          for (const line of rawAddress) {
+            phone = extractPhoneFromText(String(line));
+            if (phone) break;
+          }
+        }
+        if (!phone) {
+          // Many ledgers embed the mobile in the ledger name / mailing name,
+          // e.g. "ANGAD SINGH 8780327670" or "Rahul Deshmukh 8511583543".
+          phone = extractPhoneFromText(name) || extractPhoneFromText(mailingName);
+        }
+
+        customers.push({
+          name: name,
+          parent,
+          mailing_name: mailingName,
+          gstin: gstin || null,
+          email: email || null,
+          phone: phone || null,
+          address: addressLines.length ? addressLines.join(', ') : null,
+          city: state || null,
+          state: state || null,
+          postcode: pincode || null,
+          country: country || 'India',
+          source: 'tally',
+        });
+        log('CUSTOMERS', `Found Tally customer: ${name}${phone ? ' (' + phone + ')' : ''}`);
+      }
+    }
+
+    log('CUSTOMERS', `Fetched ${customers.length} customer(s) from Tally`);
+    return { customers, count: customers.length, message: `Found ${customers.length} customer(s) in Tally` };
+  } catch (err) {
+    logError('Failed to fetch customers from Tally', err);
+    return { customers, count: 0, message: err.message, error: true };
+  }
+}
+
+// Normalizes a phone number to digits for matching (drops country code when it
+// is just the leading 91 / +91 so local numbers still line up).
+function normalizePhoneForMatch(phone) {
+  if (!phone) return null;
+  const cleaned = String(phone).replace(/[^\d]/g, '');
+  if (!cleaned) return null;
+  if (cleaned.length > 10 && cleaned.startsWith('91')) return cleaned.slice(2);
+  return cleaned;
+}
+
+// Extracts the first plausible mobile/phone number from free text (Tally
+// customers/vouchers often store mobiles inside address lines instead of the
+// Phone field). Returns a normalized 10-digit number (91-prefixed is stripped),
+// or null when nothing phone-like is found.
+function extractPhoneFromText(text) {
+  if (!text) return null;
+  const s = String(text).trim();
+  if (!s) return null;
+  // Split on hard separators so multi-number strings like
+  // "7096110303/7990175916" are evaluated piece by piece.
+  const pieces = s.split(/[\/;,|\n\r\t]+/);
+  const seen = new Set();
+  // Normalise a digit-run to a valid Indian mobile number.
+  //  10 digits          -> must start 6-9
+  //  0 + 10 digits      -> drop the leading 0
+  //  91 + 10 digits     -> drop the country code
+  const validPhone = (digits) => {
+    if (digits.length === 10) return /^[6-9]\d{9}$/.test(digits) ? digits : null;
+    if (digits.length === 11 && digits.startsWith('0')) return validPhone(digits.slice(1));
+    if (digits.length === 12 && digits.startsWith('91')) return validPhone(digits.slice(2));
+    if (digits.length === 13 && digits.startsWith('91')) return validPhone(digits.slice(2));
+    return null;
+  };
+  for (const piece of pieces) {
+    const matches = piece.match(/(?:\+?\d[\s\-().]*){10,}/g) || [];
+    for (const cand of matches) {
+      const digits = cand.replace(/[^\d]/g, '');
+      if (digits.length < 10) continue;
+      if (digits.length > 13) {
+        // Spaces are allowed inside the run, so a phone repeated in ADDRESS +
+        // BASICBUYERADDRESS (e.g. "9909201736 9909201736") is glued into one
+        // 20-digit run. Slide a window so the embedded numbers can be found.
+        for (let i = 0; i + 10 <= digits.length; i++) {
+          for (let len = 10; len <= 13 && i + len <= digits.length; len++) {
+            const sub = digits.slice(i, i + len);
+            if (seen.has(sub)) continue;
+            seen.add(sub);
+            const ph = validPhone(sub);
+            if (ph) return ph;
+          }
+        }
+        continue;
+      }
+      if (seen.has(digits)) continue;
+      seen.add(digits);
+      const ph = validPhone(digits);
+      if (ph) return ph;
+    }
+  }
+  return null;
+}
+
+function collectStrings(value, out = []) {
+  if (value === null || value === undefined) return out;
+  if (typeof value === 'string' || typeof value === 'number') { out.push(String(value)); return out; }
+  if (Array.isArray(value)) { for (const x of value) collectStrings(x, out); return out; }
+  if (typeof value === 'object') {
+    // Collect every primitive leaf inside the address blocks (ADDRESS, and also
+    // BASICBUYERADDRESS / DELIVERYADDRESS / GSTBUYERADDRESS etc.), skipping the
+    // fast-xml-parser attribute keys so we don't pick up TYPE="String" noise.
+    // A leaf carrying attributes still holds its value under '#text' - grab it.
+    for (const k of Object.keys(value)) {
+      if (k.startsWith('@_')) continue;
+      if (k === '#text') { out.push(String(value[k])); continue; }
+      collectStrings(value[k], out);
+    }
+  }
+  return out;
+}
+
+// Tally sales vouchers carry the buyer's mobile inside the ADDRESS lists far
+// more often than in the Phone field - pull any phone-like number out of them.
+function extractVoucherPhone(v) {
+  const out = [];
+  for (const key of ['ADDRESS.LIST', 'BASICBUYERADDRESS.LIST', 'DELIVERYADDRESS.LIST']) {
+    if (v[key]) collectStrings(v[key], out);
+  }
+  return extractPhoneFromText(out.join(' '));
+}
+
+// Syncs customers from Tally into the local customers table.
+// Matches by phone (exact then normalized), then by email, then by name
+// (case-insensitive). New ones are bulk-inserted; existing ones are only
+// top-upped with missing contact details (never overwrite local data).
+async function syncCustomersFromTally(pool, company) {
+  const result = await fetchCustomersFromTally(company);
+  const { customers } = result;
+  if (!customers.length) return { ...result, added: 0, existing: 0, skipped: 0, synced: false };
+
+  // Load all existing customers once into memory so the whole sync only needs a
+  // handful of queries instead of ~4 queries per customer (fast even with
+  // thousands of Tally ledgers).
+  const existingRows = await pool.query('SELECT id, name, phone, phone2, email FROM customers');
+  const byPhoneExact = new Map();
+  const byPhoneNorm = new Map();
+  const byEmail = new Map();
+  const byName = new Map();
+  for (const row of existingRows.rows) {
+    if (row.phone) byPhoneExact.set(String(row.phone).trim().toLowerCase(), row);
+    if (row.phone2) byPhoneExact.set(String(row.phone2).trim().toLowerCase(), row);
+    const pn = normalizePhoneForMatch(row.phone);
+    if (pn) byPhoneNorm.set(pn, row);
+    const pn2 = normalizePhoneForMatch(row.phone2);
+    if (pn2) byPhoneNorm.set(pn2, row);
+    if (row.email) byEmail.set(String(row.email).trim().toLowerCase(), row);
+    if (row.name) byName.set(String(row.name).trim().toLowerCase(), row);
+  }
+
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  let added = 0, existing = 0, skipped = 0;
+  const toInsert = [];
+  const toUpdate = [];
+
+  for (const c of customers) {
+    try {
+      let match = null;
+      const phoneExact = c.phone ? String(c.phone).trim().toLowerCase() : null;
+      if (phoneExact) match = byPhoneExact.get(phoneExact);
+      if (!match) {
+        const pn = normalizePhoneForMatch(c.phone);
+        if (pn) match = byPhoneNorm.get(pn);
+      }
+      if (!match && c.email) match = byEmail.get(String(c.email).trim().toLowerCase());
+      if (!match) match = byName.get(String(c.name).trim().toLowerCase());
+
+      if (match) {
+        existing++;
+        toUpdate.push({ id: match.id, c });
+        continue;
+      }
+      toInsert.push(c);
+    } catch (err) {
+      skipped++;
+      logError(`Failed to sync Tally customer "${c.name}"`, err);
+    }
+  }
+
+  // Bulk insert new customers in chunks (11 columns per row).
+  for (let i = 0; i < toInsert.length; i += 200) {
+    const chunk = toInsert.slice(i, i + 200);
+    const placeholders = [];
+    const values = [];
+    chunk.forEach((c, idx) => {
+      const base = idx * 11;
+      placeholders.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`);
+      values.push(
+        c.name, c.mailing_name || null, c.phone || null, c.email || null,
+        c.address || null, c.city || null, c.state || null, c.postcode || null,
+        c.country || 'India', now, now
+      );
+    });
+    await pool.query(
+      `INSERT INTO customers (name, company, phone, email, address, city, state, postcode, country, created_at, updated_at)
+       VALUES ${placeholders.join(', ')}`,
+      values
+    );
+    added += chunk.length;
+  }
+
+  // Top-up missing contact details for existing customers only (never overwrite).
+  for (const { id, c } of toUpdate) {
+    await pool.query(
+      `UPDATE customers SET
+         phone = COALESCE(NULLIF(phone, ''), NULLIF($2, '')),
+         phone2 = COALESCE(NULLIF(phone2, ''), NULLIF($3, '')),
+         email = COALESCE(NULLIF(email, ''), NULLIF($4, '')),
+         city = COALESCE(NULLIF(city, ''), NULLIF($5, '')),
+         state = COALESCE(NULLIF(state, ''), NULLIF($6, '')),
+         postcode = COALESCE(NULLIF(postcode, ''), NULLIF($7, '')),
+         country = COALESCE(NULLIF(country, ''), NULLIF($8, '')),
+         address = COALESCE(NULLIF(address, ''), NULLIF($9, '')),
+         company = COALESCE(NULLIF(company, ''), NULLIF($10, '')),
+         updated_at = $11
+       WHERE id = $1`,
+      [id, c.phone || '', '', c.email || '', c.city || '', c.state || '', c.postcode || '', c.country || 'India', c.address || '', c.mailing_name || '', now]
+    );
+  }
+
+  log('CUSTOMERS', `Sync complete: ${added} added, ${existing} existing, ${skipped} skipped`);
+  return { ...result, added, existing, skipped, synced: added > 0 || existing > 0 };
 }
 
 function companyInfoFromEnv() {
@@ -2820,6 +3468,10 @@ module.exports = {
   testConnection,
   fetchRecentSales,
   syncSales,
+  fetchSalesVouchers,
+  fetchAllSalesVouchers,
+  syncTallySales,
+  parseTallyDate,
   startPoller,
   stopPoller,
   debug,
@@ -2846,6 +3498,8 @@ module.exports = {
   isPermanentStockError,
   fetchStockCategories,
   fetchLedgers,
+  fetchCustomersFromTally,
+  syncCustomersFromTally,
   pushLedgerToTally,
   buildLedgerCreateXml,
   buildPurchaseVoucherXml,
