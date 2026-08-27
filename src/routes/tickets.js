@@ -154,9 +154,14 @@ async function resolveCustomer(client, { name, phone, email, company }) {
 // GET /api/tickets - Get all tickets with search & filter
 router.get('/', async (req, res, next) => {
   try {
-    const { search, status, priority, page = 1, limit = 50 } = req.query;
+    const { search, status, priority, page = 1, limit = 50, store_id } = req.query;
     let whereClause = 'WHERE 1=1';
     const params = [];
+
+    if (store_id) {
+      whereClause += ` AND store_id = ?`;
+      params.push(parseInt(store_id));
+    }
 
     if (search) {
       whereClause += ` AND (customer_name ILIKE ? OR customer_phone ILIKE ? OR customer_email ILIKE ? OR brand ILIKE ? OR model ILIKE ? OR issue_category ILIKE ? OR ticket_id ILIKE ?)`;

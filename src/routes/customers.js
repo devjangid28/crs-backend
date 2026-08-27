@@ -6,9 +6,14 @@ const { validateCustomer } = require('../middleware/validation');
 // GET /api/customers - Get all customers
 router.get('/', async (req, res, next) => {
   try {
-    const { search, page = 1, limit = 50 } = req.query;
+    const { search, page = 1, limit = 50, store_id } = req.query;
     let sql = 'SELECT * FROM customers WHERE 1=1';
     const params = [];
+
+    if (store_id) {
+      sql += ` AND store_id = ?`;
+      params.push(parseInt(store_id));
+    }
 
     if (search) {
       sql += ` AND (name ILIKE ? OR phone ILIKE ? OR email ILIKE ?)`;
@@ -184,14 +189,19 @@ router.post('/sync-from-tally', async (req, res, next) => {
 // POST /api/customers - Create customer
 router.post('/', validateCustomer, async (req, res, next) => {
   try {
-    const { name, company, phone, phone2, email, address, addressLine2, city, state, pincode, postcode, country } = req.body;
+    const { name, company, phone, phone2, email, address, addressLine2, city, state, pincode, postcode, country, storeId, store_id } = req.body;
     const pc = pincode || postcode;
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    let resolvedStoreId = storeId || store_id || null;
+    if (!resolvedStoreId) {
+      const defStore = await query('SELECT id FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+      if (defStore.rows.length > 0) resolvedStoreId = defStore.rows[0].id;
+    }
 
     const result = await query(
-      `INSERT INTO customers (name, company, phone, phone2, email, address, address_line2, city, state, postcode, country, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-      [name, company || null, phone, phone2 || null, email || null, address || null, addressLine2 || null, city || null, state || null, pc || null, country || 'India', now, now]
+      `INSERT INTO customers (name, company, phone, phone2, email, address, address_line2, city, state, postcode, country, store_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [name, company || null, phone, phone2 || null, email || null, address || null, addressLine2 || null, city || null, state || null, pc || null, country || 'India', resolvedStoreId, now, now]
     );
 
     const insertId = result.rows[0].id;
