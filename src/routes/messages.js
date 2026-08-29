@@ -161,6 +161,70 @@ router.get('/conversations', authenticate, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/messages/lookup-user - Find a registered user by phone (WhatsApp-style)
+// Searches customers and staff users. If the number is registered, returns the
+// profile so the UI can open a one-to-one conversation without saving a contact.
+router.get('/lookup-user', authenticate, async (req, res, next) => {
+  try {
+    const raw = req.query.phone;
+    if (!raw) {
+      return res.json({ success: true, data: { registered: false, valid: false } });
+    }
+    const cleaned = String(raw).replace(/[^\d]/g, '').replace(/^0+/, '');
+    let normalized = null;
+    if (cleaned.length === 10) normalized = '91' + cleaned;
+    else if (cleaned.length === 12 && cleaned.startsWith('91')) normalized = cleaned;
+    if (!normalized) {
+      return res.json({ success: true, data: { registered: false, valid: false } });
+    }
+
+    const likeShort = `%${cleaned}`;
+    const likeFull = `%${normalized}`;
+
+    const custRes = await query(
+      `SELECT id, name, phone FROM customers WHERE phone IS NOT NULL AND (phone LIKE $1 OR phone LIKE $2) ORDER BY created_at DESC LIMIT 1`,
+      [likeShort, likeFull]
+    );
+    if (custRes.rows.length > 0) {
+      const c = custRes.rows[0];
+      return res.json({
+        success: true,
+        data: {
+          registered: true,
+          valid: true,
+          type: 'customer',
+          name: c.name || 'Customer',
+          phone: normalized,
+          customerId: c.id,
+          userId: null,
+        },
+      });
+    }
+
+    const userRes = await query(
+      `SELECT id, full_name, mobile_number FROM users WHERE mobile_number IS NOT NULL AND (mobile_number LIKE $1 OR mobile_number LIKE $2) ORDER BY id LIMIT 1`,
+      [likeShort, likeFull]
+    );
+    if (userRes.rows.length > 0) {
+      const u = userRes.rows[0];
+      return res.json({
+        success: true,
+        data: {
+          registered: true,
+          valid: true,
+          type: 'user',
+          name: u.full_name || 'User',
+          phone: normalized,
+          customerId: null,
+          userId: u.id,
+        },
+      });
+    }
+
+    return res.json({ success: true, data: { registered: false, valid: true, phone: normalized } });
+  } catch (err) { next(err); }
+});
+
 // POST /api/messages/pdf - Send a PDF message
 router.post('/pdf', authenticate, async (req, res, next) => {
   try {
