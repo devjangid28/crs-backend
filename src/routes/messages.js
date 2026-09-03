@@ -9,6 +9,7 @@ const {
 } = require('../services/messagingService');
 const { sendTextMessage, sendMediaMessage, sendDocumentFile, sendMediaFile, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateInwardReceiptFromHTML, generateOrderPdfFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
+const { generateOrderInvoicePdf } = require('../services/tallyOrderInvoicePdf');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
 const { simulateDelivery } = require('../services/simulationService');
@@ -148,8 +149,8 @@ router.post('/', authenticate, async (req, res, next) => {
 // GET /api/messages/conversations - List all conversations
 router.get('/conversations', authenticate, async (req, res, next) => {
   try {
-    const { search, filter } = req.query;
-    const conversations = await getConversationsWithDetails({ search, filter });
+    const { search, filter, store_id } = req.query;
+    const conversations = await getConversationsWithDetails({ search, filter, storeId: store_id });
 
     const sorted = (conversations || []).sort((a, b) => {
       const da = new Date(a.last_message_at || 0);
@@ -365,6 +366,11 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       pdf = await generateServiceInvoiceFromHTML(ticketId);
       entityId = ticketId;
       entityType = 'service_invoice';
+    } else if (documentType === 'invoice' && orderId) {
+      // Send the exact ManageOrders (Tally-style) tax invoice for this order.
+      pdf = await generateOrderInvoicePdf(orderId);
+      entityId = orderId;
+      entityType = 'order';
     } else {
       return res.status(400).json({ success: false, message: 'Invalid documentType/id combination' });
     }
@@ -376,6 +382,8 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       publicUrl = `${baseUrl}/api/pdf/download/inward/${entityId}`;
     } else if (entityType === 'service_invoice') {
       publicUrl = `${baseUrl}/api/pdf/download/service-invoice/${entityId}`;
+    } else if (entityType === 'invoice') {
+      publicUrl = `${baseUrl}/api/pdf/download/invoice/${entityId}`;
     } else {
       publicUrl = `${baseUrl}/api/pdf/download/order/${entityId}`;
     }
@@ -399,7 +407,9 @@ router.post('/send-document', authenticate, async (req, res, next) => {
           ? `*Inward Receipt*\nYour service receipt is attached.`
           : documentType === 'service_invoice'
             ? `*Service Invoice*\nYour service invoice is attached.`
-            : `*Order Form*\nYour order details are attached.`;
+            : documentType === 'invoice'
+              ? `*Invoice*\nYour invoice is attached.`
+              : `*Order Form*\nYour order details are attached.`;
         const waResult = await sendDocumentFile(resolvedPhone, pdf.filePath, caption, {
           conversationId: convId,
           ticketId: ticketId || null,
@@ -430,9 +440,11 @@ router.post('/send-document', authenticate, async (req, res, next) => {
       fileSize: String(pdf.fileSize || ''),
       documentType: documentType === 'inward' ? 'Inward Receipt'
         : documentType === 'service_invoice' ? 'Service Invoice'
+        : documentType === 'invoice' ? 'Invoice'
         : 'Order Form',
       event: documentType === 'inward' ? 'inward_receipt'
         : documentType === 'service_invoice' ? 'service_invoice_sent'
+        : documentType === 'invoice' ? 'invoice_sent'
         : 'order_form',
       providerMessageId,
       phone: resolvedPhone,

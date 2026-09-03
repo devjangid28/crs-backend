@@ -305,7 +305,10 @@ async function generateInvoicePdf(invoiceId) {
 
   doc.fontSize(9).font('Helvetica-Bold').fillColor('#333');
   const labels = ['Invoice No:', 'Date:', 'Due Date:', 'Payment Terms:', 'Status:'];
-  const values = [inv.invoice_id, formatDate(inv.issue_date), formatDate(inv.due_date), inv.payment_terms || 'Net 14 days', inv.status];
+  const financeText = inv.payment_method === 'Finance'
+    ? `Finance (Down ${formatCurrency(inv.finance_down_payment || 0)} + EMI ${formatCurrency(inv.finance_emi || 0)}/mo x ${parseInt(inv.finance_duration, 10) || 0} months)`
+    : null;
+  const values = [inv.invoice_id, formatDate(inv.issue_date), formatDate(inv.due_date), inv.payment_terms || inv.payment_method || 'Cash', inv.status];
 
   labels.forEach((label, i) => {
     doc.text(label, 50, y);
@@ -313,6 +316,12 @@ async function generateInvoicePdf(invoiceId) {
     y += 15;
     doc.font('Helvetica-Bold');
   });
+
+  if (financeText) {
+    doc.fontSize(8).font('Helvetica').fillColor('#444').text('Finance:', 50, y);
+    doc.font('Helvetica-Bold').fillColor('#000').text(financeText, 120, y);
+    y += 15;
+  }
 
   y += 10;
 

@@ -55,7 +55,8 @@ router.post('/', async (req, res, next) => {
     const {
       ticketId, orderId, customerId, customerName, invoiceNumber, issueDate, dueDate,
       paymentTerms, items, subtotal, taxRate, tax, discount, grandTotal,
-      amountPaid, status, paymentMethod, billedBy, billedTo, notes
+      amountPaid, status, paymentMethod, billedBy, billedTo, notes,
+      financeDownPayment, financeEmi, financeDuration
     } = req.body;
 
     const invId = invoiceNumber || `INV-${10000 + Date.now() % 100000}`;
@@ -86,11 +87,12 @@ router.post('/', async (req, res, next) => {
     const btAddr2 = billedTo?.address2 || null;
 
     const result = await query(
-      `INSERT INTO invoices (invoice_id, ticket_id, order_id, customer_id, customer_name, issue_date, due_date, payment_terms, subtotal, tax_rate, tax_amount, discount, total_amount, amount_paid, balance_due, status, payment_method, billed_by_name, billed_by_address1, billed_by_address2, billed_to_name, billed_to_email, billed_to_address1, billed_to_address2, notes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-      [invId, ticketRef, orderRef, customerRef, customerName || 'Unknown Customer', issueDate || null, dueDate || null, paymentTerms || 'Net 14 days',
+      `INSERT INTO invoices (invoice_id, ticket_id, order_id, customer_id, customer_name, issue_date, due_date, payment_terms, subtotal, tax_rate, tax_amount, discount, total_amount, amount_paid, balance_due, status, payment_method, finance_down_payment, finance_emi, finance_duration, billed_by_name, billed_by_address1, billed_by_address2, billed_to_name, billed_to_email, billed_to_address1, billed_to_address2, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [invId, ticketRef, orderRef, customerRef, customerName || 'Unknown Customer', issueDate || null, dueDate || null, paymentTerms || paymentMethod || 'Cash',
        subtotal || 0, taxRate || 0, tax || 0, discount || 0, grandTotal || 0, amountPaid || 0, (grandTotal || 0) - (amountPaid || 0),
-       status || 'Unpaid', paymentMethod || null, bbName, bbAddr1, bbAddr2, btName, btEmail, btAddr1, btAddr2,
+       status || 'Unpaid', paymentMethod || null, parseFloat(financeDownPayment) || null, parseFloat(financeEmi) || null,
+       parseInt(financeDuration, 10) || null, bbName, bbAddr1, bbAddr2, btName, btEmail, btAddr1, btAddr2,
        notes || null, now, now]
     );
 

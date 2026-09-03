@@ -307,7 +307,7 @@ async function getAllUnreadCounts() {
   return counts;
 }
 
-async function getConversationsWithDetails({ search, filter, customerId } = {}) {
+async function getConversationsWithDetails({ search, filter, customerId, storeId } = {}) {
   let whereClause = 'WHERE 1=1';
   const params = [];
 
@@ -339,6 +339,15 @@ async function getConversationsWithDetails({ search, filter, customerId } = {}) 
       OR c.phone ILIKE $${params.length + 1}
     )`;
     params.push(`%${search}%`);
+  }
+
+  if (storeId) {
+    whereClause += ` AND (
+      (m.ticket_id IS NOT NULL AND EXISTS (SELECT 1 FROM tickets t WHERE t.id = m.ticket_id AND t.store_id = $${params.length + 1}))
+      OR
+      (m.order_id IS NOT NULL AND EXISTS (SELECT 1 FROM orders o WHERE o.id = m.order_id AND o.store_id = $${params.length + 1}))
+    )`;
+    params.push(storeId);
   }
 
   let typeFilterClause = '';

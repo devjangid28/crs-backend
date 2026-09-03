@@ -347,7 +347,7 @@ router.get('/search', authenticate, async (req, res, next) => {
 // ════════════════════════════════════════════════════════════════
 router.get('/', authenticate, async (req, res, next) => {
   try {
-    const { search, status, store_id, brand, category, serial_number, page = 1, limit = 50 } = req.query;
+    const { search, status, store_id, brand, category, accessories_type, serial_number, page = 1, limit = 50 } = req.query;
     const storeIds = await getUserStoreIds(req.user);
     if (storeIds.length === 0) return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 50, totalPages: 0 } });
 
@@ -366,6 +366,7 @@ router.get('/', authenticate, async (req, res, next) => {
     if (status) { params.push(status); where += ` AND ii.status = $${params.length}`; }
     if (brand) { params.push(brand); where += ` AND ii.brand ILIKE $${params.length}`; }
     if (category) { params.push(category); where += ` AND ii.category = $${params.length}`; }
+    if (accessories_type) { params.push(accessories_type); where += ` AND ii.accessories_type = $${params.length}`; }
     if (serial_number) { params.push(`%${serial_number}%`); where += ` AND ii.serial_number ILIKE $${params.length}`; }
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -488,6 +489,7 @@ router.post('/', authenticate, async (req, res, next) => {
       productName, brand, model, processor, ram, storage, graphicsCard,
       displaySize, displayResolution, operatingSystem, batteryCondition,
       chargerIncluded, color, generation, otherSpecifications,
+      series, accessoriesType,
       warranty, purchaseDate, supplier,
       purchasePrice, sellingPrice, serialNumber, barcode, sku,
       storeId, status, remarks, category,
@@ -608,6 +610,7 @@ router.post('/', authenticate, async (req, res, next) => {
             product_name, brand, model, processor, ram, storage, graphics_card,
             display_size, display_resolution, operating_system, battery_condition,
             charger_included, color, generation, other_specifications,
+            series, accessories_type,
             warranty, purchase_date, supplier,
             purchase_price, selling_price, serial_number, barcode, sku,
             store_id, status, remarks, category, created_by, created_at, updated_at,
@@ -617,13 +620,14 @@ router.post('/', authenticate, async (req, res, next) => {
             purchase_order_no, supplier_invoice_no, purchase_ledger,
             check_no, part_no, purchase_place, invoice_date,
             basic_amount, gst_amount, amount_with_gst
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52)
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54)
           RETURNING *`,
           [
             productName.trim(), brand || null, model || null, processor || null, ram || null,
             storage || null, graphicsCard || null, displaySize || null,
             displayResolution || null, operatingSystem || null, batteryCondition || null,
             chargerIncluded || null, unitColor || null, generation || null, otherSpecifications || null,
+            series || null, accessoriesType || null,
             warranty || null, purchaseDate || null, supplier || null,
             purchasePrice || 0, effectiveSellingPrice, sn,
             barcode || null, sku || null, storeId,
@@ -711,6 +715,7 @@ router.post('/', authenticate, async (req, res, next) => {
         product_name, brand, model, processor, ram, storage, graphics_card,
         display_size, display_resolution, operating_system, battery_condition,
         charger_included, color, generation, other_specifications,
+        series, accessories_type,
         warranty, purchase_date, supplier,
         purchase_price, selling_price, serial_number, barcode, sku,
         store_id, status, remarks, category, created_by, created_at, updated_at,
@@ -720,13 +725,14 @@ router.post('/', authenticate, async (req, res, next) => {
         purchase_order_no, supplier_invoice_no, purchase_ledger,
         check_no, part_no, purchase_place, invoice_date,
         basic_amount, gst_amount, amount_with_gst
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54)
       RETURNING *`,
       [
         productName, brand || null, model || null, processor || null, ram || null,
         storage || null, graphicsCard || null, displaySize || null,
         displayResolution || null, operatingSystem || null, batteryCondition || null,
         chargerIncluded || null, color || null, generation || null, otherSpecifications || null,
+        series || null, accessoriesType || null,
         warranty || null, purchaseDate || null, supplier || null,
         purchasePrice || 0, effectiveSellingPrice, serialNumber.trim(),
         barcode || null, sku || null, storeId,
@@ -843,6 +849,7 @@ router.put('/:id', authenticate, async (req, res, next) => {
       displayResolution: 'display_resolution', operatingSystem: 'operating_system',
       batteryCondition: 'battery_condition', chargerIncluded: 'charger_included',
       color: 'color', generation: 'generation', otherSpecifications: 'other_specifications',
+      series: 'series', accessoriesType: 'accessories_type',
       warranty: 'warranty', purchaseDate: 'purchase_date', supplier: 'supplier',
       purchasePrice: 'purchase_price', sellingPrice: 'selling_price',
       serialNumber: 'serial_number', barcode: 'barcode', sku: 'sku',

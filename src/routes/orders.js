@@ -159,12 +159,14 @@ router.post('/', async (req, res, next) => {
     const orderNumber = await generateOrderNumber(client);
 
     const {
-      customerName, mobileNumber, address, orderDate, deviceType,
+      customerName, mobileNumber, email, address, orderDate, deviceType,
       desktopType, brand, model, serialNumber, problemDescription, orderNote,
       serviceAmount = 0, partsAmount = 0, additionalCharges = 0,
       discount = 0, advancePayment = 0, advancePaymentMode,
       paymentType = 'Cash',
-      deliveryDate, createdBy, components = [], storeId, specifications
+      deliveryDate, createdBy, components = [], storeId, specifications,
+      warranty, accessoryType, customAccessory, partNo,
+      financeDownPayment, financeEmi, financeDuration
     } = req.body;
 
     const serviceAmt = parseFloat(serviceAmount) || 0;
@@ -172,12 +174,18 @@ router.post('/', async (req, res, next) => {
     const additional = parseFloat(additionalCharges) || 0;
     const disc = parseFloat(discount) || 0;
 
+    // ASUS store: the entered Customer Amount is GST-inclusive. GST is
+    // recorded for reference but is NOT added on top of the amount.
+    // Non-ASUS stores keep the existing GST-inclusive calculation.
+    const store = await getStoreInfo(storeId || null);
+    const isAsusStore = String(store?.store_name || '').toLowerCase().includes('asus');
+
     // Calculate component totals
     const componentsTotal = Array.isArray(components) ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
     const subtotal = serviceAmt + componentsTotal;
     const gstRate = 0.18;
-    const gstAmount = subtotal * gstRate;
-    const grandTotal = subtotal + gstAmount - disc;
+    const gstAmount = isAsusStore ? subtotal * gstRate : subtotal * gstRate;
+    const grandTotal = isAsusStore ? (subtotal - disc) : (subtotal + gstAmount - disc);
 
     const advance = parseFloat(advancePayment) || 0;
     const remainingBalance = grandTotal - advance;
@@ -195,21 +203,26 @@ router.post('/', async (req, res, next) => {
 
     const insertResult = await client.query(
       `INSERT INTO orders (
-        order_number, customer_name, mobile_number, address, order_date,
+        order_number, customer_name, mobile_number, email, address, order_date,
         device_type, desktop_type, brand, model, serial_number,
         problem_description, order_note, delivery_date, service_amount, parts_amount,
         additional_charges, discount, total_amount, advance_payment,
         advance_payment_mode, remaining_balance, payment_status, payment_type, created_by,
-        store_id, subtotal, gst_amount, grand_total, specifications, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+        store_id, subtotal, gst_amount, grand_total, specifications, warranty,
+        accessory_type, custom_accessory, part_no,
+        finance_down_payment, finance_emi, finance_duration, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)
       RETURNING id`,
       [
-        orderNumber, customerName, mobileNumber, address, orderDateVal,
+        orderNumber, customerName, mobileNumber, email || null, address, orderDateVal,
         deviceType, desktopType || null, brand || null, model || null, serialNumber || null,
         problemDescription || null, orderNote || null, deliveryDate || null,
         serviceAmt, partsAmt, additional, disc, grandTotal,
         advance, advancePaymentMode || null, remainingBalance, paymentStatus, paymentType, createdBy || null,
-        storeId || null, subtotal, gstAmount, grandTotal, specsJson, now, now
+        storeId || null, subtotal, gstAmount, grandTotal, specsJson, warranty || null,
+        accessoryType || null, customAccessory || null, partNo || null,
+        parseFloat(financeDownPayment) || null, parseFloat(financeEmi) || null,
+        parseInt(financeDuration, 10) || null, now, now
       ]
     );
 
@@ -342,6 +355,7 @@ router.put('/:id', async (req, res, next) => {
     const fieldMapping = {
       customerName: 'customer_name',
       mobileNumber: 'mobile_number',
+      email: 'email',
       address: 'address',
       orderDate: 'order_date',
       deviceType: 'device_type',
@@ -355,6 +369,13 @@ router.put('/:id', async (req, res, next) => {
       orderNote: 'order_note',
       createdBy: 'created_by',
       storeId: 'store_id',
+      warranty: 'warranty',
+      accessoryType: 'accessory_type',
+      customAccessory: 'custom_accessory',
+      partNo: 'part_no',
+      financeDownPayment: 'finance_down_payment',
+      financeEmi: 'finance_emi',
+      financeDuration: 'finance_duration',
     };
 
     const setClauses = ['service_amount = $1', 'parts_amount = $2', 'additional_charges = $3',
@@ -422,16 +443,50 @@ router.put('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /api/orders/:id - Delete order (soft)
+// DELETE /api/orders/:id - Permanently delete the order and all of its entries
 router.delete('/:id', async (req, res, next) => {
+  const client = await getConnection();
+  const orderId = parseInt(req.params.id, 10);
+  if (isNaN(orderId)) {
+    client.release();
+    return res.status(400).json({ success: false, message: 'Invalid order id' });
+  }
   try {
-    const result = await query('UPDATE orders SET is_active = false WHERE id = ?', [req.params.id]);
-    if (result.rowCount === 0) {
+    await client.query('BEGIN');
+
+    const existing = await client.query('SELECT id FROM orders WHERE id = $1', [orderId]);
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      client.release();
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
+
+    // Delete any PDF records whose owning invoices belong to this order.
+    await client.query(
+      `DELETE FROM invoice_pdfs WHERE invoice_id IN (SELECT id FROM invoices WHERE order_id = $1)`,
+      [orderId]
+    );
+
+    // Delete invoices generated from this order.
+    await client.query(`DELETE FROM invoices WHERE order_id = $1`, [orderId]);
+
+    // Delete chat / WhatsApp log entries linked to this order.
+    await client.query(`DELETE FROM messages WHERE order_id = $1`, [orderId]);
+    await client.query(`DELETE FROM whatsapp_message_log WHERE order_id = $1`, [orderId]);
+
+    // Delete the order's components (cascades automatically as a safety net).
+    await client.query(`DELETE FROM order_components WHERE order_id = $1`, [orderId]);
+
+    // Finally remove the order itself.
+    await client.query(`DELETE FROM orders WHERE id = $1`, [orderId]);
+
+    await client.query('COMMIT');
     res.json({ success: true, message: 'Order deleted successfully' });
   } catch (err) {
+    await client.query('ROLLBACK');
     next(err);
+  } finally {
+    client.release();
   }
 });
 

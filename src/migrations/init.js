@@ -276,6 +276,112 @@ const runMigrations = async () => {
       END $$;
     `);
 
+    // Add email/warranty/accessory columns to orders if missing.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'email'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN email VARCHAR(191) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'warranty'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN warranty VARCHAR(50) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'accessory_type'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN accessory_type VARCHAR(100) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'custom_accessory'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN custom_accessory TEXT DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Add finance payment details to orders if missing.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'finance_down_payment'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN finance_down_payment DECIMAL(12,2) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'finance_emi'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN finance_emi DECIMAL(12,2) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'finance_duration'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN finance_duration INTEGER DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Add finance payment details to invoices if missing.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'invoices' AND column_name = 'finance_down_payment'
+        ) THEN
+          ALTER TABLE invoices ADD COLUMN finance_down_payment DECIMAL(12,2) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'invoices' AND column_name = 'finance_emi'
+        ) THEN
+          ALTER TABLE invoices ADD COLUMN finance_emi DECIMAL(12,2) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'invoices' AND column_name = 'finance_duration'
+        ) THEN
+          ALTER TABLE invoices ADD COLUMN finance_duration INTEGER DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
     await targetPool.query(schema);
 
     console.log('Database migrations completed successfully!');

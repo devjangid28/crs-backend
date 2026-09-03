@@ -97,16 +97,20 @@ function populateOrderTemplate(order, components, settings) {
 
   // ── CUSTOMER DETAILS ──
   html = html.replace(
-    /(<div[^>]*id="customerName"[^>]*>)[^<]*(<\/div>)/,
+    /(<td[^>]*id="customerName"[^>]*>)[^<]*(<\/td>)/,
     '$1' + (order.customer_name || '') + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="customerMobile"[^>]*>)[^<]*(<\/div>)/,
+    /(<td[^>]*id="customerMobile"[^>]*>)[^<]*(<\/td>)/,
     '$1' + (order.mobile_number || '') + '$2'
   );
   html = html.replace(
-    /(<div[^>]*id="customerAddress"[^>]*>)[^<]*(<\/div>)/,
+    /(<span[^>]*id="customerAddress"[^>]*>)[^<]*(<\/span>)/,
     '$1' + (order.address || '') + '$2'
+  );
+  html = html.replace(
+    /(<td[^>]*id="customerEmail"[^>]*>)[^<]*(<\/td>)/,
+    '$1' + (order.email || '—') + '$2'
   );
 
   // ── DEVICE DETAILS ──
@@ -123,6 +127,34 @@ function populateOrderTemplate(order, components, settings) {
     /(<td[^>]*id="modelSerial"[^>]*>)[^<]*(<\/td>)/,
     '$1' + modelSerial + '$2'
   );
+  html = html.replace(
+    /(<td[^>]*id="deviceTypePrint"[^>]*>)[^<]*(<\/td>)/,
+    '$1' + (order.device_type || '') + '$2'
+  );
+  html = html.replace(
+    /(<td[^>]*id="customerWarranty"[^>]*>)[^<]*(<\/td>)/,
+    '$1' + (order.warranty || '—') + '$2'
+  );
+
+  // Accessory details (for device_type = 'Accessories')
+  if (String(order.device_type || '').toLowerCase() === 'accessories') {
+    let accessoryDetail = order.accessory_type || '';
+    if (order.accessory_type === 'Custom' && order.custom_accessory) {
+      accessoryDetail = order.custom_accessory;
+    }
+    html = html.replace(
+      /(<td[^>]*id="accessoryDetail"[^>]*>)[^<]*(<\/td>)/,
+      '$1' + (accessoryDetail || '—') + '$2'
+    );
+    html = html.replace(
+      /(<tr id="accessoryRow")\s*style="display:none;"/,
+      '$1 style="display:table-row;"'
+    );
+    html = html.replace(
+      /(<td[^>]*id="deviceBrand"[^>]*>)[^<]*(<\/td>)/,
+      '$1' + accessoryDetail + '$2'
+    );
+  }
 
   // ── DESCRIPTION ──
   if (order.problem_description && String(order.problem_description).trim()) {
@@ -207,6 +239,28 @@ function populateOrderTemplate(order, components, settings) {
     /(<[^>]*\sid="paymentMode"[^>]*>)[^<]*(<\/\w+>)/,
     '$1' + (order.payment_type || 'Cash') + '$2'
   );
+
+  // ── FINANCE DETAILS (only when payment type is Finance) ──
+  if ((order.payment_type || '') === 'Finance') {
+    html = html.replace(
+      /(<[^>]*\sid="financeDownPayment"[^>]*>)[^<]*(<\/\w+>)/,
+      '$1' + fmtCurrency(order.finance_down_payment) + '$2'
+    );
+    html = html.replace(
+      /(<[^>]*\sid="financeEmi"[^>]*>)[^<]*(<\/\w+>)/,
+      '$1' + fmtCurrency(order.finance_emi) + '$2'
+    );
+    html = html.replace(
+      /(<[^>]*\sid="financeDuration"[^>]*>)[^<]*(<\/\w+>)/,
+      '$1' + (parseInt(order.finance_duration, 10) || 0) + ' months' + '$2'
+    );
+    html = html.replace(
+      /(<div[^>]*id="financeBlock"[^>]*>)/,
+      '$1'
+    );
+    html = html
+      .replace('id="financeBlock" style="display:none;', 'id="financeBlock" style="display:block;');
+  }
 
   // ── SPECIFICATIONS ──
   let specs = order.specifications;
