@@ -717,13 +717,16 @@ async function generateOrderPdfFromHTML(orderId) {
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];
 
+  const prodRes = await query('SELECT * FROM order_products WHERE order_id = $1', [orderId]);
+  const products = prodRes.rows || [];
+
   const dir = path.join(PDF_DIR, 'orders');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const fileName = `Order_Inward_${order.order_number}.pdf`;
   const filePath = path.join(dir, fileName);
 
-  let html = populateOrderTemplate(order, components, store);
+  let html = populateOrderTemplate(order, components, store, products);
 
   const browser = await puppeteer.launch({
     headless: true,

@@ -189,7 +189,7 @@ router.post('/sync-from-tally', async (req, res, next) => {
 // POST /api/customers - Create customer
 router.post('/', validateCustomer, async (req, res, next) => {
   try {
-    const { name, company, phone, phone2, email, address, addressLine2, city, state, pincode, postcode, country, storeId, store_id } = req.body;
+    const { name, company, phone, phone2, email, address, addressLine2, city, state, pincode, postcode, country, gstin, storeId, store_id } = req.body;
     const pc = pincode || postcode;
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     let resolvedStoreId = storeId || store_id || null;
@@ -199,9 +199,9 @@ router.post('/', validateCustomer, async (req, res, next) => {
     }
 
     const result = await query(
-      `INSERT INTO customers (name, company, phone, phone2, email, address, address_line2, city, state, postcode, country, store_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-      [name, company || null, phone, phone2 || null, email || null, address || null, addressLine2 || null, city || null, state || null, pc || null, country || 'India', resolvedStoreId, now, now]
+      `INSERT INTO customers (name, company, phone, phone2, email, address, address_line2, city, state, postcode, country, store_id, gstin, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      [name, company || null, phone, phone2 || null, email || null, address || null, addressLine2 || null, city || null, state || null, pc || null, country || 'India', resolvedStoreId, gstin || null, now, now]
     );
 
     const insertId = result.rows[0].id;
@@ -226,7 +226,8 @@ router.put('/:id', async (req, res, next) => {
     const fieldMapping = {
       name: 'name', company: 'company', phone: 'phone', phone2: 'phone2',
       email: 'email', address: 'address', addressLine2: 'address_line2',
-      city: 'city', state: 'state', pincode: 'postcode', postcode: 'postcode', country: 'country'
+      city: 'city', state: 'state', pincode: 'postcode', postcode: 'postcode', country: 'country',
+      gstin: 'gstin'
     };
 
     const setClauses = [];

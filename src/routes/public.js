@@ -6,6 +6,18 @@ const { query } = require('../config/database');
 const { validateSecureToken, markTokenUsed, getOrCreateToken } = require('../services/tokenService');
 const { logAudit, actions } = require('../services/auditService');
 const { authenticate } = require('../middleware/auth');
+const { sendReviewLinkTemplate, sendTextMessage, isEnabled, getConversationIdFromPhone } = require('../services/whatsappService');
+
+async function getStoreInfo(storeId) {
+  if (storeId) {
+    const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
+    if (sRes.rows.length > 0) return sRes.rows[0];
+  }
+  const dRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+  if (dRes.rows.length > 0) return dRes.rows[0];
+  const fRes = await query('SELECT * FROM store_settings LIMIT 1');
+  return fRes.rows[0] || {};
+}
 
 // Helper: serve HTML page
 function servePage(res, pageName) {
@@ -238,6 +250,22 @@ router.post('/collection/:ticketId/:token/confirm', async (req, res, next) => {
     });
 
     const googleReviewUrl = 'https://g.page/r/CadbqLfOAXFREBM/review';
+
+    // Auto-send the Google review link template — ONLY for Bluechip (non-ASUS)
+    // store tickets, once the device has been collected. Fire-and-forget.
+    try {
+      const store = await getStoreInfo(ticket.store_id);
+      const isAsusStore = String(store?.store_name || '').toLowerCase().includes('asus');
+      if (!isAsusStore) {
+        setImmediate(async () => {
+          await sendReviewLinkTemplate(ticket).catch(e =>
+            console.error('Auto-send review link failed:', e.message)
+          );
+        });
+      }
+    } catch (e) {
+      console.error('Review link auto-send error:', e.message);
+    }
 
     res.json({
       success: true,

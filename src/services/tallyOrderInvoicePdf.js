@@ -72,21 +72,29 @@ async function getStoreData(storeId) {
 }
 
 // Mirrors buildOrderInvoiceItems in ManageOrders.jsx
-function buildOrderInvoiceItems(order, components) {
+function buildOrderInvoiceItems(order, components, products) {
   const items = [];
   const accessoryName = order.accessory_type === 'Custom' ? (order.custom_accessory || 'Custom Accessory') : (order.accessory_type || '');
+  const orderModel = order.model || '';
+  const orderPartNo = order.part_no || '';
+  const orderCheckNo = order.check_no || '';
+  const orderWarranty = order.warranty || '';
+  const orderSerial = order.serial_number || '';
   const svcAmt = parseFloat(order.service_amount) || 0;
   if (svcAmt > 0) {
     items.push({
-      name: order.device_type === 'Accessories' ? `Accessories${accessoryName ? ' - ' + accessoryName : ''}` : `${order.device_type || ''}${order.brand ? ' - ' + order.brand + ' ' + (order.model || '') : ''}`,
+      name: order.device_type === 'Accessories' ? `Accessories${accessoryName ? ' - ' + accessoryName : ''}` : `${order.device_type || ''}${order.brand ? ' - ' + order.brand + ' ' + orderModel : ''}`,
       description: order.problem_description || '',
       qty: 1,
       price: svcAmt,
-      serialNumber: order.serial_number || '',
+      serialNumber: orderSerial,
+      modelNo: orderModel,
+      partNo: orderPartNo,
+      checkNo: orderCheckNo,
       tax: 18,
       hsn: '',
       batch: '',
-      warranty: '',
+      warranty: orderWarranty,
       discount: 0,
     });
   }
@@ -101,6 +109,9 @@ function buildOrderInvoiceItems(order, components) {
         qty: compQty,
         price: compPrice || (compAmount / compQty),
         serialNumber: '',
+        modelNo: '',
+        partNo: '',
+        checkNo: '',
         tax: 18,
         hsn: '',
         batch: '',
@@ -109,30 +120,62 @@ function buildOrderInvoiceItems(order, components) {
       });
     }
   });
-  if (items.length === 0 && (parseFloat(order.total_amount) || 0) > 0) {
+  // Product rows (ASUS multi-item sales orders: repeatable device blocks +
+  // accessory rows) - each becomes its own invoice line item so the customer
+  // sees every device / accessory they bought, one below another.
+  (Array.isArray(products) ? products : []).forEach(prod => {
+    const prodName = prod.product_name || '';
+    const prodAcc = prod.accessory_type || '';
+    const lineName = prodName.trim()
+      ? (prodAcc && prodAcc !== 'Accessories' ? `${prodName} - ${prodAcc}` : prodName)
+      : (prodAcc ? `Accessories - ${prodAcc}` : 'Accessories');
+    const prodQty = parseInt(prod.quantity, 10) || 1;
+    const prodRate = parseFloat(prod.rate) || 0;
+    const total = parseFloat(prod.amount) || (prodRate * prodQty);
+    if (!lineName.trim() && total <= 0) return;
     items.push({
-      name: order.device_type === 'Accessories' ? `Accessories${accessoryName ? ' - ' + accessoryName : ''}` : `${order.device_type || ''}${order.brand ? ' - ' + order.brand : ''}`,
-      description: order.problem_description || order.order_note || '',
-      qty: 1,
-      price: parseFloat(order.total_amount) || 0,
-      serialNumber: order.serial_number || '',
+      name: lineName,
+      description: '',
+      qty: total > 0 ? prodQty : 1,
+      price: prodRate > 0 ? prodRate : total,
+      serialNumber: prod.serial_number || '',
+      modelNo: prod.product_model || '',
+      partNo: prod.part_no || orderPartNo,
+      checkNo: prod.check_no || orderCheckNo,
       tax: 18,
       hsn: '',
       batch: '',
-      warranty: '',
+      warranty: prod.warranty || '',
+      discount: 0,
+    });
+  });
+  if (items.length === 0 && (parseFloat(order.total_amount) || 0) > 0) {
+    items.push({
+      name: order.device_type === 'Accessories' ? `Accessories${accessoryName ? ' - ' + accessoryName : ''}` : `${order.device_type || ''}${order.brand ? ' - ' + order.brand + ' ' + orderModel : ''}`,
+      description: order.problem_description || order.order_note || '',
+      qty: 1,
+      price: parseFloat(order.total_amount) || 0,
+      serialNumber: orderSerial,
+      modelNo: orderModel,
+      partNo: orderPartNo,
+      checkNo: orderCheckNo,
+      tax: 18,
+      hsn: '',
+      batch: '',
+      warranty: orderWarranty,
       discount: 0,
     });
   }
   return items;
 }
 
-function buildInvoiceHTML(order, components, store) {
+function buildInvoiceHTML(order, components, store, products) {
   const taxRate = 18;
   const cgstRate = taxRate / 2;
   const sgstRate = taxRate / 2;
   const isAsus = isAsusStore(store.store_name);
 
-  const items = buildOrderInvoiceItems(order, components);
+  const items = buildOrderInvoiceItems(order, components, products);
 
   const lineTotals = items.map((i) => {
     const qty = parseInt(i.qty) || 1;
@@ -168,6 +211,7 @@ function buildInvoiceHTML(order, components, store) {
 
   const custName = order.customer_name || 'Walk-in Customer';
   const custAddr = order.address || '';
+  const remark = order.remark || '';
   const custState = state || 'Gujarat';
   const custPhone = order.mobile_number || '';
   const custEmail = order.email || '';
@@ -190,7 +234,7 @@ function buildInvoiceHTML(order, components, store) {
   let asusEmail = emailAddr;
   let asusWebsite = '';
   if (isAsus) {
-    asusCompanyName = 'ASUS EXCLUSIVE STORE';
+    asusCompanyName = 'BLUECHIP COMPUTER SYSTEM [ASUS EXCLUSIVE STORE]';
     asusAddr = '05, Harmony complex, Opp. MK High School, Alkapuri, Vadodara-07';
     asusPhone = '9904991114';
     asusEmail = 'bluechipcs@yahoo.com';
@@ -206,7 +250,7 @@ function buildInvoiceHTML(order, components, store) {
   try {
     if (fs.existsSync(stampPath)) {
       const ext = path.extname(stampPath).slice(1).toLowerCase() === 'png' ? 'png' : 'jpeg';
-      stampImg = `<img src="data:image/${ext};base64,${fs.readFileSync(stampPath).toString('base64')}" alt="Stamp & Sign" style="max-width:100px;max-height:60px;object-fit:contain;margin:0 auto 4px;" />`;
+      stampImg = `<img src="data:image/${ext};base64,${fs.readFileSync(stampPath).toString('base64')}" alt="Stamp & Sign" style="max-width:140px;max-height:90px;object-fit:contain;margin:24px auto 8px;" />`;
     }
   } catch (e) {
     stampImg = '';
@@ -220,9 +264,12 @@ function buildInvoiceHTML(order, components, store) {
     const hsn = item.hsn || '84713010';
     const descLines = [
       `<div style="font-weight:bold">${esc(item.name || 'Service')}</div>`,
+      item.serialNumber ? `<div>Serial No: ${esc(item.serialNumber)}</div>` : '',
+      item.modelNo ? `<div>Model No: ${esc(item.modelNo)}</div>` : '',
+      item.partNo ? `<div>Part No: ${esc(item.partNo)}</div>` : '',
+      item.checkNo ? `<div>Check No: ${esc(item.checkNo)}</div>` : '',
+      item.warranty && String(item.warranty).toLowerCase().trim() !== 'no warranty' ? `<div>Warranty: ${String(item.warranty).toUpperCase()} OF HARDWARE WARRANTY</div>` : '',
       item.batch ? `<div>Batch: ${esc(item.batch)}</div>` : '',
-      item.serialNumber ? `<div>S/N: ${esc(item.serialNumber)}</div>` : '',
-      item.warranty ? `<div>${esc(item.warranty)}</div>` : '',
       item.description ? `<div style="font-size:7.5px">${esc(item.description)}</div>` : '',
     ].filter(Boolean).join('');
     return `<tr>
@@ -275,10 +322,10 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
 <tr>
   <td style="width:60%;border-right:1px solid #777;padding:4px 5px;vertical-align:top">
     <table style="width:100%"><tr>
-      <td style="width:60px;vertical-align:top;padding-right:6px">
+      <td style="width:60px;vertical-align:top;padding-right:6px;border-right:1px solid #777">
         ${logoSrc ? `<img src="${esc(logoSrc)}" style="max-width:110px;max-height:120px;object-fit:contain" />` : ''}
       </td>
-      <td style="vertical-align:top">
+      <td style="vertical-align:top;padding-left:8px">
         <div style="font-size:9px;font-weight:bold;line-height:1.4">${esc(asusCompanyName)}</div>
         <div style="font-size:7.5px;line-height:1.6">
           ${asusAddr ? `<div>${esc(asusAddr)}</div>` : ''}
@@ -296,13 +343,9 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
     <table style="width:100%">
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Invoice No.</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(terms === 'Finance' ? 'FIN-' : 'INV-')}${esc(orderNumber)}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Dated</td><td style="border-bottom:1px solid #777;padding:2px 4px">${invoiceDate}</td></tr>
-      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Delivery Note</td><td style="border-bottom:1px solid #777;padding:2px 4px"></td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Mode/Terms of Payment</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(terms)}${isFinance ? '<br/><span style="font-size:6.5px">Finance: Down ' + fmtINR(financeDown) + ' + EMI ' + fmtINR(financeEmi) + '/mo for ' + financeDur + ' months</span>' : ''}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Reference No. &amp; Date</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(orderNumber)} / ${invoiceDate}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Buyer's Order No.</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(orderNumber)}</td></tr>
-      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Dispatch Doc No.</td><td style="border-bottom:1px solid #777;padding:2px 4px"></td></tr>
-      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Delivery Note Date</td><td style="border-bottom:1px solid #777;padding:2px 4px"></td></tr>
-      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Dispatched through</td><td style="border-bottom:1px solid #777;padding:2px 4px"></td></tr>
       <tr><td style="border-right:1px solid #777;padding:2px 4px" class="lbl">Destination</td><td style="padding:2px 4px">${esc(custCity)}</td></tr>
     </table>
   </td>
@@ -355,7 +398,19 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
 </thead>
 <tbody>
 ${itemRows || '<tr><td colspan="11" style="border:1px solid #777;padding:2px 3px;text-align:center">No items</td></tr>'}
-<tr><td colspan="11" style="border:1px solid #777;height:35mm"></td></tr>
+<tr>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;height:35mm"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;vertical-align:top;padding:3px 5px"><div style="font-size:7.5px;line-height:1.5">${remark ? 'Remark: ' + esc(remark) : ''}</div></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+</tr>
 <tr>
   <td colspan="5" style="border:1px solid #777;padding:2px 4px;font-weight:bold">Total</td>
   <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(taxableValue)}</td>
@@ -419,13 +474,23 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
 </table>
 <table style="width:100%;border:1px solid #777;border-top:none">
 <tr>
-  <td style="width:70%;border-right:1px solid #777;padding:3px 5px;vertical-align:top">
-    <div style="font-size:7.5px;color:#555;text-align:center">This is a Computer Generated Invoice</div>
+  <td style="width:70%;border-right:1px solid #777;padding:4px 6px;vertical-align:top">
+    <div style="font-weight:bold;font-size:8px;margin-bottom:3px">ASUS PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -</div>
+    <div style="font-size:7.5px;line-height:1.6">
+      <div><b>1. Product Opening &amp; Demonstration</b><br/>The ASUS product has been opened and demonstrated in the presence of the customer.</div>
+      <div><b>2. Product Inspection</b><br/>The customer has thoroughly inspected and checked the product. No issues or defects were found at the time of inspection.</div>
+      <div><b>3. Extended Warranty Information</b><br/>The ASUS Promoter has explained the available Extended Warranty options and applicable terms &amp; conditions to the customer.</div>
+      <div><b>4. Customer Support</b><br/>For any assistance or support, the customer may contact the ASUS Exclusive Store during working hours at +91 99049 91114.</div>
+      <div><b>5. Store Availability</b><br/>The ASUS Exclusive Store is open 7 days a week for customer assistance and support.</div>
+      <div><b>6. DOA (DEAD ON ARRIVAL) POLICY</b><br/>In case of a DOA (Dead on Arrival) claim, the product is eligible for DOA consideration only within 7 working days from the date of invoice, subject to the applicable ASUS DOA Policy.</div>
+      <div>The system must first be submitted to an authorized ASUS Service Centre for inspection and verification. The final decision regarding DOA eligibility and replacement will be made by ASUS/its authorized Service Centre based on their inspection and approval.</div>
+      <div>The store will not be responsible for the approval or rejection of any DOA replacement. All DOA claims and replacements will be governed strictly by the applicable ASUS Policy and its terms &amp; conditions.</div>
+    </div>
   </td>
   <td style="width:30%;padding:3px 5px;vertical-align:top;text-align:center">
-    ${stampImg}
-    <div style="font-size:8px;font-weight:bold">For ${esc(asusCompanyName)}</div>
-    <div style="height:20px"></div>
+    ${stampImg ? `<div style="text-align:center;margin-bottom:4px">${stampImg}</div>` : ''}
+    <div style="font-size:8px;font-weight:bold;margin-top:10px">For ${esc(asusCompanyName)}</div>
+    <div style="height:60px"></div>
     <div style="border-top:1px solid #000;font-size:7.5px;padding-top:2px">Authorised Signatory</div>
   </td>
 </tr>
@@ -442,13 +507,20 @@ async function generateOrderInvoicePdf(orderId) {
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];
 
+  const prodRes = await query(
+    `SELECT product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no
+     FROM order_products WHERE order_id = $1 ORDER BY id`,
+    [orderId]
+  );
+  const products = prodRes.rows || [];
+
   const store = await getStoreData(order.store_id);
 
   const orderNumber = order.order_number || orderId;
   const fileName = `Invoice_${orderNumber}.pdf`;
   const filePath = path.join(PDF_DIR, fileName);
 
-  const html = buildInvoiceHTML(order, components, store);
+  const html = buildInvoiceHTML(order, components, store, products);
 
   const browser = await puppeteer.launch({
     headless: true,

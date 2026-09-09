@@ -335,16 +335,21 @@ async function sendTemplateMessage(to, templateName, params, context = {}, extra
     },
   ];
 
-  // Header with an attached PDF (inward receipt). The document is delivered
-  // as a real file inside the template — no link pasted in the body.
-  if (extra.headerDocumentLink) {
+  // Header with an attached PDF (inward receipt / invoice). The document is
+  // delivered as a real file inside the template — no link pasted in the body.
+  // Accepts either a pre-uploaded media id (headerDocumentId) or a public URL
+  // (headerDocumentLink).
+  if (extra.headerDocumentId || extra.headerDocumentLink) {
+    const documentParam = extra.headerDocumentId
+      ? { id: extra.headerDocumentId }
+      : { link: extra.headerDocumentLink };
     components.unshift({
       type: 'header',
       parameters: [
         {
           type: 'document',
           document: {
-            link: extra.headerDocumentLink,
+            ...documentParam,
             filename: extra.documentFilename || 'receipt.pdf',
           },
         },
@@ -619,15 +624,126 @@ async function sendInwardReceiptLink(ticket, filePath) {
   const convId = getConversationIdFromPhone(phone);
   const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId };
 
-  // Direct PDF document send. NOTE: Meta only delivers free-form documents
-  // inside a 24h window that the customer opens by messaging first;
-  // otherwise Meta rejects it.
   if (!filePath) {
     return { success: false, error: 'No PDF file path to send' };
   }
-  const waResult = await sendDocumentFile(phone, filePath, `Inward Receipt - ${ticket.ticket_id || ''}`, ctx);
 
+  // Send the approved "inward_receipt" template with the PDF as a document
+  // header — delivers without waiting for a customer "hi" message.
+  const mediaId = await uploadPdfMedia(filePath);
+  if (mediaId) {
+    const params = [ticket.customer_name || 'Valued Customer', ticket.ticket_id || String(ticketId)];
+    const result = await sendTemplateMessage(
+      phone,
+      config.whatsapp.templateInward,
+      params,
+      ctx,
+      { headerDocumentId: mediaId, documentFilename: `Inward_Receipt_${ticket.ticket_id || ticketId}.pdf` }
+    );
+    if (result.success) return result;
+    wa.error('sendInwardReceiptLink: template send failed, falling back to document', { error: result.error, code: result.code, ticketId });
+  } else {
+    wa.error('sendInwardReceiptLink: media upload failed, falling back to document', { ticketId });
+  }
+
+  // Fallback: send the raw PDF document if the template is not approved yet.
+  const waResult = await sendDocumentFile(phone, filePath, `Inward Receipt - ${ticket.ticket_id || ''}`, ctx);
   return waResult;
+}
+
+// Upload a local PDF to WhatsApp and return its media id (or null on failure).
+async function uploadPdfMedia(filePath) {
+  try {
+    const uploadResult = await uploadMedia(filePath, 'application/pdf');
+    if (uploadResult.success && uploadResult.mediaId) return uploadResult.mediaId;
+  } catch (e) {
+    wa.error('uploadPdfMedia: exception', e);
+  }
+  return null;
+}
+
+// Send the approved "service_invoice" template with the service-invoice PDF
+// attached, when a repair ticket is marked Completed. Falls back to the raw
+// document if the template is not approved yet.
+async function sendServiceInvoiceTemplate(ticket, filePath) {
+  const ticketId = parseInt(ticket.id, 10);
+  const phone = ticket.customer_phone;
+  if (!ticketId || !phone) return { success: false, error: 'No ticket id or customer phone' };
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId };
+
+  if (!filePath) {
+    return { success: false, error: 'No PDF file path to send' };
+  }
+
+  const mediaId = await uploadPdfMedia(filePath);
+  if (mediaId) {
+    const params = [ticket.customer_name || 'Valued Customer', ticket.ticket_id || String(ticketId)];
+    const result = await sendTemplateMessage(
+      phone,
+      config.whatsapp.templateServiceInvoice,
+      params,
+      ctx,
+      { headerDocumentId: mediaId, documentFilename: `Service_Invoice_${ticket.ticket_id || ticketId}.pdf` }
+    );
+    if (result.success) return result;
+    wa.error('sendServiceInvoiceTemplate: template send failed, falling back to document', { error: result.error, code: result.code, ticketId });
+  } else {
+    wa.error('sendServiceInvoiceTemplate: media upload failed, falling back to document', { ticketId });
+  }
+
+  const waResult = await sendDocumentFile(phone, filePath, `Service Invoice - ${ticket.ticket_id || ''}`, ctx);
+  return waResult;
+}
+
+// Send the approved "order_invoice" template with the order-invoice PDF
+// attached (used for ASUS store orders instead of the order form). Falls back
+// to the raw document if the template is not approved yet.
+async function sendOrderInvoiceTemplate(order, filePath) {
+  const orderId = parseInt(order.id, 10);
+  const phone = order.mobile_number;
+  if (!orderId || !phone) return { success: false, error: 'No order id or customer phone' };
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { orderId, sender: 'System', conversationId: convId };
+
+  if (!filePath) {
+    return { success: false, error: 'No PDF file path to send' };
+  }
+
+  const mediaId = await uploadPdfMedia(filePath);
+  if (mediaId) {
+    const params = [order.customer_name || 'Valued Customer', order.order_number || String(orderId)];
+    const result = await sendTemplateMessage(
+      phone,
+      config.whatsapp.templateOrderInvoice,
+      params,
+      ctx,
+      { headerDocumentId: mediaId, documentFilename: `Invoice_${order.order_number || orderId}.pdf` }
+    );
+    if (result.success) return result;
+    wa.error('sendOrderInvoiceTemplate: template send failed, falling back to document', { error: result.error, code: result.code, orderId });
+  } else {
+    wa.error('sendOrderInvoiceTemplate: media upload failed, falling back to document', { orderId });
+  }
+
+  const waResult = await sendDocumentFile(phone, filePath, `Invoice - ${order.order_number || ''}`, ctx);
+  return waResult;
+}
+
+// Send the approved "review_link" template (Google review request) to a
+// customer. Used only for Bluechip (non-ASUS) store tickets after collection.
+async function sendReviewLinkTemplate(ticket, context = {}) {
+  const ticketId = parseInt(ticket.id, 10);
+  const phone = ticket.customer_phone;
+  if (!ticketId || !phone) return { success: false, error: 'No ticket id or customer phone' };
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId, ...context };
+
+  const params = [ticket.customer_name || 'Valued Customer'];
+  return sendTemplateMessage(phone, config.whatsapp.templateReview, params, ctx);
 }
 
 async function sendDocumentFile(to, filePath, caption, context = {}) {
@@ -763,6 +879,9 @@ module.exports = {
   sendOrderTemplate,
   sendCollectionLink,
   sendInwardReceiptLink,
+  sendServiceInvoiceTemplate,
+  sendOrderInvoiceTemplate,
+  sendReviewLinkTemplate,
   sendWelcome,
   sendTicketDetails,
   sendOrderDetails,

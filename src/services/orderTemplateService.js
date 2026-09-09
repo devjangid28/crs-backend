@@ -23,7 +23,21 @@ function componentAmount(c) {
   return (parseFloat(c.price) || 0) * (parseInt(c.quantity, 10) || 1);
 }
 
-function populateOrderTemplate(order, components, settings) {
+// Build the full "Description of Goods" detail block for a product line so every
+// device / accessory shows one below another with its complete detail.
+function productDetailLines(p) {
+  const lines = [];
+  const type = p.accessory_type && p.accessory_type !== 'Accessories' ? p.accessory_type : '';
+  lines.push(String(p.product_name || 'Product') + (type ? ' - ' + type : ''));
+  if (p.product_model) lines.push('Model No: ' + p.product_model);
+  if (p.serial_number) lines.push('Serial No: ' + p.serial_number);
+  if (p.part_no) lines.push('Part No: ' + p.part_no);
+  if (p.check_no) lines.push('Check No: ' + p.check_no);
+  if (p.warranty) lines.push('Warranty: ' + p.warranty);
+  return lines;
+}
+
+function populateOrderTemplate(order, components, settings, products) {
   if (!fs.existsSync(TEMPLATE_PATH)) {
     throw new Error('Template file not found at ' + TEMPLATE_PATH);
   }
@@ -186,15 +200,46 @@ function populateOrderTemplate(order, components, settings) {
     );
   }
 
+  // ── PRODUCTS TABLE (ASUS multi-item sales orders) ──
+  if (products && products.length > 0) {
+    let pRows = '';
+    products.forEach(function(p, idx) {
+      const lineAmt = (parseFloat(p.amount) || ((parseFloat(p.rate) || 0) * (parseInt(p.quantity, 10) || 1))).toFixed(2);
+      const rate = parseFloat(p.rate || 0).toFixed(2);
+      const detail = productDetailLines(p);
+      const descHtml = '<div style="font-weight:bold;">' + detail[0] + '</div>' +
+        (detail.length > 1 ? '<div style="font-size:7.5px;line-height:1.6;margin-top:2px;">' +
+          detail.slice(1).join('<br>') + '</div>' : '');
+      const modelSerial = [p.product_model, p.serial_number].filter(Boolean).join(' / ');
+      pRows += '<tr><td>' + (idx + 1) + '</td><td>' + descHtml + '</td><td>' + (modelSerial || '') + '</td><td>' + (p.warranty || '') + '</td><td>' + (p.quantity || 1) + '</td><td>' + rate + '</td><td>' + lineAmt + '</td></tr>';
+    });
+    html = html.replace(
+      /<tbody id="productsTable">[\s\S]*?<\/tbody>/,
+      '<tbody id="productsTable">' + pRows + '</tbody>'
+    );
+    html = html.replace(
+      /(id="productsSection")\s*style="display:none;"/,
+      'id="productsSection" style="display:block;"'
+    );
+  }
+
   // ── FINANCIAL CALCULATIONS ──
   const componentsTotal = components ? components.reduce((sum, c) => sum + componentAmount(c), 0) : 0;
+  const productsTotal = products ? products.reduce(function(sum, p) {
+    const stored = parseFloat(p.amount) || 0;
+    if (stored > 0) return sum + stored;
+    return sum + ((parseFloat(p.rate) || 0) * (parseInt(p.quantity, 10) || 1));
+  }, 0) : 0;
   const serviceAmt = parseFloat(order.service_amount) || 0;
   const disc = parseFloat(order.discount) || 0;
-  const subtotal = serviceAmt + componentsTotal;
+  const subtotal = serviceAmt + componentsTotal + productsTotal;
   const gstRate = 0.18;
   const gstAmount = subtotal * gstRate;
+  const isAsusStore = String(settings?.store_name || '').toLowerCase().includes('asus');
   const amountBeforeDiscount = subtotal + gstAmount;
-  const grandTotal = amountBeforeDiscount - disc;
+  // For ASUS store the customer amount is GST-inclusive; GST is NOT added on top.
+  // For non-ASUS stores GST is added on top of the subtotal.
+  const grandTotal = isAsusStore ? (subtotal - disc) : (amountBeforeDiscount - disc);
   const advance = parseFloat(order.advance_payment) || 0;
   const remainingBalance = Math.max(0, grandTotal - advance);
 

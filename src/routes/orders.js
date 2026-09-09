@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { query, getConnection } = require('../config/database');
-const { notifyOrderCreated, sendDocumentFile, getConversationIdFromPhone } = require('../services/whatsappService');
+const { notifyOrderCreated, sendDocumentFile, sendOrderInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateOrderPdfFromHTML } = require('../services/pdfGenerator');
+const { generateOrderInvoicePdf } = require('../services/tallyOrderInvoicePdf');
 const { createPdfMessage } = require('../services/messagingService');
 
 async function getStoreInfo(storeId) {
@@ -17,6 +18,65 @@ async function getStoreInfo(storeId) {
 }
 
 const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+// Resolve a field that may arrive in either camelCase or snake_case.
+function srcVal(src, camelKey, snakeKey) {
+  if (src[camelKey] !== undefined && src[camelKey] !== null) return src[camelKey];
+  if (src[snakeKey] !== undefined && src[snakeKey] !== null) return src[snakeKey];
+  return undefined;
+}
+
+// Convert an ASUS "device block" (repeatable Device Type entries) into the same
+// shape used by order_products so devices + accessories appear one below another
+// in the invoice Description of Goods.
+function deviceToProduct(d) {
+  const deviceType = String(srcVal(d, 'deviceType', 'device_type') || '').trim();
+  const amount = parseFloat(srcVal(d, 'deviceAmount', 'device_amount')) || 0;
+  const isAccessory = deviceType.toLowerCase() === 'accessories';
+  const accessoryType = isAccessory
+    ? (srcVal(d, 'accessoryType', 'accessory_type') && srcVal(d, 'accessoryType', 'accessory_type') === 'Custom'
+        ? (srcVal(d, 'customAccessory', 'custom_accessory') || 'Custom')
+        : (srcVal(d, 'accessoryType', 'accessory_type') || ''))
+    : undefined;
+  return {
+    productName: (isAccessory ? 'Accessories' : deviceType) || 'Device',
+    productModel: srcVal(d, 'model', 'productModel') || srcVal(d, 'product_model', 'productModel') || undefined,
+    serialNumber: srcVal(d, 'serialNumber', 'serial_number') || undefined,
+    warranty: srcVal(d, 'warranty', 'warranty') || undefined,
+    partNo: srcVal(d, 'partNo', 'part_no') || undefined,
+    checkNo: srcVal(d, 'checkNo', 'check_no') || undefined,
+    accessoryType,
+    quantity: 1,
+    rate: amount,
+    amount,
+  };
+}
+
+// Combine repeatable device blocks + accessory product rows into one list.
+function mergeOrderProducts(devices, products) {
+  const deviceRows = Array.isArray(devices)
+    ? devices.filter(d => {
+        if (!d) return false
+        const dtype = (srcVal(d, 'deviceType', 'device_type') || '').trim()
+        if (!dtype) return false
+        const amount = parseFloat(srcVal(d, 'deviceAmount', 'device_amount')) || 0
+        if (amount > 0) return true
+        return dtype.toLowerCase() === 'accessories'
+      }).map(deviceToProduct)
+    : [];
+  const prodRows = Array.isArray(products) ? products.filter(p => p && (p.productName || p.product_name)) : [];
+  return deviceRows.concat(prodRows);
+}
+
+// Compute the summed amount of a merged order-products list.
+function sumOrderProducts(products) {
+  return (Array.isArray(products) ? products : []).reduce((sum, p) => {
+    const qty = parseInt(srcVal(p, 'quantity', 'quantity'), 10) || 1;
+    const rate = parseFloat(srcVal(p, 'rate', 'rate')) || 0;
+    const lineAmt = parseFloat(srcVal(p, 'amount', 'amount')) || (qty * rate);
+    return sum + lineAmt;
+  }, 0);
+}
 
 // Generate order number: ORD-YYYY-MMM-NNNN
 async function generateOrderNumber(client) {
@@ -80,7 +140,17 @@ router.get('/', async (req, res, next) => {
       'description', oc.description, 'warranty', oc.warranty,
       'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
       'remarks', oc.remarks, 'status', oc.status
-    )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+    )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components,
+    COALESCE((
+      SELECT json_agg(json_build_object(
+        'id', op.id, 'product_name', op.product_name,
+        'product_model', op.product_model, 'serial_number', op.serial_number,
+        'warranty', op.warranty, 'quantity', op.quantity,
+        'rate', op.rate, 'amount', op.amount,
+        'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+      ))
+      FROM order_products op WHERE op.order_id = o.id
+    ), '[]'::json) AS products
     FROM orders o
     LEFT JOIN order_components oc ON oc.order_id = o.id
     ${whereClause}
@@ -134,7 +204,17 @@ router.get('/:id', async (req, res, next) => {
         'description', oc.description, 'warranty', oc.warranty,
         'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
         'remarks', oc.remarks, 'status', oc.status
-      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components,
+      COALESCE((
+        SELECT json_agg(json_build_object(
+          'id', op.id, 'product_name', op.product_name,
+          'product_model', op.product_model, 'serial_number', op.serial_number,
+          'warranty', op.warranty, 'quantity', op.quantity,
+          'rate', op.rate, 'amount', op.amount,
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+        ))
+        FROM order_products op WHERE op.order_id = o.id
+      ), '[]'::json) AS products
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
       WHERE o.id = ?
@@ -165,8 +245,8 @@ router.post('/', async (req, res, next) => {
       discount = 0, advancePayment = 0, advancePaymentMode,
       paymentType = 'Cash',
       deliveryDate, createdBy, components = [], storeId, specifications,
-      warranty, accessoryType, customAccessory, partNo,
-      financeDownPayment, financeEmi, financeDuration
+      warranty, accessoryType, customAccessory, partNo, checkNo, remark,
+      gstin, financeDownPayment, financeEmi, financeDuration, products = [], devices = []
     } = req.body;
 
     const serviceAmt = parseFloat(serviceAmount) || 0;
@@ -182,7 +262,10 @@ router.post('/', async (req, res, next) => {
 
     // Calculate component totals
     const componentsTotal = Array.isArray(components) ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
-    const subtotal = serviceAmt + componentsTotal;
+    // Repeatable ASUS device blocks + accessory rows all live in order_products.
+    const mergedProducts = mergeOrderProducts(devices, products);
+    const productsTotal = sumOrderProducts(mergedProducts);
+    const subtotal = serviceAmt + componentsTotal + productsTotal;
     const gstRate = 0.18;
     const gstAmount = isAsusStore ? subtotal * gstRate : subtotal * gstRate;
     const grandTotal = isAsusStore ? (subtotal - disc) : (subtotal + gstAmount - disc);
@@ -209,9 +292,9 @@ router.post('/', async (req, res, next) => {
         additional_charges, discount, total_amount, advance_payment,
         advance_payment_mode, remaining_balance, payment_status, payment_type, created_by,
         store_id, subtotal, gst_amount, grand_total, specifications, warranty,
-        accessory_type, custom_accessory, part_no,
-        finance_down_payment, finance_emi, finance_duration, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)
+        accessory_type, custom_accessory, part_no, check_no, remark,
+        finance_down_payment, finance_emi, finance_duration, gstin, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
       RETURNING id`,
       [
         orderNumber, customerName, mobileNumber, email || null, address, orderDateVal,
@@ -220,9 +303,9 @@ router.post('/', async (req, res, next) => {
         serviceAmt, partsAmt, additional, disc, grandTotal,
         advance, advancePaymentMode || null, remainingBalance, paymentStatus, paymentType, createdBy || null,
         storeId || null, subtotal, gstAmount, grandTotal, specsJson, warranty || null,
-        accessoryType || null, customAccessory || null, partNo || null,
+        accessoryType || null, customAccessory || null, partNo || null, checkNo || null, remark || null,
         parseFloat(financeDownPayment) || null, parseFloat(financeEmi) || null,
-        parseInt(financeDuration, 10) || null, now, now
+        parseInt(financeDuration, 10) || null, gstin || null, now, now
       ]
     );
 
@@ -245,6 +328,87 @@ router.post('/', async (req, res, next) => {
       }
     }
 
+    // Insert multiple products (ASUS multi-item sales orders: repeatable device
+    // blocks + accessory rows)
+    if (mergedProducts.length > 0) {
+      for (const prod of mergedProducts) {
+        const qty = parseInt(srcVal(prod, 'quantity', 'quantity'), 10) || 1;
+        const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
+        const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
+        await client.query(
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [
+            orderId,
+            srcVal(prod, 'productName', 'product_name'),
+            srcVal(prod, 'productModel', 'product_model') || null,
+            srcVal(prod, 'serialNumber', 'serial_number') || null,
+            srcVal(prod, 'warranty', 'warranty') || null,
+            qty,
+            rate,
+            lineAmt,
+            srcVal(prod, 'accessoryType', 'accessory_type') || null,
+            srcVal(prod, 'partNo', 'part_no') || null,
+            srcVal(prod, 'checkNo', 'check_no') || null
+          ]
+        );
+      }
+    }
+
+    // Upsert the customer profile (name, phone, email, address, GSTIN) so the
+    // order form / customer history can auto-fill returning customers.
+    await client.query('SAVEPOINT cust_upsert_sp');
+    try {
+      const cleanPhone = String(mobileNumber || '').trim();
+      const phoneDigits = String(mobileNumber || '').replace(/[^\d]/g, '').replace(/^0+/, '');
+      if (customerName && phoneDigits) {
+        let cust = null;
+        const exact = await client.query(
+          'SELECT * FROM customers WHERE phone = $1 OR phone2 = $1 ORDER BY id DESC LIMIT 1',
+          [cleanPhone]
+        );
+        cust = exact.rows[0] || null;
+        if (!cust && phoneDigits.length >= 10) {
+          const like = await client.query(
+            'SELECT * FROM customers WHERE phone ILIKE $1 OR phone2 ILIKE $1 ORDER BY id DESC LIMIT 1',
+            [`%${phoneDigits.slice(-10)}`]
+          );
+          cust = like.rows[0] || null;
+        }
+        if (cust) {
+          const sets = [];
+          const vals = [];
+          let i = 1;
+          const flds = [
+            ['name', String(customerName || '').trim()],
+            ['email', email ? String(email).trim() : ''],
+            ['address', address ? String(address).trim() : ''],
+            ['gstin', gstin ? String(gstin).trim() : ''],
+          ];
+          for (const [col, v] of flds) {
+            if (v) { sets.push(`${col} = $${i}`); vals.push(v); i++; }
+          }
+          if (sets.length > 0) {
+            vals.push(cust.id);
+            await client.query(
+              `UPDATE customers SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${i}`,
+              vals
+            );
+          }
+        } else {
+          await client.query(
+            `INSERT INTO customers (name, phone, email, address, gstin, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
+            [String(customerName).trim(), cleanPhone, email || null, address || null, gstin || null]
+          );
+        }
+      }
+      await client.query('RELEASE SAVEPOINT cust_upsert_sp');
+    } catch (e) {
+      console.error('Customer upsert skipped (order will still be saved):', e.message);
+      await client.query('ROLLBACK TO SAVEPOINT cust_upsert_sp');
+    }
+
     await client.query('COMMIT');
 
     const newOrder = await client.query(
@@ -253,7 +417,17 @@ router.post('/', async (req, res, next) => {
         'description', oc.description, 'warranty', oc.warranty,
         'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
         'remarks', oc.remarks, 'status', oc.status
-      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components,
+      COALESCE((
+        SELECT json_agg(json_build_object(
+          'id', op.id, 'product_name', op.product_name,
+          'product_model', op.product_model, 'serial_number', op.serial_number,
+          'warranty', op.warranty, 'quantity', op.quantity,
+          'rate', op.rate, 'amount', op.amount,
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+        ))
+        FROM order_products op WHERE op.order_id = o.id
+      ), '[]'::json) AS products
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
       WHERE o.id = $1
@@ -277,30 +451,55 @@ router.post('/', async (req, res, next) => {
           console.error('WhatsApp notification error:', e.stack || e.message);
         }
 
-        // 2. Send order form PDF right after the template message (no delay)
+        // 2. Send the order document (invoice for ASUS store, order form otherwise)
+        //    right after the template message (no delay).
         if (!phone) return;
         try {
           const custConvId = getConversationIdFromPhone(phone);
-          const pdf = await generateOrderPdfFromHTML(orderId);
-          await createPdfMessage({
-            conversationId: custConvId,
-            orderId: orderId,
-            sender: 'System',
-            fileName: pdf.fileName,
-            fileSize: pdf.fileSize,
-            documentType: 'order_form',
-            event: 'Order form generated',
-            phone: phone,
-          });
-          if (pdf.filePath) {
-            sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
-              orderId: orderId,
+          const store = await getStoreInfo(orderData?.store_id);
+          const isAsusStore = String(store?.store_name || '').toLowerCase().includes('asus');
+
+          if (isAsusStore) {
+            // ASUS store: send the approved "order_invoice" template with the
+            // invoice PDF attached (instead of the order form PDF).
+            const pdf = await generateOrderInvoicePdf(orderId);
+            await createPdfMessage({
               conversationId: custConvId,
+              orderId: orderId,
               sender: 'System',
-            }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+              fileName: pdf.fileName,
+              fileSize: pdf.fileSize,
+              documentType: 'order_invoice',
+              event: 'Order invoice generated',
+              phone: phone,
+            });
+            if (pdf.filePath) {
+              sendOrderInvoiceTemplate(orderData, pdf.filePath)
+                .catch(e => console.error('Auto-send order invoice template failed:', e.message));
+            }
+          } else {
+            // Non-ASUS (Bluechip) store: keep existing behaviour (order form PDF).
+            const pdf = await generateOrderPdfFromHTML(orderId);
+            await createPdfMessage({
+              conversationId: custConvId,
+              orderId: orderId,
+              sender: 'System',
+              fileName: pdf.fileName,
+              fileSize: pdf.fileSize,
+              documentType: 'order_form',
+              event: 'Order form generated',
+              phone: phone,
+            });
+            if (pdf.filePath) {
+              sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
+                orderId: orderId,
+                conversationId: custConvId,
+                sender: 'System',
+              }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+            }
           }
         } catch (e) {
-          console.error('Auto-generate order form failed:', e.message);
+          console.error('Auto-generate order document failed:', e.message);
         }
       } catch (e) {
         console.error('Order auto-notification error:', e.stack || e.message);
@@ -340,10 +539,17 @@ router.put('/:id', async (req, res, next) => {
     // Calculate enhanced financials from components
     const comps = Array.isArray(updates.components) ? updates.components : [];
     const componentsTotal = comps.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0);
-    const subtotal = serviceAmt + componentsTotal;
+    // Repeatable ASUS device blocks + accessory rows all live in order_products.
+    const mergedProducts = mergeOrderProducts(updates.devices, updates.products);
+    const productsTotal = sumOrderProducts(mergedProducts);
+
+    const store = await getStoreInfo(updates.storeId ?? existing.rows[0].store_id);
+    const isAsusStore = String(store?.store_name || '').toLowerCase().includes('asus');
+
+    const subtotal = serviceAmt + componentsTotal + productsTotal;
     const gstRate = 0.18;
     const gstAmount = subtotal * gstRate;
-    const grandTotal = subtotal + gstAmount - disc;
+    const grandTotal = isAsusStore ? (subtotal - disc) : (subtotal + gstAmount - disc);
 
     const advance = parseFloat(updates.advancePayment ?? existing.rows[0].advance_payment) || 0;
     const remainingBalance = grandTotal - advance;
@@ -373,6 +579,9 @@ router.put('/:id', async (req, res, next) => {
       accessoryType: 'accessory_type',
       customAccessory: 'custom_accessory',
       partNo: 'part_no',
+      checkNo: 'check_no',
+      remark: 'remark',
+      gstin: 'gstin',
       financeDownPayment: 'finance_down_payment',
       financeEmi: 'finance_emi',
       financeDuration: 'finance_duration',
@@ -418,6 +627,34 @@ router.put('/:id', async (req, res, next) => {
       }
     }
 
+    // Update products if provided (ASUS multi-item sales orders - repeatable
+    // device blocks + accessory rows)
+    if (Array.isArray(updates.products) || Array.isArray(updates.devices)) {
+      await client.query('DELETE FROM order_products WHERE order_id = $1', [req.params.id]);
+      for (const prod of mergedProducts) {
+        const qty = parseInt(srcVal(prod, 'quantity', 'quantity'), 10) || 1;
+        const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
+        const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
+        await client.query(
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [
+            req.params.id,
+            srcVal(prod, 'productName', 'product_name'),
+            srcVal(prod, 'productModel', 'product_model') || null,
+            srcVal(prod, 'serialNumber', 'serial_number') || null,
+            srcVal(prod, 'warranty', 'warranty') || null,
+            qty,
+            rate,
+            lineAmt,
+            srcVal(prod, 'accessoryType', 'accessory_type') || null,
+            srcVal(prod, 'partNo', 'part_no') || null,
+            srcVal(prod, 'checkNo', 'check_no') || null
+          ]
+        );
+      }
+    }
+
     await client.query('COMMIT');
 
     const updated = await client.query(
@@ -426,13 +663,78 @@ router.put('/:id', async (req, res, next) => {
         'description', oc.description, 'warranty', oc.warranty,
         'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
         'remarks', oc.remarks, 'status', oc.status
-      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components,
+      COALESCE((
+        SELECT json_agg(json_build_object(
+          'id', op.id, 'product_name', op.product_name,
+          'product_model', op.product_model, 'serial_number', op.serial_number,
+          'warranty', op.warranty, 'quantity', op.quantity,
+          'rate', op.rate, 'amount', op.amount,
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+        ))
+        FROM order_products op WHERE op.order_id = o.id
+      ), '[]'::json) AS products
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
       WHERE o.id = $1
       GROUP BY o.id`,
       [req.params.id]
     );
+
+    // Auto-send the updated invoice to the customer on WhatsApp when the save
+    // explicitly requests it (Manage Orders "Save" flow). Fire-and-forget so
+    // the save response is not blocked by PDF generation / message delivery.
+    if (req.body.autoSendWhatsapp === true) {
+      const orderId = req.params.id;
+      const sentOrderData = updated.rows[0];
+      setImmediate(async () => {
+        try {
+          const phone = sentOrderData && sentOrderData.mobile_number;
+          if (!phone) return;
+          const custConvId = getConversationIdFromPhone(phone);
+          const sendStore = await getStoreInfo(sentOrderData.store_id);
+          const sendAsus = String(sendStore?.store_name || '').toLowerCase().includes('asus');
+          if (sendAsus) {
+            const pdf = await generateOrderInvoicePdf(orderId);
+            await createPdfMessage({
+              conversationId: custConvId,
+              orderId: parseInt(orderId, 10),
+              sender: 'System',
+              fileName: pdf.fileName,
+              fileSize: pdf.fileSize,
+              documentType: 'order_invoice',
+              event: 'Updated order invoice generated',
+              phone: phone,
+            });
+            if (pdf.filePath) {
+              sendOrderInvoiceTemplate(sentOrderData, pdf.filePath)
+                .catch(e => console.error('Auto-send updated order invoice template failed:', e.message));
+            }
+          } else {
+            const pdf = await generateOrderPdfFromHTML(orderId);
+            await createPdfMessage({
+              conversationId: custConvId,
+              orderId: parseInt(orderId, 10),
+              sender: 'System',
+              fileName: pdf.fileName,
+              fileSize: pdf.fileSize,
+              documentType: 'order_form',
+              event: 'Updated order form generated',
+              phone: phone,
+            });
+            if (pdf.filePath) {
+              sendDocumentFile(phone, pdf.filePath, `Order Form - ${sentOrderData.order_number || ''}`, {
+                orderId: parseInt(orderId, 10),
+                conversationId: custConvId,
+                sender: 'System',
+              }).catch(e => console.error('Auto-send updated order form PDF failed:', e.message));
+            }
+          }
+        } catch (e) {
+          console.error('Auto-send updated order invoice failed:', e.stack || e.message);
+        }
+      });
+    }
 
     res.json({ success: true, message: 'Order updated successfully', data: updated.rows[0] });
   } catch (err) {

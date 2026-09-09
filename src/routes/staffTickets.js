@@ -4,7 +4,7 @@ const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
 const { createStatusEvent, getOrCreateConversation, createPdfMessage } = require('../services/messagingService');
-const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
+const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, sendServiceInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 
 // Normalize status strings to exact DB enum values (handles casing differences
@@ -77,6 +77,16 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
         event: 'Service invoice generated',
       });
       console.log('Service invoice generated for ticket:', ticketId, pdf.invoiceNumber);
+
+      // Auto-send the approved "service_invoice" template with the PDF attached
+      // so the customer receives their invoice without needing to message first.
+      const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
+      const ticket = tRes.rows[0];
+      if (ticket && ticket.customer_phone && pdf.filePath) {
+        await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e =>
+          console.error('Auto-send service invoice template failed:', e.message)
+        );
+      }
     } catch (e) {
       console.error('Auto-generate service invoice failed:', e.message);
     }

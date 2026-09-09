@@ -323,9 +323,9 @@ async function getConversationsWithDetails({ search, filter, customerId, storeId
   let searchJoin = '';
   if (search) {
     searchJoin = `
-    LEFT JOIN tickets t ON m.ticket_id = t.id
+    LEFT JOIN tickets t ON COALESCE(clt.ticket_id, m.ticket_id) = t.id
     LEFT JOIN customers c ON m.customer_id::text = c.id::text
-    LEFT JOIN orders o ON m.order_id = o.id
+    LEFT JOIN orders o ON COALESCE(clo.order_id, m.order_id) = o.id
     `;
     whereClause += ` AND (
       m.conversation_id ILIKE $${params.length + 1}
@@ -343,40 +343,59 @@ async function getConversationsWithDetails({ search, filter, customerId, storeId
 
   if (storeId) {
     whereClause += ` AND (
-      (m.ticket_id IS NOT NULL AND EXISTS (SELECT 1 FROM tickets t WHERE t.id = m.ticket_id AND t.store_id = $${params.length + 1}))
+      (COALESCE(clt.ticket_id, m.ticket_id) IS NOT NULL AND EXISTS (SELECT 1 FROM tickets t WHERE t.id = COALESCE(clt.ticket_id, m.ticket_id) AND t.store_id = $${params.length + 1}))
       OR
-      (m.order_id IS NOT NULL AND EXISTS (SELECT 1 FROM orders o WHERE o.id = m.order_id AND o.store_id = $${params.length + 1}))
+      (COALESCE(clo.order_id, m.order_id) IS NOT NULL AND EXISTS (SELECT 1 FROM orders o WHERE o.id = COALESCE(clo.order_id, m.order_id) AND o.store_id = $${params.length + 1}))
     )`;
     params.push(storeId);
   }
 
   let typeFilterClause = '';
   if (filter === 'tickets') {
-    typeFilterClause = ' AND m.ticket_id IS NOT NULL';
+    typeFilterClause = ' AND COALESCE(clt.ticket_id, m.ticket_id) IS NOT NULL';
   } else if (filter === 'orders') {
-    typeFilterClause = ' AND m.order_id IS NOT NULL';
+    typeFilterClause = ' AND COALESCE(clo.order_id, m.order_id) IS NOT NULL';
   }
 
   const sql = `
+    WITH conv_latest_ticket AS (
+      SELECT DISTINCT ON (conversation_id)
+             conversation_id,
+             ticket_id
+      FROM messages
+      WHERE ticket_id IS NOT NULL
+      ORDER BY conversation_id, created_at DESC
+    ),
+    conv_latest_order AS (
+      SELECT DISTINCT ON (conversation_id)
+             conversation_id,
+             order_id
+      FROM messages
+      WHERE order_id IS NOT NULL
+      ORDER BY conversation_id, created_at DESC
+    )
     SELECT DISTINCT ON (m.conversation_id)
            m.conversation_id,
            m.customer_id,
-           m.ticket_id,
-           m.order_id,
+           COALESCE(clt.ticket_id, m.ticket_id) as ticket_id,
+           COALESCE(clo.order_id, m.order_id) as order_id,
            m.phone,
            m.created_at as last_message_at,
            (SELECT text FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_text,
            (SELECT type FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_type,
            (SELECT sender FROM messages WHERE conversation_id = m.conversation_id ORDER BY created_at DESC LIMIT 1) as last_sender,
+           (SELECT event FROM messages WHERE conversation_id = m.conversation_id AND type = 'event' ORDER BY created_at DESC LIMIT 1) as last_event,
            (SELECT COUNT(*) FROM messages WHERE conversation_id = m.conversation_id AND is_read = false AND sender = 'Customer') as unread_count,
-           (SELECT t2.customer_name FROM tickets t2 WHERE t2.id = m.ticket_id LIMIT 1) as ticket_customer_name,
-           (SELECT t2.customer_phone FROM tickets t2 WHERE t2.id = m.ticket_id LIMIT 1) as ticket_customer_phone,
-           (SELECT o2.customer_name FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_name,
-           (SELECT o2.mobile_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_customer_phone,
-           (SELECT o2.order_number FROM orders o2 WHERE o2.id = m.order_id LIMIT 1) as order_number,
+           (SELECT t2.customer_name FROM tickets t2 WHERE t2.id = COALESCE(clt.ticket_id, m.ticket_id) LIMIT 1) as ticket_customer_name,
+           (SELECT t2.customer_phone FROM tickets t2 WHERE t2.id = COALESCE(clt.ticket_id, m.ticket_id) LIMIT 1) as ticket_customer_phone,
+           (SELECT o2.customer_name FROM orders o2 WHERE o2.id = COALESCE(clo.order_id, m.order_id) LIMIT 1) as order_customer_name,
+           (SELECT o2.mobile_number FROM orders o2 WHERE o2.id = COALESCE(clo.order_id, m.order_id) LIMIT 1) as order_customer_phone,
+           (SELECT o2.order_number FROM orders o2 WHERE o2.id = COALESCE(clo.order_id, m.order_id) LIMIT 1) as order_number,
            (SELECT c2.name FROM customers c2 WHERE c2.id::text = m.customer_id::text LIMIT 1) as saved_customer_name,
            (SELECT c2.phone FROM customers c2 WHERE c2.id::text = m.customer_id::text LIMIT 1) as saved_customer_phone
     FROM messages m
+    LEFT JOIN conv_latest_ticket clt ON clt.conversation_id = m.conversation_id
+    LEFT JOIN conv_latest_order clo ON clo.conversation_id = m.conversation_id
     ${searchJoin}
     ${whereClause}${typeFilterClause}
     ORDER BY m.conversation_id, m.created_at DESC
@@ -386,15 +405,14 @@ async function getConversationsWithDetails({ search, filter, customerId, storeId
   const conversations = result.rows;
 
   // Add conversation_type to each conversation
+  // Priority: order > ticket > customer (not based on cust_ prefix)
   conversations.forEach(c => {
     if (c.order_id) {
       c.conversation_type = 'order';
-    } else if (c.conversation_id && c.conversation_id.startsWith('cust_')) {
-      c.conversation_type = 'customer';
     } else if (c.ticket_id) {
       c.conversation_type = 'ticket';
     } else {
-      c.conversation_type = 'ticket';
+      c.conversation_type = 'customer';
     }
   });
 

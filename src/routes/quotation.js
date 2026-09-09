@@ -7,11 +7,28 @@ const { authenticate } = require('../middleware/auth');
 
 const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 
-async function generateQuotationNumber(client) {
+async function buildNumberPrefix() {
   const today = new Date();
   const y = today.getFullYear();
-  const prefix = `QT- BCCS-${String.fromCharCode(65 + today.getMonth())}${String(today.getDate()).padStart(2, '0')}/${y}-${(y + 1) % 100}`;
-  return prefix;
+  const month = MONTHS[today.getMonth()];
+  const letter = String.fromCharCode(65 + today.getMonth());
+  return `QT- BCCS-${letter}${String(today.getDate()).padStart(2, '0')}/${y}-${String((y + 1) % 100).padStart(2, '0')}`;
+}
+
+async function generateQuotationNumber(client) {
+  const prefix = await buildNumberPrefix();
+  const q = client ? client.query.bind(client) : query;
+  const result = await q(
+    `SELECT quotation_number FROM quotations WHERE quotation_number LIKE $1 ORDER BY quotation_number DESC LIMIT 1`,
+    [prefix + '%']
+  );
+  let nextSeq = 1;
+  if (result.rows.length > 0) {
+    const last = result.rows[0].quotation_number;
+    const m = last.match(/(\d+)$/);
+    nextSeq = (m ? parseInt(m[1], 10) : 0) + 1;
+  }
+  return `${prefix}/${String(nextSeq).padStart(3, '0')}`;
 }
 
 async function ensureTable(client) {
@@ -89,15 +106,23 @@ router.get('/', authenticate, async (req, res, next) => {
 });
 
 // GET /api/quotations/next-number - Get next quotation number
-router.get('/next-number', authenticate, async (req, res, next) => {
+router.get('/next-number', authenticate, async (_req, res, next) => {
   try {
     await ensureTable();
     const now = new Date();
-    const y = now.getFullYear();
-    const month = MONTHS[now.getMonth()];
-    const letter = String.fromCharCode(65 + now.getMonth());
-    const prefix = `QT- BCCS-${letter}${String(now.getDate()).padStart(2, '0')}/${y}-${String((y + 1) % 100).padStart(2, '0')}`;
-    res.json({ success: true, data: { number: prefix, date: now.toLocaleDateString('en-GB') } });
+    const prefix = await buildNumberPrefix();
+    const result = await query(
+      'SELECT quotation_number FROM quotations WHERE quotation_number LIKE $1 ORDER BY quotation_number DESC LIMIT 1',
+      [prefix + '%']
+    );
+    let nextSeq = 1;
+    if (result.rows.length > 0) {
+      const last = result.rows[0].quotation_number;
+      const m = last.match(/(\d+)$/);
+      nextSeq = (m ? parseInt(m[1], 10) : 0) + 1;
+    }
+    const number = `${prefix}/${String(nextSeq).padStart(3, '0')}`;
+    res.json({ success: true, data: { number, date: now.toLocaleDateString('en-GB') } });
   } catch (err) {
     next(err);
   }
@@ -137,7 +162,13 @@ router.post('/', authenticate, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Customer name is required' });
     }
 
-    const number = quotationNumber || await generateQuotationNumber(client);
+    let number = quotationNumber || await generateQuotationNumber(client);
+    if (quotationNumber) {
+      const dup = await client.query('SELECT id FROM quotations WHERE quotation_number = $1', [number]);
+      if (dup.rows.length > 0) {
+        number = await generateQuotationNumber(client);
+      }
+    }
 
     // Calculate totals
     const parsedItems = (Array.isArray(items) ? items : []).map(item => ({

@@ -286,7 +286,17 @@ router.get('/orderform-html/:orderId', async (req, res, next) => {
         'description', oc.description, 'warranty', oc.warranty,
         'quantity', oc.quantity, 'price', oc.price, 'amount', oc.amount,
         'remarks', oc.remarks, 'status', oc.status
-      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components
+      )) FILTER (WHERE oc.id IS NOT NULL), '[]'::json) AS components,
+      COALESCE((
+        SELECT json_agg(json_build_object(
+          'id', op.id, 'product_name', op.product_name,
+          'product_model', op.product_model, 'serial_number', op.serial_number,
+          'warranty', op.warranty, 'quantity', op.quantity,
+          'rate', op.rate, 'amount', op.amount,
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+        ))
+        FROM order_products op WHERE op.order_id = o.id
+      ), '[]'::json) AS products
       FROM orders o
       LEFT JOIN order_components oc ON oc.order_id = o.id
       WHERE o.id = $1
@@ -299,7 +309,8 @@ router.get('/orderform-html/:orderId', async (req, res, next) => {
     const store = await getStoreData(order.store_id);
 
     const components = order.components || [];
-    const html = populateOrderTemplate(order, components, store);
+    const products = order.products || [];
+    const html = populateOrderTemplate(order, components, store, products);
 
     res.setHeader('Content-Type', 'text/html');
     res.send(html);

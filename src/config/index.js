@@ -41,6 +41,9 @@ const config = {
     templateCancelled: process.env.WHATSAPP_TEMPLATE_CANCELLED || 'ticket_cancelled',
     templateCollection: process.env.WHATSAPP_TEMPLATE_COLLECTION || 'device_collection',
     templateInward: process.env.WHATSAPP_TEMPLATE_INWARD || 'inward_receipt',
+    templateServiceInvoice: process.env.WHATSAPP_TEMPLATE_SERVICE_INVOICE || 'service_invoice',
+    templateOrderInvoice: process.env.WHATSAPP_TEMPLATE_ORDER_INVOICE || 'order_invoice',
+    templateReview: process.env.WHATSAPP_TEMPLATE_REVIEW || 'review_link',
     templateLanguages: Object.freeze({
       'ticket_created': 'en_GB',
       'ticket_pending': 'en_GB',
@@ -52,6 +55,9 @@ const config = {
       'order_created': 'en_GB',
       'device_collection': 'en_IN',
       'inward_receipt': 'en_IN',
+      'service_invoice': 'en_IN',
+      'order_invoice': 'en_IN',
+      'review_link': 'en_IN',
     }),
   },
 };

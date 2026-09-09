@@ -197,6 +197,27 @@ const tallyService = require('./services/tallyService');
       await pool.query(`ALTER TABLE tally_sales ADD COLUMN IF NOT EXISTS party_phone TEXT`).catch(() => {});
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_tally_sales_customer ON tally_sales(customer_id)`).catch(() => {});
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_tally_sales_party ON tally_sales(party_name)`).catch(() => {});
+      // order_products table for multi-product ASUS sales orders
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS order_products (
+          id SERIAL PRIMARY KEY,
+          order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE ON UPDATE CASCADE,
+          product_name VARCHAR(200) NOT NULL,
+          product_model VARCHAR(200) DEFAULT NULL,
+          serial_number VARCHAR(100) DEFAULT NULL,
+          warranty VARCHAR(50) DEFAULT NULL,
+          quantity INTEGER NOT NULL DEFAULT 1,
+          rate DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+          amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS accessory_type VARCHAR(200) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS part_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS check_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      // Customer GSTIN (shown on the tax invoice, optional, non-compulsory)
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_products_order ON order_products(order_id)`).catch(() => {});
       if (process.env.TALLY_HOST) {
         console.log('Starting Tally poller...');
         tallyService.startPoller(pool);
