@@ -4,7 +4,7 @@ const { query, getConnection } = require('../config/database');
 const { notifyOrderCreated, sendDocumentFile, sendOrderInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateOrderPdfFromHTML } = require('../services/pdfGenerator');
 const { generateOrderInvoicePdf } = require('../services/tallyOrderInvoicePdf');
-const { createPdfMessage } = require('../services/messagingService');
+const { createPdfMessage, updateMessageStatusById } = require('../services/messagingService');
 
 async function getStoreInfo(storeId) {
   if (storeId) {
@@ -45,6 +45,7 @@ function deviceToProduct(d) {
     warranty: srcVal(d, 'warranty', 'warranty') || undefined,
     partNo: srcVal(d, 'partNo', 'part_no') || undefined,
     checkNo: srcVal(d, 'checkNo', 'check_no') || undefined,
+    series: srcVal(d, 'series', 'series') || undefined,
     accessoryType,
     quantity: 1,
     rate: amount,
@@ -147,7 +148,7 @@ router.get('/', async (req, res, next) => {
         'product_model', op.product_model, 'serial_number', op.serial_number,
         'warranty', op.warranty, 'quantity', op.quantity,
         'rate', op.rate, 'amount', op.amount,
-        'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+        'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
       ))
       FROM order_products op WHERE op.order_id = o.id
     ), '[]'::json) AS products
@@ -195,6 +196,85 @@ router.get('/next-number', async (req, res, next) => {
   }
 });
 
+// GET /api/orders/customer-lookup - Partial phone/name lookup of customers who
+// shopped at a specific store (used by the ASUS order form to show a live list
+// of matching customers as the user types a few digits). Scoped to a store so a
+// store always sees only its own customers.
+router.get('/customer-lookup', async (req, res, next) => {
+  try {
+    const { store_id, phone, name, limit = 8 } = req.query;
+    const digits = String(phone || '').replace(/[^\d]/g, '');
+    const cleanName = String(name || '').trim();
+    const max = Math.min(parseInt(limit, 10) || 8, 20);
+
+    if (!store_id) {
+      return res.status(400).json({ success: false, message: 'store_id is required' });
+    }
+    if (digits.length < 2 && !cleanName) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const storeId = parseInt(store_id, 10);
+    const pattern = `%${digits}%`;
+    const namePattern = cleanName ? `%${cleanName}%` : null;
+    const params = [storeId];
+
+    let where = `o.is_active = true AND o.store_id = ?`;
+    if (digits.length >= 2) {
+      where += ` AND (o.mobile_number ILIKE ? OR o.customer_name ILIKE ?)`;
+      params.push(pattern, pattern);
+    } else if (namePattern) {
+      where += ` AND o.customer_name ILIKE ?`;
+      params.push(namePattern);
+    }
+
+    const ordersSql = `
+      SELECT
+        o.customer_name AS name,
+        o.mobile_number AS mobile,
+        o.email,
+        o.address,
+        o.gstin,
+        COUNT(*)::int AS order_count,
+        MAX(o.order_date)::text AS last_order_date
+      FROM orders o
+      WHERE ${where}
+      GROUP BY o.customer_name, o.mobile_number, o.email, o.address, o.gstin
+      ORDER BY last_order_date DESC NULLS LAST
+      LIMIT ?`;
+    params.push(max);
+
+    const [ordersRes, customersRes] = await Promise.all([
+      query(ordersSql, params),
+      query(
+        `SELECT name, phone AS mobile, phone2, email, address, gstin,
+                0 AS order_count, NULL::text AS last_order_date
+         FROM customers c
+         WHERE c.store_id = ?
+           AND (c.phone ILIKE ? OR c.phone2 ILIKE ? OR c.name ILIKE ?)
+         LIMIT ?`,
+        [storeId, pattern, pattern, pattern, max]
+      ),
+    ]);
+
+    // Merge orders + registered customers and de-duplicate by the last 10 digits
+    // of the mobile number so the number shown is always a clean 10-digit line.
+    const byPhone = new Map();
+    const norm = (m) => String(m || '').replace(/[^\d]/g, '').replace(/^0+/, '').slice(-10);
+    const addRow = (row) => {
+      const key = norm(row.mobile);
+      if (!key) return;
+      if (!byPhone.has(key)) byPhone.set(key, { ...row, mobile: key });
+    };
+    ordersRes.rows.forEach(addRow);
+    customersRes.rows.forEach(addRow);
+
+    res.json({ success: true, data: Array.from(byPhone.values()).slice(0, max) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/orders/:id - Get single order with components
 router.get('/:id', async (req, res, next) => {
   try {
@@ -211,7 +291,7 @@ router.get('/:id', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products
@@ -260,6 +340,23 @@ router.post('/', async (req, res, next) => {
     const store = await getStoreInfo(storeId || null);
     const isAsusStore = String(store?.store_name || '').toLowerCase().includes('asus');
 
+    // ASUS store: assign the next available sequential invoice number
+    // (16, 17, 18, ...). It is always the smallest number not used by any
+    // existing order, so deleting an order frees its number and the next new
+    // order reuses it (no gaps). Backed by a persistent DB query + advisory
+    // lock + unique index so numbers never duplicate and survive restarts.
+    let invoiceNumber = null;
+    if (isAsusStore) {
+      await client.query(`SELECT pg_advisory_xact_lock($1)`, [8675309]);
+      const usedRes = await client.query(
+        `SELECT invoice_number FROM orders WHERE invoice_number IS NOT NULL ORDER BY invoice_number`
+      );
+      const used = new Set(usedRes.rows.map(r => r.invoice_number));
+      let n = 16;
+      while (used.has(n)) n++;
+      invoiceNumber = n;
+    }
+
     // Calculate component totals
     const componentsTotal = Array.isArray(components) ? components.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0) : 0;
     // Repeatable ASUS device blocks + accessory rows all live in order_products.
@@ -293,7 +390,7 @@ router.post('/', async (req, res, next) => {
         advance_payment_mode, remaining_balance, payment_status, payment_type, created_by,
         store_id, subtotal, gst_amount, grand_total, specifications, warranty,
         accessory_type, custom_accessory, part_no, check_no, remark,
-        finance_down_payment, finance_emi, finance_duration, gstin, created_at, updated_at
+        finance_down_payment, finance_emi, finance_duration, gstin, created_at, updated_at, invoice_number
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
       RETURNING id`,
       [
@@ -305,7 +402,7 @@ router.post('/', async (req, res, next) => {
         storeId || null, subtotal, gstAmount, grandTotal, specsJson, warranty || null,
         accessoryType || null, customAccessory || null, partNo || null, checkNo || null, remark || null,
         parseFloat(financeDownPayment) || null, parseFloat(financeEmi) || null,
-        parseInt(financeDuration, 10) || null, gstin || null, now, now
+        parseInt(financeDuration, 10) || null, gstin || null, now, now, invoiceNumber
       ]
     );
 
@@ -336,8 +433,8 @@ router.post('/', async (req, res, next) => {
         const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
         const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
         await client.query(
-          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
           [
             orderId,
             srcVal(prod, 'productName', 'product_name'),
@@ -349,7 +446,8 @@ router.post('/', async (req, res, next) => {
             lineAmt,
             srcVal(prod, 'accessoryType', 'accessory_type') || null,
             srcVal(prod, 'partNo', 'part_no') || null,
-            srcVal(prod, 'checkNo', 'check_no') || null
+            srcVal(prod, 'checkNo', 'check_no') || null,
+            srcVal(prod, 'series', 'series') || null
           ]
         );
       }
@@ -424,7 +522,7 @@ router.post('/', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products
@@ -463,7 +561,7 @@ router.post('/', async (req, res, next) => {
             // ASUS store: send the approved "order_invoice" template with the
             // invoice PDF attached (instead of the order form PDF).
             const pdf = await generateOrderInvoicePdf(orderId);
-            await createPdfMessage({
+            const fileMsg = await createPdfMessage({
               conversationId: custConvId,
               orderId: orderId,
               sender: 'System',
@@ -474,13 +572,20 @@ router.post('/', async (req, res, next) => {
               phone: phone,
             });
             if (pdf.filePath) {
-              sendOrderInvoiceTemplate(orderData, pdf.filePath)
-                .catch(e => console.error('Auto-send order invoice template failed:', e.message));
+              const forwardResult = await sendOrderInvoiceTemplate(orderData, pdf.filePath).catch(e => {
+                console.error('Auto-send order invoice template failed:', e.message);
+                return null;
+              });
+              if (forwardResult && forwardResult.success && forwardResult.messageId) {
+                await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+              } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+                await updateMessageStatusById(fileMsg.id, null, 'failed');
+              }
             }
           } else {
             // Non-ASUS (Bluechip) store: keep existing behaviour (order form PDF).
             const pdf = await generateOrderPdfFromHTML(orderId);
-            await createPdfMessage({
+            const fileMsg = await createPdfMessage({
               conversationId: custConvId,
               orderId: orderId,
               sender: 'System',
@@ -491,11 +596,19 @@ router.post('/', async (req, res, next) => {
               phone: phone,
             });
             if (pdf.filePath) {
-              sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
+              const forwardResult = await sendDocumentFile(phone, pdf.filePath, `Order Form - ${orderData.order_number || ''}`, {
                 orderId: orderId,
                 conversationId: custConvId,
                 sender: 'System',
-              }).catch(e => console.error('Auto-send order form PDF failed:', e.message));
+              }).catch(e => {
+                console.error('Auto-send order form PDF failed:', e.message);
+                return null;
+              });
+              if (forwardResult && forwardResult.success && forwardResult.messageId) {
+                await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+              } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+                await updateMessageStatusById(fileMsg.id, null, 'failed');
+              }
             }
           }
         } catch (e) {
@@ -636,8 +749,8 @@ router.put('/:id', async (req, res, next) => {
         const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
         const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
         await client.query(
-          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
           [
             req.params.id,
             srcVal(prod, 'productName', 'product_name'),
@@ -649,7 +762,8 @@ router.put('/:id', async (req, res, next) => {
             lineAmt,
             srcVal(prod, 'accessoryType', 'accessory_type') || null,
             srcVal(prod, 'partNo', 'part_no') || null,
-            srcVal(prod, 'checkNo', 'check_no') || null
+            srcVal(prod, 'checkNo', 'check_no') || null,
+            srcVal(prod, 'series', 'series') || null
           ]
         );
       }
@@ -670,7 +784,7 @@ router.put('/:id', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products
@@ -696,7 +810,7 @@ router.put('/:id', async (req, res, next) => {
           const sendAsus = String(sendStore?.store_name || '').toLowerCase().includes('asus');
           if (sendAsus) {
             const pdf = await generateOrderInvoicePdf(orderId);
-            await createPdfMessage({
+            const fileMsg = await createPdfMessage({
               conversationId: custConvId,
               orderId: parseInt(orderId, 10),
               sender: 'System',
@@ -707,12 +821,19 @@ router.put('/:id', async (req, res, next) => {
               phone: phone,
             });
             if (pdf.filePath) {
-              sendOrderInvoiceTemplate(sentOrderData, pdf.filePath)
-                .catch(e => console.error('Auto-send updated order invoice template failed:', e.message));
+              const forwardResult = await sendOrderInvoiceTemplate(sentOrderData, pdf.filePath).catch(e => {
+                console.error('Auto-send updated order invoice template failed:', e.message);
+                return null;
+              });
+              if (forwardResult && forwardResult.success && forwardResult.messageId) {
+                await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+              } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+                await updateMessageStatusById(fileMsg.id, null, 'failed');
+              }
             }
           } else {
             const pdf = await generateOrderPdfFromHTML(orderId);
-            await createPdfMessage({
+            const fileMsg = await createPdfMessage({
               conversationId: custConvId,
               orderId: parseInt(orderId, 10),
               sender: 'System',
@@ -723,11 +844,19 @@ router.put('/:id', async (req, res, next) => {
               phone: phone,
             });
             if (pdf.filePath) {
-              sendDocumentFile(phone, pdf.filePath, `Order Form - ${sentOrderData.order_number || ''}`, {
+              const forwardResult = await sendDocumentFile(phone, pdf.filePath, `Order Form - ${sentOrderData.order_number || ''}`, {
                 orderId: parseInt(orderId, 10),
                 conversationId: custConvId,
                 sender: 'System',
-              }).catch(e => console.error('Auto-send updated order form PDF failed:', e.message));
+              }).catch(e => {
+                console.error('Auto-send updated order form PDF failed:', e.message);
+                return null;
+              });
+              if (forwardResult && forwardResult.success && forwardResult.messageId) {
+                await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+              } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+                await updateMessageStatusById(fileMsg.id, null, 'failed');
+              }
             }
           }
         } catch (e) {

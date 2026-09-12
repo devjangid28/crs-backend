@@ -126,9 +126,11 @@ function buildOrderInvoiceItems(order, components, products) {
   (Array.isArray(products) ? products : []).forEach(prod => {
     const prodName = prod.product_name || '';
     const prodAcc = prod.accessory_type || '';
-    const lineName = prodName.trim()
+    const prodSeries = (prod.series || '').toString().trim();
+    const baseName = prodName.trim()
       ? (prodAcc && prodAcc !== 'Accessories' ? `${prodName} - ${prodAcc}` : prodName)
       : (prodAcc ? `Accessories - ${prodAcc}` : 'Accessories');
+    const lineName = prodSeries ? `${baseName} - ${prodSeries}` : baseName;
     const prodQty = parseInt(prod.quantity, 10) || 1;
     const prodRate = parseFloat(prod.rate) || 0;
     const total = parseFloat(prod.amount) || (prodRate * prodQty);
@@ -222,6 +224,10 @@ function buildInvoiceHTML(order, components, store, products) {
   const terms = order.payment_type || 'Cash';
   const orderNumber = order.order_number || '';
   const invoiceDate = fmtDate(order.order_date || new Date());
+  // ASUS store orders carry a persistent sequential invoice number (16, 17, ...).
+  const storedInvoiceNumber = order.invoice_number != null && order.invoice_number !== ''
+    ? String(order.invoice_number)
+    : null;
 
   const financeDown = parseFloat(order.finance_down_payment || 0) || 0;
   const financeEmi = parseFloat(order.finance_emi || 0) || 0;
@@ -264,8 +270,8 @@ function buildInvoiceHTML(order, components, store, products) {
     const hsn = item.hsn || '84713010';
     const descLines = [
       `<div style="font-weight:bold">${esc(item.name || 'Service')}</div>`,
-      item.serialNumber ? `<div>Serial No: ${esc(item.serialNumber)}</div>` : '',
       item.modelNo ? `<div>Model No: ${esc(item.modelNo)}</div>` : '',
+      item.serialNumber ? `<div>Serial No: ${esc(item.serialNumber)}</div>` : '',
       item.partNo ? `<div>Part No: ${esc(item.partNo)}</div>` : '',
       item.checkNo ? `<div>Check No: ${esc(item.checkNo)}</div>` : '',
       item.warranty && String(item.warranty).toLowerCase().trim() !== 'no warranty' ? `<div>Warranty: ${String(item.warranty).toUpperCase()} OF HARDWARE WARRANTY</div>` : '',
@@ -341,7 +347,7 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
   </td>
   <td style="width:40%;padding:0;vertical-align:top">
     <table style="width:100%">
-      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Invoice No.</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(terms === 'Finance' ? 'FIN-' : 'INV-')}${esc(orderNumber)}</td></tr>
+      <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Invoice No.</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(storedInvoiceNumber || (terms === 'Finance' ? 'FIN-' : 'INV-') + orderNumber)}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Dated</td><td style="border-bottom:1px solid #777;padding:2px 4px">${invoiceDate}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Mode/Terms of Payment</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(terms)}${isFinance ? '<br/><span style="font-size:6.5px">Finance: Down ' + fmtINR(financeDown) + ' + EMI ' + fmtINR(financeEmi) + '/mo for ' + financeDur + ' months</span>' : ''}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Reference No. &amp; Date</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(orderNumber)} / ${invoiceDate}</td></tr>
@@ -508,7 +514,7 @@ async function generateOrderInvoicePdf(orderId) {
   const components = compRes.rows || [];
 
   const prodRes = await query(
-    `SELECT product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no
+    `SELECT product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series
      FROM order_products WHERE order_id = $1 ORDER BY id`,
     [orderId]
   );

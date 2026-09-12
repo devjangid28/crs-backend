@@ -63,6 +63,17 @@ router.post('/webhook', async (req, res) => {
               profileName,
             });
 
+            // Duplicate events (Meta webhook retries) are skipped silently.
+            // Missing identifiers are logged but never re-inserted.
+            if (!result || !result.id || result.duplicate) {
+              if (result && result.duplicate) {
+                wa.info('webhook: duplicate message skipped', { msgId: msg.id });
+                continue;
+              }
+              wa.warn('webhook: message skipped (no id)', { msgId: msg.id, from: msg.from });
+              continue;
+            }
+
             // Emit socket event for real-time update (room + global)
             if (io) {
               const newMsg = await query('SELECT * FROM messages WHERE id = $1', [result.id]);
@@ -102,7 +113,10 @@ router.post('/webhook', async (req, res) => {
               }
 
               if (updateResult.rowCount === 0) {
-                // Fallback: match by recipient_id in conversation_id
+                // Fallback: match by recipient_id in conversation_id. Only ever
+                // applies to OUTGOING records — customer messages are matched
+                // by their own unique wamid in the primary query above, so we
+                // must never accidentally re-tick an incoming customer message.
                 const recipientClean = status.recipient_id ? status.recipient_id.replace(/[^\d]/g, '') : '';
                 const convIdPattern = '%' + recipientClean + '%';
                 updateResult = await query(
@@ -110,6 +124,8 @@ router.post('/webhook', async (req, res) => {
                    WHERE id = (
                      SELECT id FROM messages
                      WHERE conversation_id LIKE $2
+                       AND sender != 'Customer'
+                       AND (type = 'text' OR type = 'file' OR type = 'image' OR type = 'link' OR type = 'template' OR type = 'document')
                      ORDER BY created_at DESC LIMIT 1
                    )
                    RETURNING conversation_id`,

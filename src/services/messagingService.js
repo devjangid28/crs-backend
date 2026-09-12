@@ -5,6 +5,22 @@ function nowIST() {
   return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+// Lenient phone normalizer — always produces '91' + last-10-digits or null.
+// Used as the single source of truth for conversation IDs so that incoming
+// webhook, outgoing sends, and ticket creation all produce the same key.
+function normalizePhone(phone) {
+  if (!phone) return null;
+  let cleaned = String(phone).replace(/[^\d]/g, '').replace(/^0+/, '');
+  if (!cleaned) return null;
+  if (cleaned.length === 10) return '91' + cleaned;
+  if (cleaned.length === 12 && cleaned.startsWith('91')) return cleaned;
+  if (cleaned.length > 10) {
+    const last10 = cleaned.slice(-10);
+    if (/^\d{10}$/.test(last10)) return '91' + last10;
+  }
+  return null;
+}
+
 async function createSystemMessage({
   conversationId,
   ticketId,
@@ -144,17 +160,6 @@ const EVENT_MAP = {
   'Cancelled': { event: 'cancelled', text: 'Cancelled', description: 'Repair has been cancelled.' },
 };
 
-function normalizePhone(phone) {
-  if (!phone) return null;
-  let cleaned = phone.replace(/[^\d]/g, '').replace(/^0+/, '');
-  if (!cleaned) return null;
-  if (cleaned.length === 10) cleaned = '91' + cleaned;
-  if (cleaned.length === 12 && cleaned.startsWith('91')) {
-    return cleaned;
-  }
-  return null;
-}
-
 async function getCustomerPhone(phone) {
   const cleaned = normalizePhone(phone);
   if (!cleaned) return null;
@@ -176,7 +181,6 @@ async function findExistingConversation(phone) {
   const existing = await query('SELECT conversation_id FROM messages WHERE conversation_id = $1 LIMIT 1', [convId]);
   if (existing.rows.length > 0) return convId;
 
-  // Try finding by phone in messages table (without 91 prefix)
   const shortPhone = cleanPhone.replace(/^91/, '');
   const phoneMatch = await query(
     'SELECT conversation_id FROM messages WHERE phone = $1 OR phone = $2 OR phone LIKE $3 LIMIT 1',
@@ -195,7 +199,9 @@ async function createStatusEvent(ticketId, oldStatus, newStatus, changedBy = 'Sy
   const eventInfo = EVENT_MAP[newStatus];
   if (!eventInfo) return null;
 
-  const conversationId = await findExistingConversation(t.customer_phone) || ('cust_' + (normalizePhone(t.customer_phone) || 'unknown'));
+  const normalizedPhone = normalizePhone(t.customer_phone);
+  const conversationId = await findExistingConversation(t.customer_phone)
+    || (normalizedPhone ? 'cust_' + normalizedPhone : 'conv_ticket_' + ticketId);
 
   return createSystemMessage({
     conversationId,
@@ -213,7 +219,22 @@ async function storeIncomingMessage({ from, waId, text, profileName }) {
   const now = nowIST();
   const normalizedFrom = normalizePhone(from);
   const cleanFrom = (normalizedFrom || from).replace(/[^\d]/g, '').replace(/^0+/, '');
+  if (!normalizedFrom && !cleanFrom) {
+    return { id: null, customerId: null, convId: null };
+  }
   const convId = 'cust_' + (normalizedFrom || cleanFrom);
+
+  // Duplicate message protection: skip if provider_message_id already stored
+  if (waId) {
+    try {
+      const dup = await query('SELECT id FROM messages WHERE provider_message_id = $1 LIMIT 1', [waId]);
+      if (dup.rows.length > 0) {
+        return { id: dup.rows[0].id, customerId: null, convId, duplicate: true };
+      }
+    } catch (e) {
+      // Non-fatal — proceed with insert
+    }
+  }
 
   let customerId = null;
   try {
@@ -251,14 +272,31 @@ async function getOrCreateConversation(ticketId, customerId, customerPhone) {
   if (tRes.rows.length === 0) return null;
   const ticket = tRes.rows[0];
 
-  // Use normalized phone-based conversation ID for single conversation per customer
-  const normalizedPhone = normalizePhone(customerPhone);
-  const convId = 'cust_' + (normalizedPhone || customerPhone || '').replace(/[^\d]/g, '');
+  // Always resolve the source phone from the ticket record when the caller did
+  // not pass one (callers like service-invoice generation only send ticketId).
+  const sourcePhone = customerPhone || ticket.customer_phone || ticket.mobile_number || '';
+
+  // Never create a bare 'cust_' conversation: if the ticket has a phone use the
+  // normalized phone key (single conversation per customer). Otherwise fall back
+  // to a stable ticket-based key so every message still lands in the SAME chat.
+  const normalizedPhone = normalizePhone(sourcePhone);
+  const convId = normalizedPhone
+    ? 'cust_' + normalizedPhone
+    : 'conv_ticket_' + ticketId;
 
   const existingConv = await query(
     'SELECT conversation_id FROM messages WHERE conversation_id = $1 LIMIT 1',
     [convId]
   );
+
+  // Reuse the existing conversation even when its ID is an older local-only
+  // ticket key but the customer is reachable by the phone-based key.
+  if (normalizedPhone) {
+    const phoneExisting = await findExistingConversation(sourcePhone);
+    if (phoneExisting) {
+      return { conversationId: phoneExisting, isNew: false };
+    }
+  }
 
   if (existingConv.rows.length > 0) {
     return { conversationId: convId, isNew: false };
@@ -274,7 +312,7 @@ async function getOrCreateConversation(ticketId, customerId, customerPhone) {
     text: systemMsg,
     description: '',
     type: 'event',
-    phone: customerPhone,
+    phone: sourcePhone || null,
   });
 
   return { conversationId: convId, isNew: true };
@@ -460,6 +498,18 @@ async function updateMessageStatus(providerMessageId, status) {
   );
 }
 
+// Link a placeholder message record (e.g. the PDF card created before the
+// actual send) to the real WhatsApp message id returned by the Cloud API and
+// set its initial status. Once linked, webhook status callbacks (sent →
+// delivered → read → failed) update this record automatically.
+async function updateMessageStatusById(messageId, providerMessageId, status) {
+  if (!messageId) return;
+  await query(
+    `UPDATE messages SET provider_message_id = $1, status = $2 WHERE id = $3`,
+    [providerMessageId || null, status, messageId]
+  );
+}
+
 async function getConversationByPhone(phone) {
   const cleanPhone = phone.replace(/[^\d]/g, '');
   const convId = 'cust_' + cleanPhone;
@@ -486,6 +536,7 @@ module.exports = {
   getConversationsWithDetails,
   saveCustomerContact,
   updateMessageStatus,
+  updateMessageStatusById,
   getConversationByPhone,
   findConversationByPhone,
   findExistingConversation,

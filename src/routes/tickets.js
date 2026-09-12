@@ -17,7 +17,7 @@ const { recordStatusChange, getStatusHistory } = require('../services/statusHist
 const { validateTicket } = require('../middleware/validation');
 const { optionalAuth } = require('../middleware/optionalAuth');
 const { generateInwardReceiptFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
-const { createPdfMessage, createStatusEvent, getOrCreateConversation } = require('../services/messagingService');
+const { createPdfMessage, createStatusEvent, getOrCreateConversation, updateMessageStatusById } = require('../services/messagingService');
 const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendCollectionLink, sendInwardReceiptLink, sendServiceInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
 
 // Normalize status strings to exact DB enum values (handles casing differences
@@ -91,7 +91,7 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
     try {
       const pdf = await generateServiceInvoiceFromHTML(ticketId);
       const conv = await getOrCreateConversation(ticketId);
-      await createPdfMessage({
+      const fileMsg = await createPdfMessage({
         conversationId: conv ? conv.conversationId : null,
         ticketId,
         sender: 'System',
@@ -107,9 +107,15 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
       const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
       const ticket = tRes.rows[0];
       if (ticket && ticket.customer_phone && pdf.filePath) {
-        await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e =>
-          console.error('Auto-send service invoice template failed:', e.message)
-        );
+        const forwardResult = await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e => {
+          console.error('Auto-send service invoice template failed:', e.message);
+          return null;
+        });
+        if (forwardResult && forwardResult.success && forwardResult.messageId) {
+          await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+        } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+          await updateMessageStatusById(fileMsg.id, null, 'failed');
+        }
       }
     } catch (e) {
       console.error('Auto-generate service invoice failed:', e.message);
@@ -421,7 +427,7 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
       try {
         await new Promise(resolve => setTimeout(resolve, 30000));
         const pdf = await generateInwardReceiptFromHTML(insertId);
-        await createPdfMessage({
+        const fileMsg = await createPdfMessage({
           conversationId: custConvId,
           ticketId: insertId,
           customerId: resolvedCustomerId,
@@ -435,8 +441,13 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
         // Auto-send the receipt via WhatsApp template (always delivers). Falls
         // back to the raw PDF document if the template is not approved yet.
         if (phone && pdf.filePath) {
-          sendInwardReceiptLink(newTicket.rows[0], pdf.filePath)
-            .catch(e => console.error('Auto-send inward receipt failed:', e.message));
+          const forwardResult = await sendInwardReceiptLink(newTicket.rows[0], pdf.filePath)
+            .catch(e => { console.error('Auto-send inward receipt failed:', e.message); return null; });
+          if (forwardResult && forwardResult.success && forwardResult.messageId) {
+            await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+          } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+            await updateMessageStatusById(fileMsg.id, null, 'failed');
+          }
         }
       } catch (e) {
         console.error('Auto-generate inward receipt failed:', e.message);
@@ -651,16 +662,121 @@ router.put('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /api/tickets/:id - Delete ticket
+// DELETE /api/tickets/:id - Delete ticket and all linked records
 router.delete('/:id', async (req, res, next) => {
+  const client = await getConnection();
   try {
-    const result = await query('DELETE FROM tickets WHERE id = ?', [req.params.id]);
+    await client.query('BEGIN');
+
+    const id = req.params.id;
+    const existing = await client.query('SELECT id, ticket_id, customer_name, customer_phone FROM tickets WHERE id = $1', [id]);
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    const ticket = existing.rows[0];
+
+    // Helper: run a DELETE on a child table, silently skip if the table
+    // doesn't exist (migration not yet applied). Any other error will
+    // abort the transaction properly instead of silently swallowing it.
+    const safeDelete = async (sql, params) => {
+      try {
+        await client.query(sql, params);
+      } catch (e) {
+        if (e.code === '42P01') {
+          // relation does not exist – table was never created, skip
+          return;
+        }
+        throw e;
+      }
+    };
+
+    // Conversation(s) that referenced this ticket - used so the Messages page
+    // can immediately drop the now-empty ticket conversations via socket.
+    let conversationIds = [];
+    try {
+      const convRows = await client.query(
+        'SELECT DISTINCT conversation_id FROM messages WHERE ticket_id = $1',
+        [id]
+      );
+      conversationIds = (convRows.rows || []).map(r => r.conversation_id);
+    } catch (e) {
+      if (e.code !== '42P01') throw e;
+    }
+
+    // Tables linked to the ticket indirectly via its invoices rather than
+    // directly through a ticket_id column.
+    const invoiceLinkedTables = ['invoice_items', 'invoice_pdfs'];
+    for (const table of invoiceLinkedTables) {
+      await safeDelete(
+        `DELETE FROM ${table}
+         WHERE invoice_id IN (SELECT id FROM invoices WHERE ticket_id = $1)`,
+        [id]
+      );
+    }
+
+    // Dynamically discover every table that has a ticket_id column, so that
+    // no related table is ever missed (including newly added ones). This
+    // replaces a fragile hardcoded list.
+    const ticketLinkedRows = await client.query(`
+      SELECT table_name
+      FROM information_schema.columns
+      WHERE column_name = 'ticket_id'
+        AND table_schema = 'public'
+        AND table_name <> 'tickets'
+      ORDER BY table_name
+    `);
+    for (const row of ticketLinkedRows.rows) {
+      await safeDelete(`DELETE FROM "${row.table_name}" WHERE ticket_id = $1`, [id]);
+    }
+
+    // Conversations are per-customer (cust_<phone>) and may hold WhatsApp
+    // customer replies that carry a NULL ticket_id/order_id. Without cleanup
+    // those leftover rows keep the deleted ticket's chat visible in the
+    // Messages page. Remove any message in the affected conversations that is
+    // no longer linked to any ticket or order (i.e. orphaned by this delete),
+    // while preserving messages that still belong to another ticket/order.
+    for (const convId of conversationIds) {
+      await safeDelete(
+        `DELETE FROM messages
+         WHERE conversation_id = $1
+           AND ticket_id IS NULL
+           AND order_id IS NULL`,
+        [convId]
+      );
+    }
+
+    // Finally remove the ticket itself.
+    const result = await client.query('DELETE FROM tickets WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+
     if (result.rowCount === 0) {
       return res.status(404).json({ success: false, message: 'Ticket not found' });
     }
+
+    // Let every connected client refresh immediately (messages + dashboard).
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.emit('ticket_deleted', {
+        ticketId: parseInt(id, 10),
+        ticketNumber: ticket.ticket_id,
+        conversationIds,
+      });
+    }
+
     res.json({ success: true, message: 'Ticket deleted successfully' });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      // ROLLBACK can itself fail if the connection is broken; log and move on
+      console.error('Rollback failed:', rollbackErr.message);
+    }
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -779,8 +895,9 @@ router.put('/:id/status', async (req, res, next) => {
               await sendTextMessage(ticketData.customer_phone, fallbackText, { ticketId: parseInt(req.params.id), customerId: ticketData.customer_id, phone: ticketData.customer_phone, sender: 'System', conversationId: convId });
             }
           }
-          // After the template message, auto-send the collection link when the
-          // ticket is marked Completed so the customer can collect the device.
+          // After the status template, auto-send the unique one-time collection
+          // link for Completed tickets. This must run REGARDLESS of whether the
+          // status template succeeded, so it sits outside the failure branch.
           if (status === 'Completed') {
             await sendCollectionLink(updated.rows[0]);
           }

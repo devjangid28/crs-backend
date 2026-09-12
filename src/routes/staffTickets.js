@@ -3,7 +3,7 @@ const router = express.Router();
 const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
-const { createStatusEvent, getOrCreateConversation, createPdfMessage } = require('../services/messagingService');
+const { createStatusEvent, getOrCreateConversation, createPdfMessage, updateMessageStatusById } = require('../services/messagingService');
 const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, sendServiceInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
 const { generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 
@@ -67,7 +67,7 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
     try {
       const pdf = await generateServiceInvoiceFromHTML(ticketId);
       const conv = await getOrCreateConversation(ticketId);
-      await createPdfMessage({
+      const fileMsg = await createPdfMessage({
         conversationId: conv ? conv.conversationId : null,
         ticketId,
         sender: 'System',
@@ -83,9 +83,15 @@ function scheduleServiceInvoiceGeneration(ticketId, status) {
       const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
       const ticket = tRes.rows[0];
       if (ticket && ticket.customer_phone && pdf.filePath) {
-        await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e =>
-          console.error('Auto-send service invoice template failed:', e.message)
-        );
+        const forwardResult = await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e => {
+          console.error('Auto-send service invoice template failed:', e.message);
+          return null;
+        });
+        if (forwardResult && forwardResult.success && forwardResult.messageId) {
+          await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
+        } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
+          await updateMessageStatusById(fileMsg.id, null, 'failed');
+        }
       }
     } catch (e) {
       console.error('Auto-generate service invoice failed:', e.message);

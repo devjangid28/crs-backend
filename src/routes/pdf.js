@@ -276,6 +276,23 @@ router.get('/download/order/:orderId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/pdf/download/order-invoice/:orderId - Download the order invoice PDF
+// (ASUS store). The PDF is regenerated on demand so it always has the latest
+// data (invoice number, series, items, etc.) and is saved directly by the browser.
+router.get('/download/order-invoice/:orderId', async (req, res, next) => {
+  try {
+    const orderId = parseInt(req.params.orderId);
+    const oRes = await query('SELECT order_number, invoice_number FROM orders WHERE id = $1', [orderId]);
+    if (oRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Order not found' });
+    const { generateOrderInvoicePdf } = require('../services/tallyOrderInvoicePdf');
+    const pdf = await generateOrderInvoicePdf(orderId);
+    const downloadName = oRes.rows[0].invoice_number != null
+      ? `Invoice_${oRes.rows[0].invoice_number}.pdf`
+      : pdf.fileName;
+    res.download(pdf.filePath, downloadName);
+  } catch (err) { next(err); }
+});
+
 // GET /api/pdf/orderform-html/:orderId - Get populated orderform.html for browser printing
 router.get('/orderform-html/:orderId', async (req, res, next) => {
   try {
@@ -293,7 +310,7 @@ router.get('/orderform-html/:orderId', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products

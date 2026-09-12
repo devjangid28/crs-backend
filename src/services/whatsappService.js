@@ -583,15 +583,52 @@ async function sendCollectionLink(ticket) {
   if (!ticketId || !phone) return { success: false, error: 'No ticket id or customer phone' };
 
   const token = await getOrCreateToken(ticketId, 'collection', 168);
-  const linkUrl = `${getPublicBaseUrl()}/collect/${ticketId}/${token.token}`;
+  const baseUrl = getPublicBaseUrl();
+  const linkUrl = `${baseUrl}/collect/${ticketId}/${token.token}`;
 
   const convId = getConversationIdFromPhone(phone);
   const ctx = { ticketId, customerId: ticket.customer_id, phone, sender: 'System', conversationId: convId };
 
-  // Direct text send. NOTE: Meta only delivers free-form text inside a 24h
-  // window that the customer opens by messaging first; otherwise Meta
-  // rejects it (this is why template delivery needs an approved template,
-  // which the business has chosen not to create).
+  // Preferred path: send the approved "device_collection" template with a URL
+  // button so the unique one-time link is delivered automatically (without
+  // needing the customer to message first / the 24h window). The button's base
+  // URL is configured on Meta (e.g. https://yourdomain.com/collect/) and only
+  // the unique per-ticket part (<ticketId>/<token>) is passed as the suffix.
+  const templateName = config.whatsapp.templateCollection;
+  if (templateName) {
+    const tResult = await sendTemplateMessage(
+      phone,
+      templateName,
+      [ticket.customer_name || 'Valued Customer'],
+      ctx,
+      { buttonUrlSuffix: `${ticketId}/${token.token}` }
+    );
+    if (tResult.success) {
+      try {
+        await createLinkMessage({
+          conversationId: convId,
+          ticketId,
+          customerId: ticket.customer_id,
+          sender: 'System',
+          linkType: 'collection',
+          linkUrl,
+          text: 'Device Collection',
+          description: 'Your device is repaired and ready for collection. Click to complete the collection process.',
+          providerMessageId: tResult.messageId,
+          phone,
+          status: 'sent',
+        });
+      } catch (e) {
+        wa.error('sendCollectionLink: createLinkMessage failed', e, { ticketId });
+      }
+      return tResult;
+    }
+    wa.info('sendCollectionLink: template failed, falling back to raw text', { error: tResult.error, code: tResult.code, ticketId });
+  }
+
+  // Fallback: direct text. NOTE: Meta only delivers free-form text inside a
+  // 24h window that the customer opens by messaging first; otherwise Meta
+  // rejects it (this is why the approved template is preferred).
   const text = `*Device Collection*\nYour device has been repaired and is ready for collection.\n\nClick the link below to complete the collection process:\n${linkUrl}`;
   const waResult = await sendTextMessage(phone, text, ctx, { skipSave: true });
 

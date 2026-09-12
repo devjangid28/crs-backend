@@ -29,6 +29,7 @@ function productDetailLines(p) {
   const lines = [];
   const type = p.accessory_type && p.accessory_type !== 'Accessories' ? p.accessory_type : '';
   lines.push(String(p.product_name || 'Product') + (type ? ' - ' + type : ''));
+  if (p.series) lines.push('Series: ' + p.series);
   if (p.product_model) lines.push('Model No: ' + p.product_model);
   if (p.serial_number) lines.push('Serial No: ' + p.serial_number);
   if (p.part_no) lines.push('Part No: ' + p.part_no);

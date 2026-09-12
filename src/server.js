@@ -214,8 +214,13 @@ const tallyService = require('./services/tallyService');
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS accessory_type VARCHAR(200) DEFAULT NULL`).catch(() => {});
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS part_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS check_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS series VARCHAR(100) DEFAULT NULL`).catch(() => {});
       // Customer GSTIN (shown on the tax invoice, optional, non-compulsory)
       await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
+      // Persistent sequential invoice number for ASUS store orders (starts at 16)
+      await pool.query(`CREATE SEQUENCE IF NOT EXISTS order_invoice_seq START WITH 16 INCREMENT BY 1 CACHE 1`).catch(() => {});
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_number INTEGER DEFAULT NULL`).catch(() => {});
+      await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_invoice_number ON orders (invoice_number) WHERE invoice_number IS NOT NULL`).catch(() => {});
       await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_products_order ON order_products(order_id)`).catch(() => {});
       if (process.env.TALLY_HOST) {

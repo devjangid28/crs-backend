@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const puppeteer = require('puppeteer');
 const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 
@@ -303,6 +304,24 @@ router.delete('/:id', authenticate, async (req, res, next) => {
   }
 });
 
+// Load quotation background image as base64 (cached)
+let quotBgDataUri = null;
+function getQuotationBgDataUri() {
+  if (quotBgDataUri) return quotBgDataUri;
+  const bgPaths = [
+    path.join(__dirname, '..', '..', '..', 'quotation_background.png'),
+    path.join(__dirname, '..', '..', 'public', 'quotation_background.png'),
+  ];
+  for (const p of bgPaths) {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      quotBgDataUri = 'data:image/png;base64,' + buf.toString('base64');
+      return quotBgDataUri;
+    }
+  }
+  return '';
+}
+
 // GET /api/quotations/:id/preview - Return Quotation.html with data filled in
 router.get('/:id/preview', authenticate, async (req, res, next) => {
   try {
@@ -327,10 +346,10 @@ router.get('/:id/preview', authenticate, async (req, res, next) => {
 
     let html = fs.readFileSync(templatePath, 'utf-8');
 
-    // Inject data as JSON for client-side population
+    const bgDataUri = getQuotationBgDataUri();
     html = html.replace(
       '<body>',
-      `<body>\n<script>window.__QUOTATION_DATA__ = ${JSON.stringify(quotation)};</script>`
+      `<body>\n<script>window.__QUOTATION_DATA__ = ${JSON.stringify(quotation)}; window.__QUOT_BG__ = ${JSON.stringify(bgDataUri)};</script>`
     );
 
     res.setHeader('Content-Type', 'text/html');
@@ -340,8 +359,9 @@ router.get('/:id/preview', authenticate, async (req, res, next) => {
   }
 });
 
-// GET /api/quotations/:id/download - Download Quotation.html as file
+// GET /api/quotations/:id/download - Download Quotation as PDF
 router.get('/:id/download', authenticate, async (req, res, next) => {
+  let browser = null;
   try {
     await ensureTable();
     const result = await query('SELECT * FROM quotations WHERE id = $1', [req.params.id]);
@@ -363,15 +383,39 @@ router.get('/:id/download', authenticate, async (req, res, next) => {
 
     let html = fs.readFileSync(templatePath, 'utf-8');
 
+    const bgDataUri = getQuotationBgDataUri();
     html = html.replace(
       '<body>',
-      `<body>\n<script>window.__QUOTATION_DATA__ = ${JSON.stringify(quotation)};</script>`
+      `<body>\n<script>window.__QUOTATION_DATA__ = ${JSON.stringify(quotation)}; window.__QUOT_BG__ = ${JSON.stringify(bgDataUri)};</script>`
     );
 
-    res.setHeader('Content-Type', 'text/html');
-    res.setHeader('Content-Disposition', `attachment; filename="${quotation.quotation_number.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_')}.html"`);
-    res.send(html);
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '0', bottom: '0', left: '0', right: '0' },
+    });
+
+    await browser.close();
+    browser = null;
+
+    const safeName = (quotation.quotation_number || 'Quotation').replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
+    const fileName = `${safeName}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(Buffer.from(pdfBuffer));
   } catch (err) {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
     next(err);
   }
 });
