@@ -26,6 +26,11 @@ const config = {
   upload: {
     dir: process.env.UPLOAD_DIR || './uploads',
   },
+  neon: {
+    apiKey: process.env.NEON_API_KEY || null,
+    orgId: process.env.NEON_ORG_ID || null,
+    region: process.env.NEON_REGION || null,
+  },
   whatsapp: {
     phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
     businessAccountId: process.env.WHATSAPP_BUSINESS_ACCOUNT_ID,
@@ -44,6 +49,26 @@ const config = {
     templateServiceInvoice: process.env.WHATSAPP_TEMPLATE_SERVICE_INVOICE || 'service_invoice',
     templateOrderInvoice: process.env.WHATSAPP_TEMPLATE_ORDER_INVOICE || 'order_invoice',
     templateReview: process.env.WHATSAPP_TEMPLATE_REVIEW || 'review_link',
+    templateBookingChallan: process.env.WHATSAPP_TEMPLATE_BOOKING_CHALLAN || 'booking_challan',
+    // Image-header template used to deliver repair photos to the customer.
+    // Free-form image sends are rejected by Meta outside the 24h service window
+    // ("Re-engagement message"), so this template is the only way an image
+    // actually reaches the customer. Requires an IMAGE header in Meta.
+    templateImageUpdate: process.env.WHATSAPP_TEMPLATE_IMAGE_UPDATE || 'repair_photo',
+    // Utility template used to deliver a merged "photo sheet" (a single grid
+    // image built from several repair photos). Same reasoning as
+    // templateImageUpdate: Meta will not deliver free-form images outside the
+    // 24h window, so this template is the only reliable route. Requires an
+    // IMAGE header in Meta.
+    templatePhotoSheet: process.env.WHATSAPP_TEMPLATE_PHOTO_SHEET || 'repair_photo_update',
+    // Body variables for the image template, comma separated. Meta rejects a send
+    // whose parameter count does not match the approved template body, so this
+    // must be set to exactly the number of {{n}} placeholders in the template.
+    // Empty means the approved template body has no variables.
+    templateImageUpdateParams: (process.env.WHATSAPP_TEMPLATE_IMAGE_UPDATE_PARAMS || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean),
     templateLanguages: Object.freeze({
       'ticket_created': 'en_GB',
       'ticket_pending': 'en_GB',
@@ -58,6 +83,13 @@ const config = {
       'service_invoice': 'en_IN',
       'order_invoice': 'en_IN',
       'review_link': 'en_IN',
+      'booking_challan': process.env.WHATSAPP_TEMPLATE_BOOKING_CHALLAN_LANG || 'en_IN',
+      'repair_photo': process.env.WHATSAPP_TEMPLATE_IMAGE_UPDATE_LANG || 'en_IN',
+      // NOTE: the language is resolved by exact template name. Without an entry
+      // here a renamed template silently falls back to en_GB at send time and
+      // Meta rejects it with "template does not exist" for the approved en_IN
+      // language, so keep this key in sync with WHATSAPP_TEMPLATE_PHOTO_SHEET.
+      'repair_photo_update': process.env.WHATSAPP_TEMPLATE_PHOTO_SHEET_LANG || 'en_IN',
     }),
   },
 };

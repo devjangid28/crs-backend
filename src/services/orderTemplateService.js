@@ -235,12 +235,10 @@ function populateOrderTemplate(order, components, settings, products) {
   const disc = parseFloat(order.discount) || 0;
   const subtotal = serviceAmt + componentsTotal + productsTotal;
   const gstRate = 0.18;
-  const gstAmount = subtotal * gstRate;
-  const isAsusStore = String(settings?.store_name || '').toLowerCase().includes('asus');
-  const amountBeforeDiscount = subtotal + gstAmount;
-  // For ASUS store the customer amount is GST-inclusive; GST is NOT added on top.
-  // For non-ASUS stores GST is added on top of the subtotal.
-  const grandTotal = isAsusStore ? (subtotal - disc) : (amountBeforeDiscount - disc);
+  // Customer amounts are GST-inclusive: back the GST out for display and never
+  // add it on top of the subtotal again.
+  const gstAmount = subtotal - (subtotal / (1 + gstRate));
+  const grandTotal = subtotal - disc;
   const advance = parseFloat(order.advance_payment) || 0;
   const remainingBalance = Math.max(0, grandTotal - advance);
 
@@ -279,7 +277,7 @@ function populateOrderTemplate(order, components, settings, products) {
   );
   html = html.replace(
     /(<[^>]*\sid="paymentStatus"[^>]*>)[^<]*(<\/\w+>)/,
-    '$1' + (order.payment_status || 'Unpaid') + '$2'
+    '$1' + 'Paid Fully' + '$2'
   );
   html = html.replace(
     /(<[^>]*\sid="paymentMode"[^>]*>)[^<]*(<\/\w+>)/,

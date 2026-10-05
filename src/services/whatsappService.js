@@ -1,6 +1,6 @@
 const config = require('../config');
 const { query } = require('../config/database');
-const { createTextMessage, createTemplateMessage, createPdfMessage, createLinkMessage, nowIST } = require('./messagingService');
+const { createTextMessage, createTemplateMessage, createLinkMessage, isWithinServiceWindow, nowIST } = require('./messagingService');
 const { getOrCreateToken } = require('./tokenService');
 const { wa } = require('./logger');
 
@@ -313,7 +313,56 @@ async function sendTextMessage(to, text, context = {}, options = {}) {
   return result;
 }
 
-async function sendTemplateMessage(to, templateName, params, context = {}, extra = {}) {
+// Build the optional "header" component for a template message. A template's
+// header format is fixed in Meta (DOCUMENT, IMAGE, ...), so the caller must pass
+// the media kind that matches the template that was approved. Returns null when
+// no header media was requested.
+function buildTemplateHeader(extra = {}) {
+  if (extra.headerImageId || extra.headerImageLink) {
+    const imageParam = extra.headerImageId
+      ? { id: extra.headerImageId }
+      : { link: extra.headerImageLink };
+    return {
+      type: 'header',
+      parameters: [
+        { type: 'image', image: imageParam },
+      ],
+    };
+  }
+
+  if (extra.headerDocumentId || extra.headerDocumentLink) {
+    const documentParam = extra.headerDocumentId
+      ? { id: extra.headerDocumentId }
+      : { link: extra.headerDocumentLink };
+    return {
+      type: 'header',
+      parameters: [
+        {
+          type: 'document',
+          document: {
+            ...documentParam,
+            filename: extra.documentFilename || 'receipt.pdf',
+          },
+        },
+      ],
+    };
+  }
+
+  return null;
+}
+
+// Meta error codes/titles that mean "this free-form message can never be
+// delivered right now". 131047 "Re-engagement message" is the 24-hour customer
+// service window being closed.
+function isReengagementError(result) {
+  if (!result) return false;
+  const code = result.code;
+  if (code === 131047 || code === 131048) return true;
+  const text = `${result.error || ''} ${result.type || ''} ${result.details || ''}`.toLowerCase();
+  return text.includes('re-engagement') || text.includes('reengagement');
+}
+
+async function sendTemplateMessage(to, templateName, params, context = {}, extra = {}, options = {}) {
   wa.info('sendTemplateMessage called', { to, templateName, params, context, extra });
 
   if (!isEnabled()) {
@@ -335,26 +384,14 @@ async function sendTemplateMessage(to, templateName, params, context = {}, extra
     },
   ];
 
-  // Header with an attached PDF (inward receipt / invoice). The document is
-  // delivered as a real file inside the template — no link pasted in the body.
-  // Accepts either a pre-uploaded media id (headerDocumentId) or a public URL
-  // (headerDocumentLink).
-  if (extra.headerDocumentId || extra.headerDocumentLink) {
-    const documentParam = extra.headerDocumentId
-      ? { id: extra.headerDocumentId }
-      : { link: extra.headerDocumentLink };
-    components.unshift({
-      type: 'header',
-      parameters: [
-        {
-          type: 'document',
-          document: {
-            ...documentParam,
-            filename: extra.documentFilename || 'receipt.pdf',
-          },
-        },
-      ],
-    });
+  // Header with attached media (inward receipt / invoice as a document, repair
+  // photos as an image). The media is delivered as a real attachment inside the
+  // template — no link pasted in the body. Accepts either a pre-uploaded media
+  // id (headerDocumentId / headerImageId) or a public URL (headerDocumentLink /
+  // headerImageLink).
+  const headerComponent = buildTemplateHeader(extra);
+  if (headerComponent) {
+    components.unshift(headerComponent);
   }
 
   // URL button that opens the collection page (clean button, not pasted text).
@@ -383,7 +420,9 @@ async function sendTemplateMessage(to, templateName, params, context = {}, extra
   if (result.success) {
     wa.info('sendTemplateMessage: success', { to: phone, templateName, messageId: result.messageId });
     await logMessage(phone, displayText, 'sent', result.messageId, null, context.ticketId, 'template', context.orderId);
-    await saveMessagesRecord(displayText, { ...context, phone, templateName, sender: context.sender || 'System' }, result.messageId, 'template');
+    if (!options.skipSave) {
+      await saveMessagesRecord(displayText, { ...context, phone, templateName, sender: context.sender || 'System' }, result.messageId, 'template');
+    }
   } else {
     wa.error('sendTemplateMessage: failed', { to: phone, templateName, error: result.error, code: result.code });
     await logMessage(phone, displayText, 'failed', null, result.error, context.ticketId, 'template', context.orderId);
@@ -829,8 +868,22 @@ async function sendDocumentFile(to, filePath, caption, context = {}) {
   return result;
 }
 
-async function sendMediaFile(to, filePath, mimeType = 'application/pdf', caption = '', context = {}) {
-  wa.info('sendMediaFile called', { to, filePath, mimeType, caption });
+// Send a local file to the customer as a WhatsApp message.
+//
+// Meta only delivers free-form (non-template) media while the 24-hour customer
+// service window is open. Outside that window the API still returns a wamid, but
+// the status webhook then reports the message as failed with "Re-engagement
+// message" (131047) and the customer never sees the file. Approved templates are
+// the only reliable delivery route outside the window, so we upload once and
+// then try the routes in order of preference:
+//
+//   inside the window  -> free-form first (keeps the caption; no template cost)
+//   outside the window -> image template first, free-form only as a fallback
+//
+// The result always describes what actually happened so callers never report
+// success for a message Meta silently dropped.
+async function sendMediaFile(to, filePath, mimeType = 'application/pdf', caption = '', context = {}, options = {}) {
+  wa.info('sendMediaFile called', { to, filePath, mimeType, caption, options });
 
   if (!isEnabled()) {
     return { success: false, skipped: true };
@@ -852,27 +905,224 @@ async function sendMediaFile(to, filePath, mimeType = 'application/pdf', caption
   const mediaId = uploadResult.mediaId;
   const isImage = mimeType.startsWith('image/');
   const mediaKey = isImage ? 'image' : 'document';
+  const fileName = filePath.split('\\').pop().split('/').pop();
 
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: phone,
-    type: mediaKey,
-    [mediaKey]: isImage
-      ? { id: mediaId, caption: caption || '' }
-      : { id: mediaId, caption: caption || '', filename: filePath.split('\\').pop().split('/').pop() },
+  const sendFreeForm = () => {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: phone,
+      type: mediaKey,
+      [mediaKey]: isImage
+        ? { id: mediaId, caption: caption || '' }
+        : { id: mediaId, caption: caption || '', filename: fileName },
+    };
+    return callWhatsAppApi(payload);
   };
 
-  const result = await callWhatsAppApi(payload);
+  // Only images have a dedicated media-header template. Documents go out through
+  // their own document templates (inward_receipt / service_invoice) instead.
+  // Callers can point a send at a different image template (the merged photo
+  // sheet uses its own) without losing the window-aware routing below.
+  const templateName = isImage
+    ? (options.templateName || config.whatsapp.templateImageUpdate)
+    : null;
+  const sendViaTemplate = () => sendTemplateMessage(
+    phone,
+    templateName,
+    options.templateParams || context.templateParams || config.whatsapp.templateImageUpdateParams || [],
+    { ...context, phone },
+    isImage ? { headerImageId: mediaId } : { headerDocumentId: mediaId, documentFilename: fileName },
+    { skipSave: true }
+  );
 
-  if (result.success) {
-    wa.info('sendMediaFile: sent successfully', { to: phone, mimeType, caption, messageId: result.messageId });
-    await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'sent', result.messageId, null, context.ticketId, mediaKey, context.orderId);
+  const withinWindow = await isWithinServiceWindow(phone);
+  wa.info('sendMediaFile: choosing delivery route', { to: phone, mediaKey, withinWindow, templateName });
+
+  const attempts = [];
+  if (withinWindow) {
+    attempts.push({ via: 'free_form', run: sendFreeForm });
+    if (templateName) attempts.push({ via: 'template', run: sendViaTemplate });
   } else {
-    wa.error('sendMediaFile: failed', { to: phone, mimeType, caption, error: result.error, code: result.code });
-    await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'failed', null, result.error, context.ticketId, mediaKey, context.orderId);
+    if (templateName) attempts.push({ via: 'template', run: sendViaTemplate });
+    attempts.push({ via: 'free_form', run: sendFreeForm });
   }
 
+  let lastError = null;
+  for (const attempt of attempts) {
+    const result = await attempt.run();
+    if (result && result.success) {
+      wa.info('sendMediaFile: sent successfully', {
+        to: phone, mimeType, caption, messageId: result.messageId, via: attempt.via, withinWindow,
+      });
+      await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'sent', result.messageId, null, context.ticketId, mediaKey, context.orderId);
+      return { ...result, via: attempt.via, withinWindow };
+    }
+    lastError = result && result.error ? result.error : 'WhatsApp API returned unsuccessful';
+    wa.error('sendMediaFile: route failed', { to: phone, via: attempt.via, error: lastError, code: result && result.code });
+  }
+
+  // Nothing worked. Surface the reason that is actually actionable for the user
+  // rather than a generic failure, because the usual cause is a Meta policy
+  // limit rather than a bug in this code.
+  const blockedByWindow = isReengagementError({ error: lastError });
+  const finalError = blockedByWindow && !withinWindow
+    ? `Outside the 24h WhatsApp window and no approved template could deliver this ${mediaKey}. ` +
+      `Approve the "${templateName || mediaKey}" template in Meta, or ask the customer to message us first.`
+    : `WhatsApp rejected the ${mediaKey}: ${lastError}`;
+
+  wa.error('sendMediaFile: all routes failed', { to: phone, mimeType, error: lastError, withinWindow });
+  await logMessage(phone, `[${mediaKey}] ${caption || filePath}`, 'failed', null, finalError, context.ticketId, mediaKey, context.orderId);
+  return { success: false, error: finalError, withinWindow, via: 'none' };
+}
+
+// Deliver an already-merged photo sheet (a single grid image built from several
+// repair photos) to the customer.
+//
+// The whole point of merging is that the customer sees every photo in one
+// message, so this must never fan out into one send per photo: that would cost
+// N x the utility rate, arrive out of order, and risk partial delivery.
+// sendMediaFile already prefers the approved image template whenever the 24-hour
+// window is closed, which is what lets the sheet reach a customer who has not
+// messaged us first.
+async function sendPhotoSheet(to, sheetPath, meta = {}, context = {}) {
+  if (!config.whatsapp.templatePhotoSheet) {
+    return { success: false, error: 'No photo sheet template configured (WHATSAPP_TEMPLATE_PHOTO_SHEET)' };
+  }
+
+  // The approved repair_photo_update body carries exactly three variables:
+  // {{1}} customer name, {{2}} device, {{3}} ticket number. Meta rejects the
+  // send outright if the count does not match, so never pass a different
+  // number of values here.
+  const templateParams = [
+    meta.customer || 'Customer',
+    meta.device || 'Device',
+    meta.ticket || '',
+  ];
+
+  const result = await sendMediaFile(
+    to,
+    sheetPath,
+    'image/jpeg',
+    context.caption || '',
+    context,
+    {
+      templateName: config.whatsapp.templatePhotoSheet,
+      templateParams,
+    }
+  );
+
+  wa.info('sendPhotoSheet: result', {
+    to,
+    ticket: meta.ticket,
+    success: result && result.success,
+    via: result && result.via,
+    withinWindow: result && result.withinWindow,
+    template: config.whatsapp.templatePhotoSheet,
+  });
+
   return result;
+}
+
+// Format a booking date as DD-MM-YYYY for the "booking_challan" template.
+function formatBookingDate(value) {
+  if (!value) return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return String(value);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}-${mm}-${d.getFullYear()}`;
+}
+
+// Format an amount as \u20B91,23,456.00 for the "booking_challan" template.
+function formatBookingAmount(value) {
+  const val = parseFloat(value) || 0;
+  return '\u20B9' + val.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Build a compact "device(s)" summary for the "booking_challan" template,
+// e.g. "Laptop Vivobook 15, Accessories Backpack".
+function buildBookingDeviceSummary(order) {
+  const products = Array.isArray(order.products) ? order.products : [];
+  if (products.length > 0) {
+    const names = products.map(p => {
+      const parts = [p.product_name || '', p.product_model || '', p.accessory_type || ''].filter(Boolean);
+      return parts.join(' ').replace(/\s+/g, ' ').trim();
+    }).filter(Boolean);
+    if (names.length > 0) return names.join(', ');
+  }
+  const fallback = [order.device_type, order.brand, order.model].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  return fallback || 'Device';
+}
+
+// Send the approved "booking_challan" template (6 body variables + the challan
+// PDF as a document header) when an Advanced Booking is saved. Only the
+// template message is sent — there is no PDF-only fallback so the customer
+// never receives a bare document instead of the approved template.
+async function sendBookingChallanTemplate(order, filePath) {
+  const orderId = parseInt(order.id, 10);
+  const phone = order.mobile_number;
+  if (!orderId || !phone) return { success: false, error: 'No order id or customer phone' };
+
+  const convId = getConversationIdFromPhone(phone);
+  const ctx = { orderId, sender: 'System', conversationId: convId };
+  // Template body variables: {{1}} name, {{2}} booking no, {{3}} date,
+  // {{4}} device(s), {{5}} total amount, {{6}} advance paid.
+  const params = [
+    order.customer_name || 'Valued Customer',
+    order.order_number || String(orderId),
+    formatBookingDate(order.order_date || order.booking_date),
+    buildBookingDeviceSummary(order),
+    formatBookingAmount(order.total_amount || order.grand_total),
+    formatBookingAmount(order.advance_payment),
+  ];
+  const templateName = config.whatsapp.templateBookingChallan;
+
+  if (!filePath) {
+    return { success: false, error: 'No PDF file path to send' };
+  }
+
+  const mediaId = await uploadPdfMedia(filePath);
+  if (!mediaId) {
+    wa.error('sendBookingChallanTemplate: PDF upload failed', { orderId });
+    return { success: false, error: 'Failed to upload challan PDF' };
+  }
+
+  const result = await sendTemplateMessage(
+    phone,
+    templateName,
+    params,
+    ctx,
+    { headerDocumentId: mediaId, documentFilename: `Booking_Challan_${order.order_number || orderId}.pdf` }
+  );
+  if (!result.success) {
+    wa.error('sendBookingChallanTemplate: template send failed', { error: result.error, code: result.code, orderId });
+  }
+  return result;
+}
+
+// Generate the booking challan PDF for an advanced booking and send it to the
+// customer via the approved "booking_challan" WhatsApp template.
+async function notifyBookingCreated(order, store) {
+  const phone = order.mobile_number;
+  if (!phone) {
+    wa.error('notifyBookingCreated: no customer phone', { orderId: order.id, orderNumber: order.order_number });
+    return { success: false, error: 'No customer phone' };
+  }
+
+  try {
+    const { generateBookingChallanPdf } = require('./bookingChallanPdf');
+    const pdf = await generateBookingChallanPdf(order.id);
+    if (!pdf.filePath) return { success: false, error: 'Challan PDF generation failed' };
+
+    const result = await sendBookingChallanTemplate(order, pdf.filePath).catch(e => {
+      wa.error('notifyBookingCreated: template send failed', e, { orderId: order.id });
+      return null;
+    });
+    return { success: !!result?.success, result };
+  } catch (e) {
+    wa.error('notifyBookingCreated: error', e, { orderId: order.id });
+    return { success: false, error: e.message };
+  }
 }
 
 async function notifyOrderCreated(order, store) {
@@ -911,6 +1161,7 @@ module.exports = {
   uploadMedia,
   sendDocumentFile,
   sendMediaFile,
+  sendPhotoSheet,
   sendTicketTemplate,
   sendTicketStatusTemplate,
   sendOrderTemplate,
@@ -918,6 +1169,8 @@ module.exports = {
   sendInwardReceiptLink,
   sendServiceInvoiceTemplate,
   sendOrderInvoiceTemplate,
+  sendBookingChallanTemplate,
+  notifyBookingCreated,
   sendReviewLinkTemplate,
   sendWelcome,
   sendTicketDetails,
@@ -927,4 +1180,7 @@ module.exports = {
   isEnabled,
   formatPhone,
   getConversationIdFromPhone,
+  isReengagementError,
+  isWithinServiceWindow,
+  buildTemplateHeader,
 };

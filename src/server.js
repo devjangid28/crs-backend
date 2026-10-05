@@ -4,8 +4,9 @@ const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
 const config = require('./config/index');
-const { pool, query, waitForPool } = require('./config/database');
+const { pool, query, waitForPool, runWithTenant } = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
+const { guardClientScreens } = require('./middleware/auth');
 
 const ticketRoutes = require('./routes/tickets');
 const staffTicketRoutes = require('./routes/staffTickets');
@@ -34,6 +35,7 @@ const supplierRoutes = require('./routes/suppliers');
 const demoModelRoutes = require('./routes/demoModels');
 const notificationRoutes = require('./routes/notifications');
 const quotationRoutes = require('./routes/quotation');
+const saasRoutes = require('./routes/saas');
 const notificationService = require('./services/notificationService');
 
 const app = express();
@@ -70,6 +72,37 @@ app.set('io', io);
 
 // Pass io to webhook
 whatsappWebhookRoutes.setSocketIO(io);
+
+// ── Multi-tenant resolver ─────────────────────────────────────────────────────
+// Resolve the tenant for EVERY request that carries a session token so that
+// queries are routed to the correct client database (even on routes that do
+// not call the authenticate middleware). Requests without a token (public
+// pages, webhooks) are untouched. Local (super admin) behavior is unchanged.
+app.use(async (req, res, next) => {
+  const token = (req.headers.authorization && req.headers.authorization.replace('Bearer ', '')) || req.cookies?.session_token;
+  if (!token) return next();
+  try {
+    const { getSession } = require('./services/saasMasterDb');
+    const session = await getSession(token);
+    if (!session) return next();
+    const client = { id: session.client_id, connection_string: session.connection_string };
+    req.isTenant = true;
+    // `req.client` is the TCP socket on Node's IncomingMessage - never reuse it.
+    req.tenantClient = {
+      clientId: session.client_id,
+      slug: session.slug,
+      companyName: session.company_name,
+      allowedScreens: Array.isArray(session.allowed_screens) ? session.allowed_screens : JSON.parse(session.allowed_screens || '[]'),
+      onboardingComplete: session.onboarding_complete,
+    };
+    return runWithTenant(client, () => next());
+  } catch (e) {
+    return next();
+  }
+});
+
+// Enforce the screens the super admin enabled for the client (server-side).
+app.use(guardClientScreens);
 
 // Make io accessible to all route handlers
 app.use((req, res, next) => {
@@ -116,6 +149,7 @@ app.use('/api/suppliers', supplierRoutes);
 app.use('/api/demo-models', demoModelRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/quotations', quotationRoutes);
+app.use('/api/saas', saasRoutes);
 
 // ---- Serve built frontend as static files ----
 const frontendDist = path.join(__dirname, '..', '..', 'dist');
@@ -177,6 +211,10 @@ const tallyService = require('./services/tallyService');
     dbReady = await waitForPool(20, 500);
     if (dbReady) {
       console.log('Database connected successfully to ' + config.db.database);
+      // Ensure the SaaS master schema exists (super admin registry).
+      const { ensureSchema } = require('./services/saasMasterDb');
+      await ensureSchema();
+      console.log('SaaS master schema ready');
       // Ensure the tally_sales table (customer purchase history from Tally) exists
       await pool.query(`
         CREATE TABLE IF NOT EXISTS tally_sales (
@@ -215,12 +253,26 @@ const tallyService = require('./services/tallyService');
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS part_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS check_no VARCHAR(100) DEFAULT NULL`).catch(() => {});
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS series VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS specifications JSONB DEFAULT NULL`).catch(() => {});
       // Customer GSTIN (shown on the tax invoice, optional, non-compulsory)
       await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
       // Persistent sequential invoice number for ASUS store orders (starts at 16)
       await pool.query(`CREATE SEQUENCE IF NOT EXISTS order_invoice_seq START WITH 16 INCREMENT BY 1 CACHE 1`).catch(() => {});
       await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_number INTEGER DEFAULT NULL`).catch(() => {});
       await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_invoice_number ON orders (invoice_number) WHERE invoice_number IS NOT NULL`).catch(() => {});
+      // Advanced Bookings support (ASUS store): bookings live in the orders table.
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS booking_type VARCHAR(50) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS booking_status VARCHAR(20) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS linked_order_id INTEGER DEFAULT NULL`).catch(() => {});
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_booking ON orders(booking_type, booking_status)`).catch(() => {});
+      // Business rule: a regular (non-booking) order means the payment was
+      // received when the order was made, so legacy 'Partially Paid' orders
+      // are corrected to Paid with no leftover balance.
+      await pool.query(
+        `UPDATE orders SET payment_status = 'Paid', remaining_balance = 0
+         WHERE (booking_type IS NULL OR booking_type = '' OR booking_type = 'normal')
+           AND payment_status = 'Partially Paid'`
+      ).catch(() => {});
       await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_order_products_order ON order_products(order_id)`).catch(() => {});
       if (process.env.TALLY_HOST) {

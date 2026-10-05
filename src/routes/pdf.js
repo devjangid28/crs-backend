@@ -83,6 +83,10 @@ router.post('/generate-inward/:ticketId', authenticate, async (req, res, next) =
 router.get('/download/inward/:ticketId', async (req, res, next) => {
   try {
     const ticketId = parseInt(req.params.ticketId);
+    const tRes = await query('SELECT ticket_id, updated_at FROM tickets WHERE id = $1', [ticketId]);
+    if (tRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Ticket not found' });
+    const ticket = tRes.rows[0];
+
     const result = await query('SELECT * FROM inward_receipts WHERE ticket_id = $1 ORDER BY created_at DESC LIMIT 1', [ticketId]);
     const receipt = result.rows[0];
 
@@ -90,16 +94,33 @@ router.get('/download/inward/:ticketId', async (req, res, next) => {
 
     // Fallback: locate the receipt file on disk (created via /messages/send-document)
     if (!filePath || !fs.existsSync(filePath)) {
-      const tRes = await query('SELECT ticket_id FROM tickets WHERE id = $1', [ticketId]);
-      if (tRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Ticket not found' });
-      const diskPath = path.join(PDF_DIR, 'inward', `Inward_Receipt_${tRes.rows[0].ticket_id}.pdf`);
+      const diskPath = path.join(PDF_DIR, 'inward', `Inward_Receipt_${ticket.ticket_id}.pdf`);
       if (fs.existsSync(diskPath)) filePath = diskPath;
     }
 
-    // Last resort: generate the receipt on the fly
-    if (!filePath || !fs.existsSync(filePath)) {
+    // The stored PDF only reflects the ticket as it was when it was generated.
+    // If the ticket has been edited since then (services added, estimate
+    // changed, status moved on), rebuild it so a preview or a later download
+    // can never show a stale ESTIMATE PRICE. Comparing the two timestamps means
+    // an unchanged ticket is served straight from disk with no extra work.
+    let pdfMtime = null;
+    if (filePath && fs.existsSync(filePath)) {
+      try { pdfMtime = fs.statSync(filePath).mtime; } catch { pdfMtime = null; }
+    }
+    const ticketUpdatedAt = ticket.updated_at ? new Date(ticket.updated_at) : null;
+    const isStale = !filePath || !pdfMtime
+      || (ticketUpdatedAt && pdfMtime.getTime() < ticketUpdatedAt.getTime() + 1000);
+
+    if (isStale) {
       const pdf = await generateInwardReceiptFromHTML(ticketId);
       filePath = pdf.filePath;
+      // Keep the pointer in step so later lookups resolve to the fresh file.
+      await query(
+        `INSERT INTO inward_receipts (ticket_id, receipt_number, pdf_path, pdf_size)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (receipt_number) DO UPDATE SET pdf_path = $3, pdf_size = $4`,
+        [ticketId, pdf.receiptNumber, pdf.filePath, pdf.fileSize]
+      ).catch(() => {});
     }
 
     const fileName = path.basename(filePath);
@@ -112,6 +133,10 @@ router.get('/download/inward/:ticketId', async (req, res, next) => {
       performedBy: req.user?.full_name || 'Staff',
     });
 
+    // No caching: the bytes change every time the ticket is edited, and a
+    // proxy/browser cache would keep handing back the previous receipt.
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     res.download(filePath, fileName);
   } catch (err) { next(err); }
 });
@@ -282,13 +307,13 @@ router.get('/download/order/:orderId', async (req, res, next) => {
 router.get('/download/order-invoice/:orderId', async (req, res, next) => {
   try {
     const orderId = parseInt(req.params.orderId);
-    const oRes = await query('SELECT order_number, invoice_number FROM orders WHERE id = $1', [orderId]);
+    const oRes = await query('SELECT order_number, invoice_number, customer_name FROM orders WHERE id = $1', [orderId]);
     if (oRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Order not found' });
     const { generateOrderInvoicePdf } = require('../services/tallyOrderInvoicePdf');
     const pdf = await generateOrderInvoicePdf(orderId);
-    const downloadName = oRes.rows[0].invoice_number != null
-      ? `Invoice_${oRes.rows[0].invoice_number}.pdf`
-      : pdf.fileName;
+    const custName = (oRes.rows[0].customer_name || 'Customer').replace(/[<>:"/\\|?*]/g, '_').trim();
+    const invNum = oRes.rows[0].invoice_number || oRes.rows[0].order_number || 'Invoice';
+    const downloadName = `${custName} - ${invNum}.pdf`;
     res.download(pdf.filePath, downloadName);
   } catch (err) { next(err); }
 });
@@ -310,7 +335,7 @@ router.get('/orderform-html/:orderId', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'specifications', op.specifications
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products

@@ -61,9 +61,19 @@ async function ensureTable(client) {
       sign_off_text TEXT DEFAULT 'For BLUECHIP COMPUTER SYSTEM',
       status VARCHAR(20) NOT NULL DEFAULT 'Draft',
       created_by VARCHAR(100) DEFAULT 'System',
+      store_id INTEGER DEFAULT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
+  `);
+  // Store separation migration: keep existing quotations in the default store
+  // so the BlueChip store retains its history when the ASUS store is separated.
+  await q(`ALTER TABLE quotations ADD COLUMN IF NOT EXISTS store_id INTEGER DEFAULT NULL`);
+  await q(`
+    UPDATE quotations SET store_id = COALESCE(
+      (SELECT id FROM stores WHERE is_default = true AND is_active = true ORDER BY id LIMIT 1),
+      (SELECT id FROM stores ORDER BY id LIMIT 1)
+    ) WHERE store_id IS NULL
   `);
 }
 
@@ -71,9 +81,14 @@ async function ensureTable(client) {
 router.get('/', authenticate, async (req, res, next) => {
   try {
     await ensureTable();
-    const { search, status, page = 1, limit = 50 } = req.query;
+    const { search, status, page = 1, limit = 50, store_id } = req.query;
     let whereClause = 'WHERE 1=1';
     const params = [];
+
+    if (store_id) {
+      whereClause += ` AND store_id = $${params.length + 1}`;
+      params.push(parseInt(store_id));
+    }
 
     if (search) {
       whereClause += ` AND (quotation_number ILIKE $${params.length + 1} OR customer_name ILIKE $${params.length + 2} OR kind_attention ILIKE $${params.length + 3})`;
@@ -155,7 +170,7 @@ router.post('/', authenticate, async (req, res, next) => {
       customerAddress, companyName, contactPerson, kindAttention,
       quotationDate, validUntil, referenceText, items = [],
       taxRate = 18, discount = 0, termsConditions, bankDetails,
-      closingMessage, signOffText, status = 'Draft'
+      closingMessage, signOffText, status = 'Draft', storeId
     } = req.body;
 
     if (!customerName || !customerName.trim()) {
@@ -176,6 +191,8 @@ router.post('/', authenticate, async (req, res, next) => {
       sn: item.sn || 0,
       productName: item.productName || item.product_name || '',
       description: item.description || '',
+      warranty: item.warranty || '',
+      type: item.type || 'product',
       qty: parseInt(item.qty) || 1,
       price: parseFloat(item.price) || 0,
       amount: parseFloat(item.amount) || (parseInt(item.qty) || 1) * (parseFloat(item.price) || 0),
@@ -191,8 +208,8 @@ router.post('/', authenticate, async (req, res, next) => {
         customer_address, company_name, contact_person, kind_attention,
         quotation_date, valid_until, reference_text, items, subtotal, tax_rate,
         tax_amount, discount, total_amount, terms_conditions, bank_details,
-        closing_message, sign_off_text, status, created_by
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+        closing_message, sign_off_text, status, created_by, store_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
       RETURNING *`,
       [
         number, customerId || null, customerName, customerPhone || null, customerEmail || null,
@@ -200,7 +217,8 @@ router.post('/', authenticate, async (req, res, next) => {
         quotationDate || new Date().toISOString().slice(0, 10), validUntil || null, referenceText || null,
         JSON.stringify(parsedItems), subtotal, parseFloat(taxRate) || 0,
         taxAmount, parseFloat(discount) || 0, totalAmount, termsConditions || null, bankDetails || null,
-        closingMessage || null, signOffText || 'For BLUECHIP COMPUTER SYSTEM', status, req.user.full_name || 'System'
+        closingMessage || null, signOffText || 'For BLUECHIP COMPUTER SYSTEM', status, req.user.full_name || 'System',
+        storeId != null && storeId !== '' ? parseInt(storeId) : null
       ]
     );
 
@@ -253,6 +271,8 @@ router.put('/:id', authenticate, async (req, res, next) => {
         sn: item.sn || 0,
         productName: item.productName || item.product_name || '',
         description: item.description || '',
+        warranty: item.warranty || '',
+        type: item.type || 'product',
         qty: parseInt(item.qty) || 1,
         price: parseFloat(item.price) || 0,
         amount: parseFloat(item.amount) || (parseInt(item.qty) || 1) * (parseFloat(item.price) || 0),
@@ -397,8 +417,18 @@ router.get('/:id/download', authenticate, async (req, res, next) => {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
 
+    const contentHeightPx = await page.evaluate(() =>
+      Math.max(
+        document.documentElement ? document.documentElement.scrollHeight : 0,
+        document.body ? document.body.scrollHeight : 0
+      )
+    );
+    const heightPx = Math.max(contentHeightPx, 1123);
+    const heightMm = ((heightPx * 25.4) / 96).toFixed(2);
+
     const pdfBuffer = await page.pdf({
-      format: 'A4',
+      width: '210mm',
+      height: `${heightMm}mm`,
       printBackground: true,
       margin: { top: '0', bottom: '0', left: '0', right: '0' },
     });

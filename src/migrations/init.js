@@ -350,6 +350,75 @@ const runMigrations = async () => {
       END $$;
     `);
 
+    // Advanced Bookings (ASUS store): bookings stored as orders.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'booking_type'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN booking_type VARCHAR(50) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'booking_status'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN booking_status VARCHAR(20) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'linked_order_id'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN linked_order_id INTEGER DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Payment Mode / Advance Payment Mode accept free text (the order form
+    // offers a dropdown of common modes but any wording can be typed), so both
+    // columns are wider than the original VARCHAR(20)/VARCHAR(50).
+    // See 042_free_text_payment_modes.sql for the standalone migration.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'payment_type'
+        ) THEN
+          ALTER TABLE orders ALTER COLUMN payment_type TYPE VARCHAR(50);
+        END IF;
+      END $$;
+    `);
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'orders' AND column_name = 'advance_payment_mode'
+        ) THEN
+          ALTER TABLE orders ADD COLUMN advance_payment_mode VARCHAR(100) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Assembled-desktop parts (Blue Chips) each carry their own Brand.
+    await targetPool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'order_products' AND column_name = 'brand'
+        ) THEN
+          ALTER TABLE order_products ADD COLUMN brand VARCHAR(100) DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
     // Add finance payment details to invoices if missing.
     await targetPool.query(`
       DO $$ BEGIN

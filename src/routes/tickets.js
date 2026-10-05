@@ -558,12 +558,14 @@ router.put('/:id', async (req, res, next) => {
     const seenCols = new Set();
 
     // line_items is JSONB: normalize the incoming array/string to JSON.
+    let normalizedLineItems = null;
     if (updates.lineItems !== undefined || updates.line_items !== undefined || updates.invoiceItems !== undefined || updates.invoice_items !== undefined) {
       const raw = updates.lineItems !== undefined ? updates.lineItems
         : updates.line_items !== undefined ? updates.line_items
         : updates.invoiceItems !== undefined ? updates.invoiceItems
         : updates.invoice_items;
       const normalized = normalizeLineItems(raw, updates.solutionDescription || updates.solution_description || updates.problemDescription || updates.problem_description || oldTicket.solution_description || oldTicket.problem_description);
+      normalizedLineItems = normalized;
       seenCols.add('line_items');
       setClauses.push(`line_items = $${setClauses.length + 1}`);
       updateValues.push(normalized.length > 0 ? JSON.stringify(normalized) : null);
@@ -590,6 +592,52 @@ router.put('/:id', async (req, res, next) => {
         seenCols.add('estimated_price');
         setClauses.push(`estimated_price = $${setClauses.length + 1}`);
         updateValues.push(est);
+      }
+    }
+
+    // The inward receipt prints estimated_price, so a ticket whose service items
+    // were saved without an estimate of its own would otherwise keep a stale (or
+    // missing) amount. Derive it from the items in that case. A client that sends
+    // an explicit estimate always wins, so the mobile/web quote field still
+    // overrides this.
+    if (normalizedLineItems && normalizedLineItems.length > 0
+      && updates.estimatedCost === undefined && updates.estimatedPrice === undefined) {
+      const itemsTotal = normalizedLineItems.reduce(
+        (s, it) => s + (parseFloat(it.total) || 0), 0);
+      if (itemsTotal > 0) {
+        const taxPct = parseFloat(updates.taxRate ?? oldTicket.tax_rate) || 0;
+        const disc = parseFloat(updates.discount ?? oldTicket.discount) || 0;
+        const derived = Math.max(0, itemsTotal + (itemsTotal * taxPct) / 100 - disc);
+        for (const col of ['estimated_cost', 'estimated_price']) {
+          if (!seenCols.has(col)) {
+            seenCols.add(col);
+            setClauses.push(`${col} = $${setClauses.length + 1}`);
+            updateValues.push(derived);
+          }
+        }
+      }
+    }
+
+    // A client that flagged the estimate as item-derived wants the server to
+    // recompute it from the items it actually stores, so a stale/edited
+    // estimate can never be written next to a different set of line items.
+    if (updates.estimateFollowsItems === true && normalizedLineItems && normalizedLineItems.length > 0) {
+      const itemsTotal = normalizedLineItems.reduce(
+        (s, it) => s + (parseFloat(it.total) || 0), 0);
+      if (itemsTotal > 0) {
+        const taxPct = parseFloat(updates.taxRate ?? oldTicket.tax_rate) || 0;
+        const disc = parseFloat(updates.discount ?? oldTicket.discount) || 0;
+        const derived = Math.max(0, itemsTotal + (itemsTotal * taxPct) / 100 - disc);
+        for (const col of ['estimated_cost', 'estimated_price']) {
+          if (seenCols.has(col)) {
+            const i = setClauses.findIndex(c => c.startsWith(`${col} = `));
+            updateValues[i] = derived;
+          } else {
+            seenCols.add(col);
+            setClauses.push(`${col} = $${setClauses.length + 1}`);
+            updateValues.push(derived);
+          }
+        }
       }
     }
 
@@ -785,6 +833,211 @@ router.get('/:id/status-history', async (req, res, next) => {
   try {
     const history = await getStatusHistory(req.params.id);
     res.json({ success: true, data: history });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Read a table only if it exists in this tenant's database. The signature and
+// collection tables are created by later migrations, so an older tenant DB
+// should degrade to "no data" instead of failing the whole request.
+//
+// The cache is keyed per tenant because each request can be routed to a
+// different tenant database — a shared cache would report one tenant's missing
+// table to all of them.
+const { getTenant } = require('../config/database');
+const tableExistsCache = new Map();
+async function tableExists(table) {
+  const tenant = getTenant();
+  const key = `${tenant ? tenant.client : 'local'}:${table}`;
+  if (tableExistsCache.has(key)) return tableExistsCache.get(key);
+  let exists = false;
+  try {
+    const r = await query('SELECT 1 FROM information_schema.tables WHERE table_name = $1 LIMIT 1', [table]);
+    exists = r.rows.length > 0;
+  } catch {
+    exists = false;
+  }
+  tableExistsCache.set(key, exists);
+  return exists;
+}
+
+async function safeQuery(table, sql, params, fallback = []) {
+  if (!(await tableExists(table))) return fallback;
+  try {
+    const result = await query(sql, params);
+    return result.rows;
+  } catch (err) {
+    console.error('collection-details sub-query failed:', err.message);
+    return fallback;
+  }
+}
+
+// GET /api/tickets/:id/collection-details
+// Everything the customer signed/confirmed through the collection link, plus
+// the status and payment trail around it. Powers the "See Details" button so
+// staff can verify a hand-off with a single tap.
+router.get('/:id/collection-details', async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid ticket id' });
+    }
+
+    const ticketRes = await query(
+      `SELECT id, ticket_id, customer_name, customer_phone, device_type, brand, model,
+              serial_number, status, estimated_cost, estimated_price, advance_payment,
+              total_amount, actual_completion_date
+         FROM tickets WHERE id = $1`,
+      [id]
+    );
+    if (ticketRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    const t = ticketRes.rows[0];
+
+    const [signatures, collections, statusHistory, payments, invoices, feedback] = await Promise.all([
+      safeQuery(
+        'customer_signatures',
+        `SELECT id, signature_type, signature_data, ip_address, user_agent, signed_at
+           FROM customer_signatures WHERE ticket_id = $1 ORDER BY signed_at DESC`,
+        [id]
+      ),
+      safeQuery(
+        'customer_collection_records',
+        `SELECT id, ticket_id, token_id, confirmation_1, confirmation_2, signature_image,
+                ip_address, user_agent, collected_at
+           FROM customer_collection_records WHERE ticket_id = $1 ORDER BY collected_at DESC`,
+        [id]
+      ),
+      safeQuery(
+        'ticket_status_history',
+        `SELECT id, old_status, new_status, changed_by, changed_at
+           FROM ticket_status_history WHERE ticket_id = $1 ORDER BY changed_at DESC`,
+        [id]
+      ),
+      safeQuery(
+        'payment_history',
+        `SELECT id, invoice_id, amount, payment_method, status, reference_number,
+                received_by, notes, payment_date
+           FROM payment_history WHERE ticket_id = $1 ORDER BY payment_date DESC`,
+        [id]
+      ),
+      safeQuery(
+        'invoices',
+        `SELECT id, invoice_id, status, payment_status, subtotal, tax_amount, discount,
+                total_amount, amount_paid, balance_due, issue_date
+           FROM invoices WHERE ticket_id = $1 ORDER BY issue_date DESC`,
+        [id]
+      ),
+      safeQuery(
+        'feedback',
+        `SELECT id, rating, comment, created_at
+           FROM feedback WHERE ticket_id = $1 ORDER BY created_at DESC`,
+        [id]
+      ),
+    ]);
+
+    // pg returns snake_case columns. Map every row to camelCase here so both
+    // the web app and the Flutter app can read one predictable shape without
+    // each having to guess which key it got.
+    const mapSignature = (s) => ({
+      id: s.id,
+      signatureType: s.signature_type,
+      signatureData: s.signature_data,
+      ipAddress: s.ip_address,
+      userAgent: s.user_agent,
+      signedAt: s.signed_at,
+    });
+
+    const mapCollection = (c) => ({
+      id: c.id,
+      ticketId: c.ticket_id,
+      tokenId: c.token_id,
+      // The live schema stores the two collection-link ticks under these
+      // names (see POST /api/collection/:ticketId/:token/confirm).
+      confirmationClosure: c.confirmation_1 === true,
+      confirmationCondition: c.confirmation_2 === true,
+      ipAddress: c.ip_address,
+      userAgent: c.user_agent,
+      collectedAt: c.collected_at,
+    });
+
+    const mapStatusChange = (h) => ({
+      id: h.id,
+      oldStatus: h.old_status,
+      newStatus: h.new_status,
+      changedBy: h.changed_by,
+      changedAt: h.changed_at,
+    });
+
+    const mapPayment = (p) => ({
+      id: p.id,
+      invoiceId: p.invoice_id,
+      amount: p.amount,
+      paymentMethod: p.payment_method,
+      status: p.status,
+      referenceNumber: p.reference_number,
+      receivedBy: p.received_by,
+      notes: p.notes,
+      paymentDate: p.payment_date,
+    });
+
+    const mapInvoice = (inv) => ({
+      id: inv.id,
+      invoiceId: inv.invoice_id,
+      status: inv.status,
+      paymentStatus: inv.payment_status,
+      subtotal: inv.subtotal,
+      taxAmount: inv.tax_amount,
+      discount: inv.discount,
+      totalAmount: inv.total_amount,
+      amountPaid: inv.amount_paid,
+      balanceDue: inv.balance_due,
+      issueDate: inv.issue_date,
+    });
+
+    const mapFeedback = (f) => ({
+      id: f.id,
+      rating: f.rating,
+      comment: f.comment,
+      createdAt: f.created_at,
+    });
+
+    const signatureList = signatures.map(mapSignature);
+    // Newest signature wins, but keep every signature so repeat hand-offs are
+    // all visible instead of only the last one.
+    const latestSignature = signatureList[0] || null;
+
+    res.json({
+      success: true,
+      data: {
+        ticket: {
+          id: t.id,
+          ticketId: t.ticket_id,
+          customerName: t.customer_name,
+          customerPhone: t.customer_phone,
+          deviceType: t.device_type,
+          brand: t.brand,
+          model: t.model,
+          serialNumber: t.serial_number,
+          status: t.status,
+          estimatedCost: t.estimated_cost,
+          estimatedPrice: t.estimated_price,
+          advancePayment: t.advance_payment,
+          totalAmount: t.total_amount,
+          actualCompletionDate: t.actual_completion_date,
+        },
+        collected: signatures.length > 0 || collections.length > 0,
+        latestSignature,
+        signatures: signatureList,
+        collections: collections.map(mapCollection),
+        statusHistory: statusHistory.map(mapStatusChange),
+        payments: payments.map(mapPayment),
+        invoices: invoices.map(mapInvoice),
+        feedback: feedback.map(mapFeedback),
+      },
+    });
   } catch (err) {
     next(err);
   }

@@ -166,6 +166,44 @@ async function getCustomerPhone(phone) {
   return 'cust_' + cleaned;
 }
 
+// Meta only lets a business send free-form (non-template) text/media/document
+// messages for 24 hours after the customer last wrote to us. Outside that window
+// the Cloud API accepts the request but the message is then reported as failed
+// by the status webhook with "Re-engagement message" (error 131047), so the
+// customer never sees it. Approved templates are the only reliable path.
+const SERVICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Timestamp of the most recent inbound customer message, or null when the
+// customer has never written to us (which means the window is closed).
+async function getLastInboundAt(phone) {
+  const convId = await findExistingConversation(phone);
+  if (!convId) return null;
+  try {
+    const result = await query(
+      `SELECT created_at FROM messages
+       WHERE conversation_id = $1 AND sender = 'Customer'
+       ORDER BY created_at DESC LIMIT 1`,
+      [convId]
+    );
+    if (result.rows.length === 0) return null;
+    const raw = result.rows[0].created_at;
+    const d = raw instanceof Date ? raw : new Date(raw);
+    return isNaN(d.getTime()) ? null : d.getTime();
+  } catch (e) {
+    return null;
+  }
+}
+
+// True when Meta will still deliver a free-form message to this customer.
+// Treated as closed when we cannot prove it is open: a false "open" only costs
+// one failed send, whereas a false "closed" would needlessly force a template.
+async function isWithinServiceWindow(phone) {
+  if (!phone) return false;
+  const last = await getLastInboundAt(phone);
+  if (last == null) return false;
+  return Date.now() - last < SERVICE_WINDOW_MS;
+}
+
 async function findConversationByPhone(phone) {
   const convId = await getCustomerPhone(phone);
   if (!convId) return null;
@@ -343,6 +381,57 @@ async function getAllUnreadCounts() {
     counts[r.conversation_id] = parseInt(r.count) || 0;
   });
   return counts;
+}
+
+// Unread summary for the navigation badge, so a staff member can see that
+// customers have written without opening the Messaging screen. Kept to a single
+// aggregate query because the badge is polled. The store filter mirrors
+// getConversationsWithDetails so the badge always agrees with the conversation
+// list the user is about to see.
+async function getUnreadSummary({ storeId } = {}) {
+  const params = [];
+  let storeClause = '';
+  if (storeId) {
+    params.push(storeId);
+    storeClause = ` AND (
+      (COALESCE(clt.ticket_id, m.ticket_id) IS NOT NULL AND EXISTS (SELECT 1 FROM tickets t WHERE t.id = COALESCE(clt.ticket_id, m.ticket_id) AND t.store_id = $1))
+      OR
+      (COALESCE(clo.order_id, m.order_id) IS NOT NULL AND EXISTS (SELECT 1 FROM orders o WHERE o.id = COALESCE(clo.order_id, m.order_id) AND o.store_id = $1))
+    )`;
+  }
+
+  const result = await query(
+    `WITH conv_latest_ticket AS (
+       SELECT DISTINCT ON (conversation_id) conversation_id, ticket_id
+       FROM messages WHERE ticket_id IS NOT NULL
+       ORDER BY conversation_id, created_at DESC
+     ),
+     conv_latest_order AS (
+       SELECT DISTINCT ON (conversation_id) conversation_id, order_id
+       FROM messages WHERE order_id IS NOT NULL
+       ORDER BY conversation_id, created_at DESC
+     ),
+     per_conversation AS (
+       SELECT m.conversation_id,
+              (SELECT COUNT(*) FROM messages
+                WHERE conversation_id = m.conversation_id
+                  AND is_read = FALSE AND sender = 'Customer') AS unread_count
+       FROM messages m
+       LEFT JOIN conv_latest_ticket clt ON clt.conversation_id = m.conversation_id
+       LEFT JOIN conv_latest_order clo ON clo.conversation_id = m.conversation_id
+       WHERE 1=1 ${storeClause}
+       GROUP BY m.conversation_id
+     )
+     SELECT COUNT(*) FILTER (WHERE unread_count > 0) AS conversations,
+            COALESCE(SUM(unread_count), 0) AS total
+     FROM per_conversation`,
+    params
+  );
+
+  return {
+    total: parseInt(result.rows[0]?.total) || 0,
+    conversations: parseInt(result.rows[0]?.conversations) || 0,
+  };
 }
 
 async function getConversationsWithDetails({ search, filter, customerId, storeId } = {}) {
@@ -533,6 +622,7 @@ module.exports = {
   markConversationRead,
   getUnreadCount,
   getAllUnreadCounts,
+  getUnreadSummary,
   getConversationsWithDetails,
   saveCustomerContact,
   updateMessageStatus,
@@ -541,5 +631,7 @@ module.exports = {
   findConversationByPhone,
   findExistingConversation,
   getCustomerPhone,
+  getLastInboundAt,
+  isWithinServiceWindow,
   EVENT_MAP,
 };

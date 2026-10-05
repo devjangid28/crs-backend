@@ -293,15 +293,16 @@ router.put('/:id', async (req, res, next) => {
     const seenCols = new Set();
 
     // line_items is JSONB: normalize the incoming array/string to JSON.
+    let normalizedLineItems = null;
     if (updates.lineItems !== undefined || updates.line_items !== undefined || updates.invoiceItems !== undefined || updates.invoice_items !== undefined) {
       const raw = updates.lineItems !== undefined ? updates.lineItems
         : updates.line_items !== undefined ? updates.line_items
         : updates.invoiceItems !== undefined ? updates.invoiceItems
         : updates.invoice_items;
-      const normalized = normalizeLineItems(raw, updates.solutionDescription || updates.solution_description || updates.problemDescription || updates.problem_description || oldTicket.solution_description || oldTicket.problem_description);
+      normalizedLineItems = normalizeLineItems(raw, updates.solutionDescription || updates.solution_description || updates.problemDescription || updates.problem_description || oldTicket.solution_description || oldTicket.problem_description);
       seenCols.add('line_items');
       setClauses.push(`line_items = $${setClauses.length + 1}`);
-      updateValues.push(normalized.length > 0 ? JSON.stringify(normalized) : null);
+      updateValues.push(normalizedLineItems.length > 0 ? JSON.stringify(normalizedLineItems) : null);
     }
 
     for (const [frontField, dbField] of Object.entries(fieldMapping)) {
@@ -309,6 +310,67 @@ router.put('/:id', async (req, res, next) => {
         seenCols.add(dbField);
         setClauses.push(`${dbField} = $${setClauses.length + 1}`);
         updateValues.push(updates[frontField]);
+      }
+    }
+
+    // Keep estimated_cost and estimated_price in sync so the same amount is used
+    // everywhere (print preview, PDF, and the inward receipt generated later).
+    // The mobile app only ever sends estimatedCost, which used to leave
+    // estimated_price on its previous value and make the inward receipt show a
+    // stale ESTIMATE PRICE.
+    if (updates.estimatedCost !== undefined || updates.estimatedPrice !== undefined) {
+      const est = updates.estimatedCost !== undefined ? updates.estimatedCost : updates.estimatedPrice;
+      for (const col of ['estimated_cost', 'estimated_price']) {
+        if (!seenCols.has(col)) {
+          seenCols.add(col);
+          setClauses.push(`${col} = $${setClauses.length + 1}`);
+          updateValues.push(est);
+        }
+      }
+    }
+
+    // A client that flagged the estimate as item-derived wants the server to
+    // recompute it from the items it actually stores, so a stale/edited
+    // estimate can never be written next to a different set of line items.
+    if (updates.estimateFollowsItems === true && normalizedLineItems && normalizedLineItems.length > 0) {
+      const itemsTotal = normalizedLineItems.reduce(
+        (s, it) => s + (parseFloat(it.total) || 0), 0);
+      if (itemsTotal > 0) {
+        const taxPct = parseFloat(updates.taxRate ?? updates.tax_rate ?? oldTicket.tax_rate) || 0;
+        const disc = parseFloat(updates.discount ?? oldTicket.discount) || 0;
+        const derived = Math.max(0, itemsTotal + (itemsTotal * taxPct) / 100 - disc);
+        for (const col of ['estimated_cost', 'estimated_price']) {
+          if (seenCols.has(col)) {
+            const i = setClauses.findIndex(c => c.startsWith(`${col} = `));
+            updateValues[i] = derived;
+          } else {
+            seenCols.add(col);
+            setClauses.push(`${col} = $${setClauses.length + 1}`);
+            updateValues.push(derived);
+          }
+        }
+      }
+    }
+
+    // The inward receipt prints estimated_price, so a ticket whose service items
+    // were saved without an explicit estimate would otherwise keep a stale (or
+    // missing) amount. Derive it from the items in that case. A client that sends
+    // an explicit estimate always wins.
+    if (normalizedLineItems && normalizedLineItems.length > 0
+      && updates.estimatedCost === undefined && updates.estimatedPrice === undefined) {
+      const itemsTotal = normalizedLineItems.reduce(
+        (s, it) => s + (parseFloat(it.total) || 0), 0);
+      if (itemsTotal > 0) {
+        const taxPct = parseFloat(updates.taxRate ?? updates.tax_rate ?? oldTicket.tax_rate) || 0;
+        const disc = parseFloat(updates.discount ?? oldTicket.discount) || 0;
+        const derived = Math.max(0, itemsTotal + (itemsTotal * taxPct) / 100 - disc);
+        for (const col of ['estimated_cost', 'estimated_price']) {
+          if (!seenCols.has(col)) {
+            seenCols.add(col);
+            setClauses.push(`${col} = $${setClauses.length + 1}`);
+            updateValues.push(derived);
+          }
+        }
       }
     }
 

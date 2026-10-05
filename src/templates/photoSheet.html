@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Device Condition Report</title>
+<style>
+  /* Rendered at 1080px wide by puppeteer, then screenshotted to JPEG.
+     Output is ~1080x1424 / ~300 KB, which WhatsApp delivers without
+     re-compressing (and therefore blurring) the labels. */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    width: 1080px;
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #14181f;
+  }
+
+  .sheet { width: 1080px; }
+
+  .head {
+    padding: 28px 32px 22px;
+    border-bottom: 3px solid #101828;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+  }
+  .head h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.4px; }
+  .head .sub { font-size: 21px; color: #475467; margin-top: 6px; }
+  .head .right { text-align: right; font-size: 20px; color: #475467; line-height: 1.45; }
+  .head .right b { color: #101828; font-size: 22px; }
+
+  /* Two columns keeps up to six tiles legible; beyond that the tiles get too
+     small to judge damage from, so callers should cap the photo count. */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px;
+    padding: 22px 32px 0;
+  }
+
+  .tile {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    background: #f2f4f7;
+    border: 1px solid #d0d5dd;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+  /* Numbered badge + caption guarantee the customer reads the photos in a
+     fixed, deliberate order rather than guessing. */
+  .num {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #101828;
+    color: #ffffff;
+    font-size: 21px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .label {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 22px 14px 11px;
+    font-size: 21px;
+    font-weight: 600;
+    color: #ffffff;
+    background: linear-gradient(to top, rgba(0,0,0,0.82), rgba(0,0,0,0));
+  }
+
+  .foot {
+    margin: 22px 32px 30px;
+    padding: 16px 20px;
+    background: #f9fafb;
+    border-left: 5px solid #101828;
+    border-radius: 6px;
+    font-size: 20px;
+    color: #344054;
+    line-height: 1.5;
+  }
+  .foot b { color: #101828; }
+</style>
+</head>
+<body>
+<div class="sheet">
+  <div class="head">
+    <div>
+      <h1>Device Condition Report</h1>
+      <div class="sub" id="device"></div>
+    </div>
+    <div class="right" id="meta"></div>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+  // Called by photoSheetService.js inside puppeteer with already-resolved
+  // file:// image URLs. Kept synchronous so a screenshot can follow it.
+  window.renderSheet = function (opts) {
+    var photos = opts.photos || [];
+    var meta = opts.meta || {};
+
+    var grid = document.getElementById('grid');
+    grid.innerHTML = '';
+
+    photos.forEach(function (p, i) {
+      var tile = document.createElement('div');
+      tile.className = 'tile';
+
+      var img = document.createElement('img');
+      img.src = p.src;
+      img.alt = p.label || ('Photo ' + (i + 1));
+
+      var num = document.createElement('div');
+      num.className = 'num';
+      num.textContent = String(i + 1);
+
+      var label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = p.label || ('Photo ' + (i + 1));
+
+      tile.appendChild(img);
+      tile.appendChild(num);
+      tile.appendChild(label);
+      grid.appendChild(tile);
+    });
+
+    document.getElementById('device').textContent = meta.device || 'Device';
+
+    document.getElementById('meta').innerHTML =
+      'Ticket <b>' + escapeHtml(meta.ticket || '') + '</b><br>' + escapeHtml(meta.date || '');
+
+    // The opt-out wording is required by Meta for business-initiated messages,
+    // so it is baked into the image itself and not left to the caller.
+    document.getElementById('foot').innerHTML =
+      '<b>' + escapeHtml(meta.customer || '') + '</b>, these are the current photos of your ' +
+      escapeHtml(meta.device || 'device') + ' (' + escapeHtml(meta.ticket || '') + '). ' +
+      'Reply to this message if you have any questions, or send STOP to opt out.';
+  };
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // Signals to the renderer that every <img> has decoded, so a screenshot is
+  // never taken against half-painted tiles.
+  window.sheetImagesReady = function () {
+    var imgs = Array.prototype.slice.call(document.images);
+    return imgs.length > 0 && imgs.every(function (i) { return i.complete && i.naturalWidth > 0; });
+  };
+
+  window.sheetImageCount = function () {
+    return document.images.length;
+  };
+</script>
+</body>
+</html>

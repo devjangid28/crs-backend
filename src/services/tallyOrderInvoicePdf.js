@@ -10,6 +10,17 @@ function isAsusStore(name) {
   return String(name || '').toLowerCase().includes('asus');
 }
 
+// Assembled desktops (Blue Chips) are stored as one order_products row per part,
+// all tagged with this series value. On the invoice they are printed under a
+// single heading row instead of repeating the label on every line.
+const ASSEMBLED_DESKTOP_SERIES = 'Assembled Desktop';
+const ASSEMBLED_DESKTOP_HEADING = 'Assembled Desktop (Parts Used)';
+const ASSEMBLED_HEADING_KEY = '__assembled_desktop_heading';
+
+function isAssembledPart(prod) {
+  return String(prod.series || '').trim().toLowerCase() === ASSEMBLED_DESKTOP_SERIES.toLowerCase();
+}
+
 function fmtINR(v) {
   return (parseFloat(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -55,25 +66,59 @@ function resolveImgSrc(logo) {
 }
 
 async function getStoreData(storeId) {
-  let store;
+  const getDefaultStore = async () => {
+    const defRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
+    return defRes.rows[0] || null;
+  };
+
+  const getGlobalSettings = async () => {
+    try {
+      const cRes = await query('SELECT * FROM store_settings LIMIT 1');
+      return cRes.rows[0] || {};
+    } catch (e) {
+      return {};
+    }
+  };
+
+  let store = null;
   if (storeId) {
     const sRes = await query('SELECT * FROM stores WHERE id = $1 AND is_active = true', [storeId]);
     if (sRes.rows.length > 0) store = sRes.rows[0];
   }
   if (!store) {
-    const defRes = await query('SELECT * FROM stores WHERE is_default = true AND is_active = true LIMIT 1');
-    if (defRes.rows.length > 0) store = defRes.rows[0];
+    store = await getDefaultStore();
   }
-  if (!store) {
-    const cRes = await query('SELECT * FROM store_settings LIMIT 1');
-    store = cRes.rows[0] || {};
-  }
-  return store || {};
+
+  const [global, defaultStore] = await Promise.all([getGlobalSettings(), getDefaultStore()]);
+  if (!store) return global || {};
+
+  // The store record may be incomplete (blank GSTIN / city / pincode / email).
+  // Fall back to the default store first, then to the global store_settings row,
+  // so the invoice always carries the shop's real branding just like the
+  // front-end preview (store > default store > global settings).
+  const fallback = { ...global, ...defaultStore };
+  return {
+    ...store,
+    company_name: store.company_name || store.store_name || fallback.company_name || fallback.store_name || '',
+    store_name: store.store_name || store.company_name || fallback.store_name || fallback.company_name || '',
+    address: store.address || fallback.address || '',
+    city: store.city || fallback.city || '',
+    state: store.state || fallback.state || 'Gujarat',
+    pincode: store.pincode || fallback.pincode || '',
+    phone: store.phone || fallback.phone || '',
+    email: store.email || fallback.email || '',
+    gst_number: store.gst_number || fallback.gst_number || fallback.gst_vat || '',
+    gst_vat: store.gst_vat || fallback.gst_vat || fallback.gst_number || '',
+    website: store.website || fallback.website || '',
+    logo: store.logo || fallback.logo || '',
+    terms_conditions: store.terms_conditions || fallback.terms_conditions || '',
+  };
 }
 
 // Mirrors buildOrderInvoiceItems in ManageOrders.jsx
 function buildOrderInvoiceItems(order, components, products) {
   const items = [];
+  const productsMap = new Map();
   const accessoryName = order.accessory_type === 'Custom' ? (order.custom_accessory || 'Custom Accessory') : (order.accessory_type || '');
   const orderModel = order.model || '';
   const orderPartNo = order.part_no || '';
@@ -87,6 +132,7 @@ function buildOrderInvoiceItems(order, components, products) {
       description: order.problem_description || '',
       qty: 1,
       price: svcAmt,
+      brand: order.brand || '',
       serialNumber: orderSerial,
       modelNo: orderModel,
       partNo: orderPartNo,
@@ -108,6 +154,7 @@ function buildOrderInvoiceItems(order, components, products) {
         description: comp.description || comp.remarks || '',
         qty: compQty,
         price: compPrice || (compAmount / compQty),
+        brand: '',
         serialNumber: '',
         modelNo: '',
         partNo: '',
@@ -123,23 +170,37 @@ function buildOrderInvoiceItems(order, components, products) {
   // Product rows (ASUS multi-item sales orders: repeatable device blocks +
   // accessory rows) - each becomes its own invoice line item so the customer
   // sees every device / accessory they bought, one below another.
+  // Mirrors buildOrderInvoiceItems in ManageOrders.jsx, including its de-dup:
+  // the same physical product can exist twice in order_products (a zero-amount
+  // placeholder alongside the real row). Collapse genuine duplicates - same
+  // serial (same physical item) or a zero-amount placeholder for the same item.
   (Array.isArray(products) ? products : []).forEach(prod => {
     const prodName = prod.product_name || '';
     const prodAcc = prod.accessory_type || '';
     const prodSeries = (prod.series || '').toString().trim();
+    const isAssembled = isAssembledPart(prod);
     const baseName = prodName.trim()
       ? (prodAcc && prodAcc !== 'Accessories' ? `${prodName} - ${prodAcc}` : prodName)
       : (prodAcc ? `Accessories - ${prodAcc}` : 'Accessories');
-    const lineName = prodSeries ? `${baseName} - ${prodSeries}` : baseName;
+    // Assembled parts already sit under the "Assembled Desktop" heading, so the
+    // series label is not repeated on each line.
+    const lineName = (prodSeries && !isAssembled) ? `${baseName} - ${prodSeries}` : baseName;
     const prodQty = parseInt(prod.quantity, 10) || 1;
     const prodRate = parseFloat(prod.rate) || 0;
-    const total = parseFloat(prod.amount) || (prodRate * prodQty);
+    const prodAmt = parseFloat(prod.amount) || 0;
+    const total = prodAmt > 0 ? prodAmt : (prodRate * prodQty);
+    const serial = String(prod.serial_number || '').trim();
     if (!lineName.trim() && total <= 0) return;
-    items.push({
+    // The brand is part of the line identity so two parts of the same type with
+    // different brands (e.g. two SSDs) are never collapsed into one row.
+    const key = serial ? `s:${serial}` : `n:${lineName}|${prod.brand || ''}|${prod.product_model || ''}`;
+    const entry = {
       name: lineName,
       description: '',
       qty: total > 0 ? prodQty : 1,
-      price: prodRate > 0 ? prodRate : total,
+      price: total > 0 ? (prodRate > 0 ? prodRate : total) : 0,
+      total,
+      brand: prod.brand || '',
       serialNumber: prod.serial_number || '',
       modelNo: prod.product_model || '',
       partNo: prod.part_no || orderPartNo,
@@ -149,14 +210,52 @@ function buildOrderInvoiceItems(order, components, products) {
       batch: '',
       warranty: prod.warranty || '',
       discount: 0,
-    });
+    };
+    if (isAssembled && !productsMap.has(ASSEMBLED_HEADING_KEY)) {
+      // Zero-value marker row printed above the first assembled part.
+      productsMap.set(ASSEMBLED_HEADING_KEY, {
+        isHeading: true,
+        name: ASSEMBLED_DESKTOP_HEADING,
+        description: '',
+        qty: 0,
+        price: 0,
+        total: 0,
+        brand: '',
+        serialNumber: '',
+        modelNo: '',
+        partNo: '',
+        checkNo: '',
+        tax: 18,
+        hsn: '',
+        batch: '',
+        warranty: '',
+        discount: 0,
+      });
+    }
+    const existing = key.startsWith('s:') ? productsMap.get(key) : null;
+    if (key.startsWith('s:') && existing) {
+      // Same physical item twice - prefer the row that actually carries the value.
+      if (entry.total > existing.total) productsMap.set(key, entry);
+    } else if (key.startsWith('n:') && productsMap.has(key)) {
+      const existingNoKey = productsMap.get(key);
+      // Merge only when one entry is a zero-amount placeholder.
+      if ((entry.total <= 0) !== (existingNoKey.total <= 0)) {
+        productsMap.set(key, entry.total > existingNoKey.total ? entry : existingNoKey);
+      } else {
+        productsMap.set(`__dup_${productsMap.size}_${Date.now()}`, entry);
+      }
+    } else {
+      productsMap.set(key, entry);
+    }
   });
+  productsMap.forEach(item => items.push(item));
   if (items.length === 0 && (parseFloat(order.total_amount) || 0) > 0) {
     items.push({
       name: order.device_type === 'Accessories' ? `Accessories${accessoryName ? ' - ' + accessoryName : ''}` : `${order.device_type || ''}${order.brand ? ' - ' + order.brand + ' ' + orderModel : ''}`,
       description: order.problem_description || order.order_note || '',
       qty: 1,
       price: parseFloat(order.total_amount) || 0,
+      brand: order.brand || '',
       serialNumber: orderSerial,
       modelNo: orderModel,
       partNo: orderPartNo,
@@ -173,24 +272,23 @@ function buildOrderInvoiceItems(order, components, products) {
 
 function buildInvoiceHTML(order, components, store, products) {
   const taxRate = 18;
-  const cgstRate = taxRate / 2;
-  const sgstRate = taxRate / 2;
   const isAsus = isAsusStore(store.store_name);
 
   const items = buildOrderInvoiceItems(order, components, products);
 
+  // Customer amounts are GST-inclusive for every store: back the GST out for the
+  // tax columns and never add it on top of the amount again.
   const lineTotals = items.map((i) => {
+    if (i && i.isHeading) {
+      return { qty: 0, rate: 0, disc: 0, taxable: 0, cgst: 0, sgst: 0, total: 0, heading: true };
+    }
     const qty = parseInt(i.qty) || 1;
     const rate = parseFloat(i.price) || 0;
     const disc = parseFloat(i.discount || 0);
     const lineIncl = Math.max(0, (rate - disc) * qty);
-    if (isAsus) {
-      const taxable = lineIncl / (1 + taxRate / 100);
-      const tax = lineIncl - taxable;
-      return { qty, rate, disc, taxable, cgst: tax / 2, sgst: tax / 2, total: lineIncl };
-    }
-    const taxable = lineIncl;
-    return { qty, rate, disc, taxable, cgst: taxable * cgstRate / 100, sgst: taxable * sgstRate / 100, total: taxable + taxable * taxRate / 100 };
+    const taxable = lineIncl / (1 + taxRate / 100);
+    const tax = lineIncl - taxable;
+    return { qty, rate, disc, taxable, cgst: tax / 2, sgst: tax / 2, total: lineIncl };
   });
 
   const taxableValue = lineTotals.reduce((s, l) => s + l.taxable, 0);
@@ -234,6 +332,19 @@ function buildInvoiceHTML(order, components, store, products) {
   const financeDur = parseInt(order.finance_duration, 10) || 0;
   const isFinance = terms === 'Finance' || order.payment_type === 'Finance';
 
+  // Advance / part-payment details captured on the order form (advance or
+  // non-advance booking). Shown in the invoice so the customer can see how
+  // much was paid, by which mode, and the balance still due.
+  const advancePaid = parseFloat(order.advance_payment) || 0;
+  const advanceMode = order.advance_payment_mode || '';
+  const balanceDue = Math.max(0, grandTotal - advancePaid);
+  // The order invoice represents a completed sale, so it always shows the
+  // payment as fully settled regardless of any advance recorded.
+  const payStatus = 'Paid Fully';
+  // Date the advance was paid: the booking/order date when an advance was
+  // received, otherwise today's date.
+  const advanceDate = fmtDate(advancePaid > 0 ? (order.advance_paid_date || order.order_date || order.created_at || new Date()) : new Date());
+
   let asusCompanyName = companyName;
   let asusAddr = addr;
   let asusPhone = phoneNum;
@@ -243,7 +354,7 @@ function buildInvoiceHTML(order, components, store, products) {
     asusCompanyName = 'BLUECHIP COMPUTER SYSTEM [ASUS EXCLUSIVE STORE]';
     asusAddr = '05, Harmony complex, Opp. MK High School, Alkapuri, Vadodara-07';
     asusPhone = '9904991114';
-    asusEmail = 'bluechipcs@yahoo.com';
+    asusEmail = emailAddr || 'aes.bluechip@gmail.com';
     asusWebsite = 'www.bccsgroup.in';
   }
 
@@ -262,16 +373,26 @@ function buildInvoiceHTML(order, components, store, products) {
     stampImg = '';
   }
 
+  let itemSerialNo = 0;
   const itemRows = items.map((item, idx) => {
     const lt = lineTotals[idx] || { qty: 1, taxable: 0, cgst: 0, sgst: 0, total: 0 };
+    if (item && item.isHeading) {
+      return `<tr>
+      <td colspan="11" style="border:1px solid #777;padding:3px 5px;background:#f5f5f5;font-weight:bold">${esc(item.name || '')}</td>
+    </tr>`;
+    }
+    itemSerialNo += 1;
     const qty = lt.qty;
-    const rate = isAsus ? (lt.taxable / qty) : lt.rate;
+    const rate = lt.taxable / qty;
     const itemTaxRate = item.tax || taxRate;
-    const hsn = item.hsn || '84713010';
+    // HSN/SAC is only printed when one was actually recorded for the line -
+    // there is no hardcoded default, so an unentered HSN never shows a code.
+    const hsn = String(item.hsn || '').trim() || '-';
     const descLines = [
       `<div style="font-weight:bold">${esc(item.name || 'Service')}</div>`,
-      item.modelNo ? `<div>Model No: ${esc(item.modelNo)}</div>` : '',
+      item.brand ? `<div>Brand: ${esc(item.brand)}</div>` : '',
       item.serialNumber ? `<div>Serial No: ${esc(item.serialNumber)}</div>` : '',
+      item.modelNo ? `<div>Model No: ${esc(item.modelNo)}</div>` : '',
       item.partNo ? `<div>Part No: ${esc(item.partNo)}</div>` : '',
       item.checkNo ? `<div>Check No: ${esc(item.checkNo)}</div>` : '',
       item.warranty && String(item.warranty).toLowerCase().trim() !== 'no warranty' ? `<div>Warranty: ${String(item.warranty).toUpperCase()} OF HARDWARE WARRANTY</div>` : '',
@@ -279,7 +400,7 @@ function buildInvoiceHTML(order, components, store, products) {
       item.description ? `<div style="font-size:7.5px">${esc(item.description)}</div>` : '',
     ].filter(Boolean).join('');
     return `<tr>
-      <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${idx + 1}</td>
+      <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemSerialNo}</td>
       <td style="border:1px solid #777;padding:2px 4px;vertical-align:top">${descLines}</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${esc(hsn)}</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${qty} Qty</td>
@@ -294,10 +415,12 @@ function buildInvoiceHTML(order, components, store, products) {
   }).join('');
 
   const taxSummaryRows = items.map((item, idx) => {
+    // Heading rows carry no HSN / no tax - they are skipped in the tax summary.
+    if (item && item.isHeading) return '';
     const lt = lineTotals[idx] || { taxable: 0, cgst: 0, sgst: 0 };
     const itr = item.tax || taxRate;
     return `<tr>
-      <td style="border:1px solid #777;text-align:center">${esc(item.hsn || '84713010')}</td>
+      <td style="border:1px solid #777;text-align:center">${esc(String(item.hsn || '').trim() || '-')}</td>
       <td style="border:1px solid #777;text-align:right">${fmtINR(lt.taxable)}</td>
       <td style="border:1px solid #777;text-align:center">${itr / 2}%</td>
       <td style="border:1px solid #777;text-align:right">${fmtINR(lt.cgst)}</td>
@@ -328,8 +451,8 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
 <tr>
   <td style="width:60%;border-right:1px solid #777;padding:4px 5px;vertical-align:top">
     <table style="width:100%"><tr>
-      <td style="width:60px;vertical-align:top;padding-right:6px;border-right:1px solid #777">
-        ${logoSrc ? `<img src="${esc(logoSrc)}" style="max-width:110px;max-height:120px;object-fit:contain" />` : ''}
+      <td style="width:110px;display:table-cell;vertical-align:middle;text-align:center;padding:4px 6px;border-right:1px solid #777">
+        ${logoSrc ? `<img src="${esc(logoSrc)}" style="max-width:100%;max-height:120px;object-fit:contain" />` : ''}
       </td>
       <td style="vertical-align:top;padding-left:8px">
         <div style="font-size:9px;font-weight:bold;line-height:1.4">${esc(asusCompanyName)}</div>
@@ -461,6 +584,25 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
   <span style="font-weight:bold">Tax Amount (in words): </span>${numToWords(totalTax)}
 </div>
 <table style="width:100%;border:1px solid #777;border-top:none">
+<thead>
+<tr style="background:#f5f5f5">
+  <th style="border:1px solid #777;font-size:8px;text-align:left;padding:2px 4px" colspan="4">Payment Details</th>
+</tr>
+</thead>
+<tbody>
+<tr style="font-size:8px">
+  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Total Amount:</span> &#8377;${fmtINR(grandTotal)}</td>
+  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Advance Paid:</span> &#8377;${fmtINR(advancePaid)}</td>
+  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Payment Mode:</span> ${esc(advanceMode || terms || '-')}</td>
+  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Balance Due:</span> &#8377;${fmtINR(balanceDue)}</td>
+</tr>
+<tr style="font-size:8px">
+  <td style="border:1px solid #777;padding:2px 4px" colspan="2"><span class="lbl">Advance Payment Date:</span> ${advanceDate || '-'}</td>
+  <td style="border:1px solid #777;padding:2px 4px" colspan="2"><span class="lbl">Payment Status:</span> ${esc(payStatus)}</td>
+</tr>
+</tbody>
+</table>
+<table style="width:100%;border:1px solid #777;border-top:none">
 <tr>
   <td style="width:35%;border-right:1px solid #777;padding:3px 5px;vertical-align:top">
     <div style="font-weight:bold;font-size:8px;border-bottom:1px solid #777;margin-bottom:2px;padding-bottom:1px">Company's Bank Details</div>
@@ -481,8 +623,9 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
 <table style="width:100%;border:1px solid #777;border-top:none">
 <tr>
   <td style="width:70%;border-right:1px solid #777;padding:4px 6px;vertical-align:top">
-    <div style="font-weight:bold;font-size:8px;margin-bottom:3px">ASUS PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -</div>
+    <div style="font-weight:bold;font-size:8px;margin-bottom:3px">${isAsus ? 'ASUS PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -' : 'BLUE CHIP PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -'}</div>
     <div style="font-size:7.5px;line-height:1.6">
+      ${isAsus ? `
       <div><b>1. Product Opening &amp; Demonstration</b><br/>The ASUS product has been opened and demonstrated in the presence of the customer.</div>
       <div><b>2. Product Inspection</b><br/>The customer has thoroughly inspected and checked the product. No issues or defects were found at the time of inspection.</div>
       <div><b>3. Extended Warranty Information</b><br/>The ASUS Promoter has explained the available Extended Warranty options and applicable terms &amp; conditions to the customer.</div>
@@ -491,6 +634,16 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
       <div><b>6. DOA (DEAD ON ARRIVAL) POLICY</b><br/>In case of a DOA (Dead on Arrival) claim, the product is eligible for DOA consideration only within 7 working days from the date of invoice, subject to the applicable ASUS DOA Policy.</div>
       <div>The system must first be submitted to an authorized ASUS Service Centre for inspection and verification. The final decision regarding DOA eligibility and replacement will be made by ASUS/its authorized Service Centre based on their inspection and approval.</div>
       <div>The store will not be responsible for the approval or rejection of any DOA replacement. All DOA claims and replacements will be governed strictly by the applicable ASUS Policy and its terms &amp; conditions.</div>
+      ` : `
+      <div><b>1. Product Opening &amp; Demonstration</b><br/>The product has been opened and demonstrated in the presence of the customer.</div>
+      <div><b>2. Product Inspection</b><br/>The customer has thoroughly inspected and checked the product. No issues or defects were found at the time of inspection.</div>
+      <div><b>3. Extended Warranty Information</b><br/>The Blue Chip team has explained the available Extended Warranty options and applicable terms &amp; conditions to the customer.</div>
+      <div><b>4. Customer Support</b><br/>For any assistance or support, the customer may contact the Blue Chip Computer Store during working hours at +91 99049 91819.</div>
+      <div><b>5. Advance Booking Amount Policy</b><br/>The advance booking amount is non-refundable. However, if the customer chooses not to proceed with the booked product, the advance amount may be redeemed against any complimentary product of equal value available at the Blue Chip Computer Store.</div>
+      <div><b>6. DOA (DEAD ON ARRIVAL) POLICY</b><br/>In case of a DOA (Dead on Arrival) claim, the product is eligible for DOA consideration only within 7 working days from the date of invoice, subject to the applicable DOA Policy.</div>
+      <div>The system must first be submitted to an authorized Service Centre for inspection and verification. The final decision regarding DOA eligibility and replacement will be made by the authorized Service Centre based on their inspection and approval.</div>
+      <div>The store will not be responsible for the approval or rejection of any DOA replacement. All DOA claims and replacements will be governed strictly by the applicable policy and its terms &amp; conditions.</div>
+      `}
     </div>
   </td>
   <td style="width:30%;padding:3px 5px;vertical-align:top;text-align:center">
@@ -509,6 +662,20 @@ async function generateOrderInvoicePdf(orderId) {
   const oRes = await query('SELECT * FROM orders WHERE id = $1', [orderId]);
   if (oRes.rows.length === 0) throw new Error('Order not found');
   const order = oRes.rows[0];
+
+  // If this order was converted from an advance booking, use the original
+  // booking date as the date the advance was paid.
+  try {
+    const bookRes = await query(
+      `SELECT order_date FROM orders
+        WHERE booking_type = 'advanced' AND linked_order_id = $1
+        ORDER BY id LIMIT 1`,
+      [orderId]
+    );
+    if (bookRes.rows.length > 0 && bookRes.rows[0].order_date) {
+      order.advance_paid_date = bookRes.rows[0].order_date;
+    }
+  } catch (e) { /* ignore — fall back to order date */ }
 
   const compRes = await query('SELECT * FROM order_components WHERE order_id = $1', [orderId]);
   const components = compRes.rows || [];

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const { query } = require('../config/database');
+const { query, pool } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 
 const SESSION_DURATION_DAYS = 30;
@@ -20,13 +20,27 @@ router.post('/login', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Login ID and password are required' });
     }
 
-    // Find user by email, mobile_number, or username
-    const result = await query(
+    // Find user by email, mobile_number, or username. Always query the MASTER
+    // (super admin) database: a request may still be wrapped in a tenant
+    // context by a stale session token in the browser, and tenant owners live
+    // in each shop's own Neon database (via tenantLogin below), never here.
+    const result = await pool.query(
       `SELECT * FROM users WHERE (email = $1 OR mobile_number = $1 OR username = $1) AND is_active = TRUE`,
       [loginId]
     );
 
     if (result.rows.length === 0) {
+      // Not a local user — maybe a client shop owner logging into their own
+      // workspace. Resolve via the master registry and authenticate against
+      // the client's own Neon database.
+      const { tenantLogin } = require('../services/tenantService');
+      const tenantRes = await tenantLogin(loginId, password, req);
+      if (tenantRes) {
+        if (!tenantRes.success) {
+          return res.status(401).json(tenantRes);
+        }
+        return res.json(tenantRes);
+      }
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
@@ -80,6 +94,9 @@ router.post('/logout', async (req, res, next) => {
     const token = req.headers.authorization?.replace('Bearer ', '') || req.body.sessionToken;
     if (token) {
       await query('UPDATE user_sessions SET is_valid = FALSE WHERE session_token = $1', [token]);
+      // Also drop the master-routing session for tenant logins.
+      const { deleteSession } = require('../services/saasMasterDb');
+      await deleteSession(token);
     }
     res.json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
@@ -94,7 +111,8 @@ router.get('/session', authenticate, async (req, res, next) => {
       success: true,
       data: {
         user: req.user,
-        sessionToken: req.sessionToken
+        sessionToken: req.sessionToken,
+        client: req.tenantClient || null,
       }
     });
   } catch (err) {
@@ -114,7 +132,8 @@ router.get('/me', authenticate, async (req, res, next) => {
         email: req.user.email,
         username: req.user.username,
         role: req.user.role,
-        storeId: req.user.store_id
+        storeId: req.user.store_id,
+        client: req.tenantClient || null,
       }
     });
   } catch (err) {
