@@ -19,6 +19,10 @@ const { optionalAuth } = require('../middleware/optionalAuth');
 const { generateInwardReceiptFromHTML, generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
 const { createPdfMessage, createStatusEvent, getOrCreateConversation, updateMessageStatusById } = require('../services/messagingService');
 const { notifyTicketCreated, sendTicketStatusTemplate, sendTextMessage, sendCollectionLink, sendInwardReceiptLink, sendServiceInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
+// Draws the ticket's purchased items out of the purchase stock and records the
+// serials of the units taken. Runs inside the ticket's own transaction, so a
+// ticket can never exist without its stock movement.
+const purchaseStock = require('../services/purchaseStockService');
 
 // Normalize status strings to exact DB enum values (handles casing differences
 // between mobile app, web frontend, and the PostgreSQL enum).
@@ -66,11 +70,16 @@ function normalizeLineItems(raw, fallbackSource) {
       const qty = parseFloat(it.qty ?? it.quantity ?? it.unit ?? 1) || 1;
       const unitPrice = parseFloat(it.unitPrice ?? it.unit_price ?? it.price ?? 0) || 0;
       const total = parseFloat(it.total ?? it.amount);
+      // A line picked from purchased stock carries the item name it came from.
+      // It is kept on the line so the stock deduction knows what to draw, but
+      // the serials are never stored here — no print reads this field.
+      const purchaseItemName = it.purchaseItemName || it.purchase_item_name || '';
       out.push({
         description: String(description).trim(),
         qty,
         unitPrice,
         total: Number.isFinite(total) ? total : qty * unitPrice,
+        ...(String(purchaseItemName).trim() ? { purchaseItemName: String(purchaseItemName).trim() } : {}),
       });
     });
   }
@@ -394,6 +403,31 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
 
     await recordStatusChange(insertId, null, status, 'System', client, ticketId);
 
+    // Deduct any purchased items this ticket is using. The serials of the units
+    // taken are recorded in purchase_item_consumptions only — they are never
+    // written to line_items, so no print or invoice can show them.
+    let stockMovements = { allocations: [], shortfalls: [] };
+    try {
+      stockMovements = await purchaseStock.consumeForTicket({
+        client,
+        ticketId: insertId,
+        ticketRef: ticketId,
+        storeId: resolvedStoreId,
+        lineItems,
+      });
+      if (stockMovements.shortfalls.length > 0) {
+        for (const s of stockMovements.shortfalls) {
+          console.warn(
+            `Ticket ${ticketId}: only ${s.requested - s.shortBy} of ${s.requested} unit(s) of "${s.itemName}" were in purchased stock`
+          );
+        }
+      }
+    } catch (stockErr) {
+      // Never fail a ticket because the stock bookkeeping hit a problem; the
+      // ticket itself is the important record.
+      console.error('Purchase stock deduction failed for ticket', ticketId, stockErr.message);
+    }
+
     await client.query('COMMIT');
 
     const newTicket = await client.query('SELECT * FROM tickets WHERE id = $1', [insertId]);
@@ -456,7 +490,14 @@ router.post('/', validateTicket, optionalAuth, async (req, res, next) => {
 
     scheduleServiceInvoiceGeneration(insertId, status);
 
-    res.status(201).json({ success: true, message: 'Ticket created successfully', data: newTicket.rows[0] });
+    res.status(201).json({
+      success: true,
+      message: 'Ticket created successfully',
+      data: newTicket.rows[0],
+      // Reported back so the UI can warn that stock ran short. The serials
+      // themselves are intentionally not returned to the client.
+      stockShortfalls: stockMovements.shortfalls || [],
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
@@ -658,6 +699,24 @@ router.put('/:id', async (req, res, next) => {
         `UPDATE tickets SET ${setClauses.join(', ')} WHERE id = $${setClauses.length + 1}`,
         updateValues
       );
+    }
+
+    // When the service items are edited, the stock they had taken is returned
+    // and drawn again, so the purchase quantities always match what the ticket
+    // actually uses. Without this, every save would deduct a second time.
+    if (normalizedLineItems) {
+      try {
+        await purchaseStock.releaseForTicket({ client, ticketId: parseInt(req.params.id) });
+        await purchaseStock.consumeForTicket({
+          client,
+          ticketId: parseInt(req.params.id),
+          ticketRef: oldTicket.ticket_id,
+          storeId: oldTicket.store_id,
+          lineItems: normalizedLineItems,
+        });
+      } catch (stockErr) {
+        console.error('Purchase stock refresh failed for ticket', req.params.id, stockErr.message);
+      }
     }
 
     await client.query('COMMIT');

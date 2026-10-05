@@ -141,6 +141,7 @@ const SCREEN_GUARD_MAP = {
   '/api/inventory': ['inventory'],
   '/api/suppliers': ['inventory', 'orders'],
   '/api/demo-models': ['inventory', 'orders'],
+  '/api/purchases': ['inventory'],
   '/api/dashboard': ['dashboard'],
   '/api/stores': ['settings', 'dashboard'],
 };

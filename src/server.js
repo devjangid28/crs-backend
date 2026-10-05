@@ -35,6 +35,7 @@ const supplierRoutes = require('./routes/suppliers');
 const demoModelRoutes = require('./routes/demoModels');
 const notificationRoutes = require('./routes/notifications');
 const quotationRoutes = require('./routes/quotation');
+const purchaseRoutes = require('./routes/purchases');
 const saasRoutes = require('./routes/saas');
 const notificationService = require('./services/notificationService');
 
@@ -149,6 +150,7 @@ app.use('/api/suppliers', supplierRoutes);
 app.use('/api/demo-models', demoModelRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/quotations', quotationRoutes);
+app.use('/api/purchases', purchaseRoutes);
 app.use('/api/saas', saasRoutes);
 
 // ---- Serve built frontend as static files ----

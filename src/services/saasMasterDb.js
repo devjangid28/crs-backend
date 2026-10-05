@@ -11,7 +11,7 @@ const crypto = require('crypto');
 
 const SCREEN_IDS = [
   'dashboard', 'newticket', 'tickets', 'orders', 'amc', 'quotation',
-  'messages', 'inventory', 'settings', 'help',
+  'messages', 'inventory', 'purchases', 'settings', 'help',
 ];
 
 const ALL_SCREENS = [
@@ -23,6 +23,7 @@ const ALL_SCREENS = [
   { id: 'quotation', label: 'Quotation' },
   { id: 'messages', label: 'Messaging' },
   { id: 'inventory', label: 'Inventory' },
+  { id: 'purchases', label: 'Purchases' },
   { id: 'settings', label: 'Admin' },
   { id: 'help', label: 'Help' },
 ];
