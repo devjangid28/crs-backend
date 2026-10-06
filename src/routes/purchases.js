@@ -1,8 +1,11 @@
 const express = require('express');
 const router = express.Router();
+const path = require('path');
+const fs = require('fs');
 const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 const purchaseStock = require('../services/purchaseStockService');
+const invoiceOcr = require('../services/invoiceOcr');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Purchases (Tally-style purchase voucher)
@@ -95,6 +98,17 @@ async function ensureTables(client) {
   await q(`CREATE INDEX IF NOT EXISTS idx_purchases_party_name ON purchases(LOWER(party_name))`);
   await q(`CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase_id ON purchase_items(purchase_id)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_purchase_items_item_name ON purchase_items(LOWER(item_name))`);
+  // Invoice-import audit trail. Every column is optional, so a purchase entered
+  // by hand is byte-for-byte what it always was; only a purchase created from a
+  // scanned invoice fills these in, which is what makes it possible to answer
+  // "where did this voucher come from?" during an audit.
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS source VARCHAR(40) DEFAULT NULL`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS ocr_processed BOOLEAN NOT NULL DEFAULT FALSE`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS ocr_processed_at TIMESTAMP DEFAULT NULL`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS ocr_confidence DECIMAL(4,3) DEFAULT NULL`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS invoice_document_name VARCHAR(255) DEFAULT NULL`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS invoice_document_type VARCHAR(60) DEFAULT NULL`);
+  await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS invoice_document_path VARCHAR(400) DEFAULT NULL`);
   // Store separation: existing purchases stay with the default (Blue Chip) store.
   await q(`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS store_id INTEGER DEFAULT NULL`);
   await q(`
@@ -338,6 +352,224 @@ router.get('/consumptions', authenticate, async (req, res, next) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Invoice import (Scan / Upload)
+//
+//  Reads a photographed or uploaded supplier invoice and returns everything it
+//  could understand — supplier, GSTIN, invoice number and date, every line item
+//  with its HSN, quantity, pre-tax rate and serial numbers, the GST that was
+//  actually charged, and the totals — each field carrying a confidence value.
+//
+//  This route deliberately writes nothing. It returns a *draft* that the New
+//  Purchase form is filled from, and the user then reviews and saves it through
+//  the ordinary purchase endpoints. An OCR result is never allowed to reach the
+//  database on its own, because OCR gets 0 and O and 1 and I wrong, and a wrong
+//  GSTIN, serial number or rate is expensive to discover later.
+//
+//  Everything is processed in-process with open-source tools; the invoice is
+//  never sent to a third party and nothing is written to disk here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INVOICE_DOC_DIR = path.join(__dirname, '..', '..', 'uploads', 'purchase-invoices');
+
+// GET /api/purchases/invoice-ocr/status - is the reader ready, and can this
+// build enhance photos? The UI uses it to explain itself before a user tries.
+router.get('/invoice-ocr/status', authenticate, async (_req, res, next) => {
+  try {
+    const engine = await invoiceOcr.warmUp();
+    res.json({
+      success: true,
+      data: {
+        available: Boolean(engine.ready),
+        error: engine.error || null,
+        offline: Boolean(engine.localLanguageData),
+        imageEnhancement: invoiceOcr.preprocessAvailable(),
+        acceptedFormats: ['jpg', 'jpeg', 'png', 'webp', 'pdf'],
+        maxFileBytes: invoiceOcr.MAX_FILE_BYTES,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/purchases/invoice-ocr/extract - read an invoice and return a draft.
+//
+// The file arrives the same way every other upload in this app does: base64 in
+// the JSON body. That keeps the endpoint free of any new multipart handling and
+// works identically from the web app and from the mobile app.
+router.post('/invoice-ocr/extract', authenticate, async (req, res, next) => {
+  try {
+    const {
+      fileName = '', fileType = '', fileData = '',
+      ownCompany = {}, storeId = null, checkDuplicates = true, dpi = null,
+    } = req.body || {};
+
+    if (!fileData) {
+      return res.status(400).json({ success: false, message: 'No invoice file was received.' });
+    }
+
+    let buffer;
+    try {
+      buffer = Buffer.from(String(fileData), 'base64');
+    } catch (err) {
+      buffer = null;
+    }
+    if (!buffer || !buffer.length) {
+      return res.status(400).json({ success: false, message: 'The invoice file could not be read.' });
+    }
+
+    const result = await invoiceOcr.extractInvoice({
+      buffer,
+      fileName,
+      mimeType: fileType,
+      // Who "we" are. This is what lets the reader tell a purchase invoice from
+      // one of our own sales invoices — the difference between a supplier and a
+      // customer, and the single most expensive mistake this feature could make.
+      ownCompany: {
+        name: ownCompany.name || ownCompany.companyName || '',
+        gstin: ownCompany.gstin || ownCompany.partyGstin || '',
+      },
+      storeId: storeId != null && storeId !== '' ? parseInt(storeId, 10) : null,
+      checkDuplicates: checkDuplicates !== false,
+      dpi: Number(dpi) > 0 ? Number(dpi) : null,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    if (err && err.code && err.status) {
+      // A problem with the file itself (unsupported format, too large, empty) —
+      // reported as-is so the user gets a message they can act on.
+      return res.status(err.status).json({ success: false, code: err.code, message: err.message });
+    }
+    console.error('[InvoiceOCR] extraction failed:', err && err.message);
+    res.status(500).json({
+      success: false,
+      message: 'We could not read this invoice. Please try a clearer image or enter the purchase manually.',
+    });
+  }
+});
+
+// POST /api/purchases/invoice-ocr/check-duplicate - has this supplier invoice
+// already been entered? Run again after the user edits the party or invoice
+// number, and always before an OCR-sourced purchase is saved.
+router.post('/invoice-ocr/check-duplicate', authenticate, async (req, res, next) => {
+  try {
+    const { partyName, invoiceNo, gstin, storeId, excludePurchaseId } = req.body || {};
+    const result = await invoiceOcr.duplicateCheck({
+      partyName,
+      invoiceNo,
+      gstin,
+      storeId: storeId != null && storeId !== '' ? parseInt(storeId, 10) : null,
+      excludePurchaseId: excludePurchaseId != null && excludePurchaseId !== '' ? parseInt(excludePurchaseId, 10) : null,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/purchases/invoice-ocr/check-serials - do these serial numbers
+// already exist in purchased stock? A serial that is already recorded belongs to
+// a unit physically in the shop, so entering it twice would put two stock
+// records behind one device.
+router.post('/invoice-ocr/check-serials', authenticate, async (req, res, next) => {
+  try {
+    const { serials = [], storeId, excludePurchaseId } = req.body || {};
+    const result = await invoiceOcr.serialCheck({
+      serials: Array.isArray(serials) ? serials : [],
+      storeId: storeId != null && storeId !== '' ? parseInt(storeId, 10) : null,
+      excludePurchaseId: excludePurchaseId != null && excludePurchaseId !== '' ? parseInt(excludePurchaseId, 10) : null,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Saves the invoice file the user confirmed, and links it to the purchase.
+ * Only called from the purchase endpoints, i.e. after the user has already
+ * reviewed the entry — so nothing about an invoice is retained before that.
+ *
+ * Returns `{ path, previousPath }`. The previous file is reported rather than
+ * deleted here, so it can be removed once the transaction has actually
+ * committed: losing an attachment must never leave a purchase pointing at a file
+ * that is no longer there.
+ */
+async function attachInvoiceDocument(client, purchaseId, document) {
+  const q = client ? client.query.bind(client) : query;
+  const raw = document && typeof document === 'object' ? document : null;
+  if (!raw || raw.keep === false) return null;
+  if (!raw.data) return null;
+
+  const fileName = String(raw.fileName || 'invoice').replace(/[^\w.\-]+/g, '_').slice(-120);
+  const fileType = String(raw.fileType || '').slice(0, 60);
+  let buffer;
+  try {
+    buffer = Buffer.from(String(raw.data), 'base64');
+  } catch (err) {
+    buffer = null;
+  }
+  if (!buffer || !buffer.length) return null;
+
+  const existing = await q('SELECT invoice_document_path FROM purchases WHERE id = $1', [purchaseId]);
+  const storedName = `${purchaseId}_${fileName}`;
+  const relative = path.join('purchase-invoices', storedName);
+  const absolute = path.join(INVOICE_DOC_DIR, storedName);
+
+  try {
+    fs.mkdirSync(INVOICE_DOC_DIR, { recursive: true });
+    fs.writeFileSync(absolute, buffer);
+  } catch (err) {
+    console.error('[InvoiceOCR] could not store the invoice file:', err.message);
+    return null;
+  }
+
+  await q(
+    `UPDATE purchases
+        SET invoice_document_name = $2,
+            invoice_document_type = $3,
+            invoice_document_path = $4,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1`,
+    [purchaseId, fileName, fileType, relative]
+  );
+
+  const previous = existing.rows[0]?.invoice_document_path;
+  return {
+    path: `/uploads/${relative.split(path.sep).join('/')}`,
+    previousPath: previous && previous !== relative
+      ? path.join(path.join(__dirname, '..', '..', 'uploads'), previous)
+      : null,
+  };
+}
+
+/** Removes a replaced invoice file, once the purchase itself is safely saved. */
+function removeStaleInvoiceFile(previousPath) {
+  if (!previousPath) return;
+  try {
+    // Only ever inside the purchase-invoices folder.
+    if (!previousPath.startsWith(INVOICE_DOC_DIR + path.sep)) return;
+    if (fs.existsSync(previousPath)) fs.unlinkSync(previousPath);
+  } catch (err) {
+    console.error('[InvoiceOCR] could not remove the replaced invoice file:', err.message);
+  }
+}
+
+/** Fills the invoice-import audit columns. Optional in every request. */
+function ocrAuditFields(body) {
+  const ocr = body && body.ocr ? body.ocr : null;
+  if (!ocr || ocr.processed !== true) return null;
+  const confidence = parseFloat(ocr.confidence);
+  return {
+    source: 'OCR Invoice Import',
+    ocrProcessed: true,
+    ocrProcessedAt: new Date().toISOString(),
+    ocrConfidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : null,
+  };
+}
+
 // GET /api/purchases/:id - one purchase with its items
 router.get('/:id', authenticate, async (req, res, next) => {
   try {
@@ -389,7 +621,7 @@ router.post('/', authenticate, async (req, res, next) => {
       voucherNo, purchaseDate, partyName, partyGstin, partyAddress, partyCity,
       partyState, partyPincode, partyPhone, partyEmail, contactPerson,
       invoiceNo, invoiceDate, taxRate = 18, remark, status = 'Completed', storeId,
-      items = []
+      items = [], invoiceDocument = null
     } = req.body;
 
     if (!partyName || !String(partyName).trim()) {
@@ -411,13 +643,18 @@ router.post('/', authenticate, async (req, res, next) => {
 
     const { subtotal, taxAmount, totalAmount } = computeTotals(parsedItems, taxRate);
 
+    // Invoice-import provenance. Absent for a purchase typed by hand, which
+    // keeps those vouchers exactly as they were before this feature existed.
+    const audit = ocrAuditFields(req.body);
+
     const inserted = await client.query(
       `INSERT INTO purchases (
         voucher_no, purchase_date, party_name, party_gstin, party_address, party_city,
         party_state, party_pincode, party_phone, party_email, contact_person,
         invoice_no, invoice_date, subtotal, tax_rate, tax_amount, total_amount,
-        remark, status, created_by, store_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+        remark, status, created_by, store_id,
+        source, ocr_processed, ocr_processed_at, ocr_confidence
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
       RETURNING *`,
       [
         number, purchaseDate || new Date().toISOString().slice(0, 10), String(partyName).trim(),
@@ -426,7 +663,11 @@ router.post('/', authenticate, async (req, res, next) => {
         invoiceNo || null, invoiceDate || null, subtotal, parseFloat(taxRate) || 0,
         taxAmount, totalAmount, remark || null, status,
         (req.user && (req.user.full_name || req.user.name)) || 'System',
-        storeId != null && storeId !== '' ? parseInt(storeId) : null
+        storeId != null && storeId !== '' ? parseInt(storeId) : null,
+        audit ? audit.source : null,
+        audit ? audit.ocrProcessed : false,
+        audit ? audit.ocrProcessedAt : null,
+        audit ? audit.ocrConfidence : null,
       ]
     );
 
@@ -445,8 +686,17 @@ router.post('/', authenticate, async (req, res, next) => {
       );
     }
 
+    // The scanned invoice is kept only now — after the user has confirmed the
+    // entry — and only if they asked for it to be kept.
+    const document = await attachInvoiceDocument(client, purchaseId, invoiceDocument);
+
     await client.query('COMMIT');
-    res.status(201).json({ success: true, message: 'Purchase saved successfully', data: inserted.rows[0] });
+    removeStaleInvoiceFile(document?.previousPath);
+    res.status(201).json({
+      success: true,
+      message: 'Purchase saved successfully',
+      data: { ...inserted.rows[0], invoice_document_path: document?.path || null },
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
@@ -476,7 +726,7 @@ router.put('/:id', authenticate, async (req, res, next) => {
     const {
       voucherNo, purchaseDate, partyName, partyGstin, partyAddress, partyCity,
       partyState, partyPincode, partyPhone, partyEmail, contactPerson,
-      invoiceNo, invoiceDate, taxRate, remark, status, items
+      invoiceNo, invoiceDate, taxRate, remark, status, items, invoiceDocument = null
     } = req.body;
 
     const hasItems = Array.isArray(items);
@@ -529,6 +779,18 @@ router.put('/:id', authenticate, async (req, res, next) => {
       );
     }
 
+    // Re-saving an OCR-sourced voucher keeps its provenance current.
+    const audit = ocrAuditFields(req.body);
+    if (audit) {
+      await client.query(
+        `UPDATE purchases
+            SET source = $2, ocr_processed = $3, ocr_processed_at = $4, ocr_confidence = $5,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1`,
+        [req.params.id, audit.source, audit.ocrProcessed, audit.ocrProcessedAt, audit.ocrConfidence]
+      );
+    }
+
     if (parsedItems) {
       await client.query('DELETE FROM purchase_items WHERE purchase_id = $1', [req.params.id]);
       for (const item of parsedItems) {
@@ -546,7 +808,10 @@ router.put('/:id', authenticate, async (req, res, next) => {
       }
     }
 
+    const document = await attachInvoiceDocument(client, parseInt(req.params.id, 10), invoiceDocument);
+
     await client.query('COMMIT');
+    removeStaleInvoiceFile(document?.previousPath);
     const updated = await query('SELECT * FROM purchases WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'Purchase updated successfully', data: updated.rows[0] });
   } catch (err) {
