@@ -28,10 +28,13 @@
 const preprocess = require('./preprocess');
 const ocrEngine = require('./ocrEngine');
 const pdfInput = require('./pdf');
-const { parseInvoice } = require('./parser');
+const { parseInvoice, INVOICE_NUMBER_LABELS, INVOICE_DATE_LABELS } = require('./parser');
+const companyIdentity = require('./companyIdentity');
 const validator = require('./validate');
 const { valueOf } = validator;
-const { confidenceBand, collapseSpaces, round2, cleanLine } = require('./normalize');
+const { findLabeledValue, findLabeledValueInCells, buildColumnBands } = require('./layout');
+const sharp = require('sharp');
+const { confidenceBand, collapseSpaces, round2, cleanLine, normalizeState, repairGstin, normalizeGstin, field, normalizeDate } = require('./normalize');
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;                 // 25 MB
 const ACCEPTED_MIME = [
@@ -45,7 +48,10 @@ const MAX_RAW_TEXT_CHARS = 20000;
 // longer than this is trimmed rather than allowed to fail the save.
 const LIMIT = {
   partyName: 200, gstin: 20, address: 2000, city: 100, state: 100, pincode: 10,
-  phone: 20, email: 191, contactPerson: 150, invoiceNo: 80, remark: 4000,
+  // A phone field legitimately holds more than one number - "9601740014, 8487961404"
+  // is 20 characters including the separator - so the old 20-character cap cut the
+  // second number off mid-digits and wrote a number that was never printed.
+  phone: 64, email: 191, contactPerson: 150, invoiceNo: 80, remark: 4000,
   itemName: 255, hsnCode: 20, serial: 60,
 };
 
@@ -175,6 +181,9 @@ async function decodeIntoPages(buffer, { fileName, mimeType, onStage, dpi } = {}
     textSource: 'image-ocr',
     quality: prepared.assessment,
     enhanced: prepared.enhanced,
+    // The raster this page was read from, kept for a targeted re-read of the
+    // header when the invoice number or date was lost at the page-level OCR.
+    prepared: { buffer: prepared.buffer, width: prepared.width, height: prepared.height },
   };
 }
 
@@ -188,6 +197,128 @@ async function decodeIntoPages(buffer, { fileName, mimeType, onStage, dpi } = {}
  * Nothing else is ever inferred: with two or more items there is no way to know
  * which line a total belongs to, so the rate stays blank for the user to type.
  */
+
+/**
+ * Targeted re-OCR of the header metadata column.
+ *
+ * The page-level read puts the whole page through Tesseract at one scale, and the
+ * tiniest cells on the page — the invoice number and date printed in the header
+ * table — come out at a size where OCR routinely drops them. Cropping just the
+ * header strip and re-reading it at three times the scale recovers them, exactly
+ * like zooming in on the paper. Only ever fills a field the page-level read left
+ * empty; it never overwrites a value that was already read.
+ */
+const HEADER_DATE_TOKEN = /\b(\d{1,2}[-\/]([A-Za-z0-9]{2,8})[-\/]\d{2,4}|\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})\b/i;
+
+function cleanHeaderNumber(text) {
+  const candidate = collapseSpaces(text).replace(/^[^\w\/-]+|[^\w\/-]+$/g, '');
+  if (!candidate || candidate.length < 2 || candidate.length > 80) return null;
+  if (!/\d/.test(candidate)) return null;
+  if (HEADER_DATE_TOKEN.test(candidate)) return null;
+  if (/^e\s*&\s*oe$/i.test(candidate)) return null;
+  // Plausible invoice numbers on this page are digits with slashes/dashes
+  // ("126-27/00790", "12627100790"). Once OCR merges a neighbour letter in
+  // ("N1CSI26-27100790") it is beyond repair, and back it out.
+  if (!/^[\d][\d\/-]{5,19}$/.test(candidate)) return null;
+  return candidate;
+}
+
+// OCR reads the month glyph as a digit often enough ("6-0ct-26"): try the
+// character-level confusions before giving up on a date token.
+function fixMonthToken(token) {
+  if (/^[A-Za-z]+$/.test(token)) return token;
+  const map = { '0': 'o', '1': 'l', '2': 'z', '5': 's', '8': 'b' };
+  const fixed = [...token].map((c) => map[c] || c).join('');
+  return /^[A-Za-z]+$/.test(fixed) ? fixed : token;
+}
+function tryNormalizeDate(raw) {
+  const token = collapseSpaces(raw);
+  const normalized = normalizeDate(token);
+  if (normalized) return normalized;
+  const m = token.match(/(\d{1,2})[-\/]([A-Za-z0-9]+)[-\/](\d{2,4})/);
+  if (m) return normalizeDate(`${m[1]}-${fixMonthToken(m[2])}-${m[3]}`);
+  return null;
+}
+
+async function readHeaderReferenceFields(decoded, parsed) {
+  const raw = decoded?.prepared;
+  if (!raw || !Buffer.isBuffer(raw.buffer)) return;
+  const { width, height } = raw;
+  if (!(width > 200 && height > 200)) return;
+
+  const crop = async (left, top, cw, ch, scale) => {
+    const safe = (v, min, max) => Math.max(min, Math.min(max, Math.round(v)));
+    const region = {
+      left: safe(left, 0, width - 1),
+      top: safe(top, 0, height - 1),
+      width: safe(cw, 10, width - (safe(left, 0, width - 1))),
+      height: safe(ch, 10, height - (safe(top, 0, height - 1))),
+    };
+    const buf = await sharp(raw.buffer)
+      .extract(region)
+      .resize({
+        width: Math.round(region.width * scale),
+        height: Math.round(region.height * scale),
+        kernel: 'lanczos3',
+      })
+      .grayscale()
+      .toBuffer();
+    const page = await ocrEngine.recognizePage(buf);
+    return page.lines || [];
+  };
+
+  // The right-hand metadata column, read at high scale so the printed rule
+  // between "Invoic No." and "Dated" survives and the two cells stay separated
+  // ("126-27/00790   6-Oct-26"). A wide header strip backs it up for labels that
+  // spilled across the page.
+  const rightLines = await crop(width * 0.53, height * 0.06, width * 0.47, height * 0.30, 6);
+  const lines = rightLines.length ? rightLines : await crop(0, height * 0.02, width, height * 0.30, 4);
+  if (!lines.length) return;
+
+  const numberField = parsed?.invoice?.number;
+  const dateField = parsed?.invoice?.date;
+  const needNumber = !(numberField && numberField.value);
+  const needDate = !(dateField && dateField.value);
+  if (!needNumber && !needDate) return;
+
+  const bands = buildColumnBands(lines, { minCells: 2 });
+  let numberHit = needNumber ? findLabeledValue(lines, INVOICE_NUMBER_LABELS, { limit: lines.length }) : null;
+  if (!numberHit && needNumber) {
+    numberHit = findLabeledValueInCells(lines, INVOICE_NUMBER_LABELS, bands, { limit: lines.length });
+  }
+  let dateHit = needDate ? findLabeledValue(lines, INVOICE_DATE_LABELS, { limit: lines.length }) : null;
+  if (!dateHit && needDate) {
+    dateHit = findLabeledValueInCells(lines, INVOICE_DATE_LABELS, bands, { limit: lines.length });
+  }
+
+  let numberValue = numberHit?.value ? cleanHeaderNumber(numberHit.value) : null;
+  let dateValue = null;
+  if (dateHit?.value) dateValue = tryNormalizeDate(dateHit.value);
+
+  // Pattern fallback: "…/26-27/00790  6-Oct-26" carries BOTH fields on one
+  // printed row, so once the date token is cut out, the rest is the invoice
+  // number. This is the shape the page-level OCR most often caught.
+  if ((!numberValue || !dateValue)) {
+    for (const line of lines) {
+      const text = collapseSpaces(line.text || '');
+      const filler = text.replace(HEADER_DATE_TOKEN, ' ');
+      if (filler !== text && HEADER_DATE_TOKEN.test(text)) {
+        if (!dateValue) dateValue = tryNormalizeDate((text.match(HEADER_DATE_TOKEN) || [])[1]);
+        if (!numberValue) numberValue = cleanHeaderNumber(filler);
+        if (numberValue && dateValue) break;
+      }
+    }
+  }
+
+  if (needDate && dateValue) {
+    parsed.invoice.date = field(dateValue.iso, 0.85, 'header-reocr', ['Invoice date was re-read from the header at higher resolution — please verify']);
+    parsed.invoice.dateDisplay = dateValue.display;
+    if (dateValue.ambiguous) parsed.invoice.date.warnings = [...(parsed.invoice.date.warnings || []), 'Day and month order could not be confirmed — please verify'];
+  }
+  if (needNumber && numberValue) {
+    parsed.invoice.number = field(numberValue, 0.8, 'header-reocr', ['Invoice number was re-read from the header at higher resolution — please verify']);
+  }
+}
 function applyDocumentLevelFallbacks(parsed, math) {
   const items = parsed.items || [];
   if (items.length !== 1) return;
@@ -210,6 +341,43 @@ function applyDocumentLevelFallbacks(parsed, math) {
   item.warnings = [...(item.warnings || []), 'Rate was worked out from the invoice total — please verify'];
 }
 
+// ── Did we actually read the page? ────────────────────────────────────────────
+
+/**
+ * Whether the document was read well enough to judge it at all.
+ *
+ * This has to be decided separately from what the invoice *says*. A blurry phone
+ * photo that yields almost no text and a genuine sales invoice are opposite
+ * problems, and telling the user "this is not a purchase invoice" about a photo
+ * that simply could not be read is worse than saying nothing — it invites them to
+ * give up on a purchase they can perfectly well see. So the read is measured, and
+ * a failed read is reported as a failed read.
+ */
+function assessReadHealth({ pages, quality }) {
+  const characterCount = (pages || []).reduce((sum, p) => sum + (p.characterCount || (p.text || '').length || 0), 0);
+  const lineCount = (pages || []).reduce((sum, p) => sum + ((p.lines || []).length), 0);
+  const qualityIssues = (quality && Array.isArray(quality.issues)) ? quality.issues : [];
+
+  // An invoice always prints far more than this. Below it, nothing was read.
+  const tooLittleText = characterCount < 120 || lineCount < 3;
+  const imageUnreadable = qualityIssues.some((i) => ['blurry', 'blank', 'low-contrast', 'underexposed', 'overexposed'].includes(i.code));
+
+  return {
+    ok: !tooLittleText && !imageUnreadable,
+    ocrFailed: tooLittleText,
+    imageUnreadable,
+    characterCount,
+    lineCount,
+    // Shown to the user as the reason the scan has to be repeated.
+    remedies: tooLittleText || imageUnreadable ? [
+      'Retake the photograph, with the whole invoice inside the frame',
+      'Keep the camera straight and parallel to the page',
+      'Use good, even lighting and avoid shadows across the page',
+      'Or upload the invoice as a PDF instead',
+    ] : [],
+  };
+}
+
 // ── Draft mapping ────────────────────────────────────────────────────────────
 
 const withBand = (f) => ({
@@ -226,11 +394,20 @@ const withBand = (f) => ({
  */
 function splitAddress(address, pincode) {
   if (!address) return { address: null, addressConfidence: 0 };
+  // The pincode is kept in the address. It is printed there ("ALKAPURI,
+  // VADODARA-390007") and is also offered on its own in the Pincode field; the
+  // two are the same printed text, and stripping it left the address ending in a
+  // stray hyphen because the invoice glued city and pincode together.
   let text = address;
   if (pincode) {
-    text = text.replace(new RegExp(`[,\\s]*\\b${pincode}\\b[,\\s]*`, 'g'), ', ');
+    text = text.replace(new RegExp(`\\b${pincode}\\b`, 'g'), pincode);
   }
-  text = text.replace(/\s{2,}/g, ' ').replace(/(,\s*)+,/g, ', ').replace(/[,;\s]+$/, '').trim();
+  text = text.replace(/\s{2,}/g, ' ').replace(/(,\s*)+,/g, ', ')
+    // The pincode was often printed glued to the city by a hyphen
+    // ("ALKAPURI,VADODARA-390007"). Removing it leaves the hyphen dangling at the
+    // end of the address, so a trailing separator is cleaned up here.
+    .replace(/[-\u2013\u2014/]\s*$/, '')
+    .replace(/[,;\s-]+$/, '').trim();
   return { address: fit(text, LIMIT.address), addressConfidence: 1 };
 }
 
@@ -238,8 +415,37 @@ const ITEM_NAME_RE = /^(tax\s+)?(sales\s+)?invoice\b/i;
 
 function buildPurchaseDraft(parsed, math, { ownCompany } = {}) {
   const supplier = parsed.supplier || {};
+
+  // A document that is not a purchase produces no draft at all.
+  //
+  // This is the guard that stops "Party Name = Tax Invoice" and its relatives.
+  // There is no supplier on a sales invoice, so every supplier field stays empty
+  // and the review screen shows the classification instead of a half-filled form
+  // the user might save by accident.
+  const classification = parsed.classification || null;
+  const isPurchase = classification ? classification.importable !== false : parsed.documentRole === 'purchase';
+
+  if (!isPurchase) {
+    return {
+      // Deliberately empty. Not "Tax Invoice", not the buyer, not blank-but-
+      // hopeful: no party is offered for a document that is not a purchase.
+      partyName: '', partyGstin: '', contactPerson: '', partyAddress: '',
+      partyCity: '', partyState: '', partyPincode: '', partyPhone: '',
+      partyEmail: '', invoiceNo: '', invoiceDate: '', items: [],
+      notApplicable: true,
+      reason: classification?.headline || 'This document is not a purchase invoice.',
+    };
+  }
+
   const pincode = supplier.pincode?.value || null;
   const { address } = splitAddress(supplier.address?.value, pincode);
+
+  // OCR commonly mangles a GSTIN into something the structure check rejects.
+  // The number is only rewritten when the arithmetic checksum identifies exactly
+  // one valid reading of the misread characters - the same number has to be the
+  // only one that could have been printed.
+  const gstinRepair = supplier.gstin?.value ? repairGstin(supplier.gstin.value) : { value: null, repaired: false };
+  const resolvedGstin = gstinRepair.repaired ? gstinRepair.value : supplier.gstin?.value || null;
 
   const items = (parsed.items || []).map((item) => {
     const rate = item.gstRate?.value ?? math.recommendedRate ?? null;
@@ -269,11 +475,14 @@ function buildPurchaseDraft(parsed, math, { ownCompany } = {}) {
 
   const draft = {
     partyName: fit(supplier.name?.value, LIMIT.partyName) || '',
-    partyGstin: fit(supplier.gstin?.value, LIMIT.gstin) || '',
+    partyGstin: fit(resolvedGstin, LIMIT.gstin) || '',
     contactPerson: fit(supplier.contactPerson?.value, LIMIT.contactPerson) || '',
     partyAddress: address || '',
     partyCity: fit(supplier.city?.value, LIMIT.city) || '',
-    partyState: fit(supplier.state?.value, LIMIT.state) || '',
+    // The printed state name is normalised to its canonical spelling - a state
+    // dictionary, matched by resemblance, so "Gujaral" resolves to GUJARAT. An
+    // unrecognised name is passed through rather than guessed at.
+    partyState: fit(normalizeState(supplier.state?.value || '').value, LIMIT.state) || '',
     partyPincode: fit(pincode, LIMIT.pincode) || '',
     partyPhone: fit(supplier.phone?.value, LIMIT.phone) || '',
     partyEmail: fit(supplier.email?.value, LIMIT.email) || '',
@@ -287,6 +496,31 @@ function buildPurchaseDraft(parsed, math, { ownCompany } = {}) {
   if (math.recommendedRate !== null && math.recommendedRate !== undefined) {
     draft.taxRate = round2(math.recommendedRate);
   }
+
+  // ── The totals the invoice itself printed ──
+  //
+  // The draft used to carry no totals at all, so the review screen recomputed
+  // them from the items and the tax rate. That is only ever a fallback: it
+  // silently disagreed with the invoice whenever a rate was unreadable, which is
+  // how a printed 2,350.00 / 423.00 / 2,773.00 became 1,200 / 216 / 1,416.
+  // Whatever was actually printed on the document is carried through here, and
+  // the form uses it in preference to its own arithmetic.
+  const printed = parsed.totals || {};
+  const printedValue = (key) => (printed[key] && printed[key].value !== undefined ? printed[key].value : null);
+  draft.taxableValue = printedValue('taxableValue');
+  draft.cgstAmount = printedValue('cgstAmount');
+  draft.sgstAmount = printedValue('sgstAmount');
+  draft.igstAmount = printedValue('igstAmount');
+  draft.gstAmount = printedValue('totalTax');
+  draft.grandTotal = printedValue('grandTotal');
+  draft.totalQty = items.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+  // A line total is only meaningful per item; it is not part of the item schema
+  // the form posts, so it is reported here rather than inside the item.
+  draft.amounts = items.map((_, index) => {
+    const line = parsed.items?.[index];
+    const value = line?.lineAmount?.value;
+    return value === null || value === undefined ? null : round2(value);
+  });
   return draft;
 }
 
@@ -295,17 +529,25 @@ function buildPurchaseDraft(parsed, math, { ownCompany } = {}) {
  * dumping the whole invoice text into the narration box.
  */
 function buildRemark(parsed, math) {
+  const classification = parsed.classification || null;
+  const role = classification ? classification.role : parsed.documentRole;
+
+  // A document that is not a purchase gets a remark that says so. It must never
+  // say "supplier invoice imported".
+  if (role !== 'purchase') {
+    return fit([
+      classification?.headline || 'This document was not imported as a purchase.',
+      'No purchase entry was created from this invoice.',
+    ].join('\n'), LIMIT.remark);
+  }
+
   const lines = ['Supplier invoice imported using OCR.'];
   const number = parsed.invoice?.number?.value;
   const date = parsed.invoice?.dateDisplay || parsed.invoice?.date?.value;
   if (number) lines.push(`Invoice No: ${number}`);
   if (date) lines.push(`Invoice Date: ${date}`);
-  if (parsed.documentRole === 'sales') {
-    lines.push('Note: this document is a sales invoice issued by this company — the supplier has to be confirmed.');
-  }
-  for (const note of new Set((parsed.items || []).flatMap((i) => i.notes || []))) {
-    if (lines.length < 14) lines.push(note);
-  }
+  // Product metadata (model, part number, check number, warranty) deliberately
+  // stays with the item instead of being dumped into the narration box.
   if (math?.summary?.grandTotal !== null && math?.summary?.grandTotal !== undefined) {
     lines.push(`Invoice total as printed: ${round2(math.summary.grandTotal)}`);
   }
@@ -331,6 +573,7 @@ async function extractInvoice(input) {
   const {
     buffer, fileName = '', mimeType = '', dpi = null,
     ownCompany = {}, storeId = null, checkDuplicates = true, onStage,
+    identity = null,
   } = input || {};
 
   if (!Buffer.isBuffer(buffer)) {
@@ -342,7 +585,18 @@ async function extractInvoice(input) {
   const decoded = await decodeIntoPages(buffer, { fileName, mimeType, onStage, dpi });
 
   if (onStage) onStage('detecting-structure');
-  const parsed = parseInvoice({ pages: decoded.pages, ownCompany });
+  // The canonical identity is what tells a purchase from one of our own sales.
+  // `identity` is resolved by the caller from this tenant's own configuration;
+  // without one the parser falls back to the client hint.
+  const parsed = parseInvoice({ pages: decoded.pages, ownCompany, identity });
+
+  // The header table is the smallest type on the page, so page-level OCR drops it
+  // on low-res photos. A targeted, high-resolution re-read of the header strip
+  // recovers an invoice number / date the first pass missed.
+  if (onStage) onStage('reading-header');
+  if (decoded.pages && decoded.pages.some((p) => (p.source || '').includes('ocr'))) {
+    await readHeaderReferenceFields(decoded, parsed);
+  }
 
   if (onStage) onStage('validating');
   const math = validator.validateMath(parsed);
@@ -388,12 +642,34 @@ async function extractInvoice(input) {
     }
   }
 
+  // Read health is measured before anything is concluded about the document, and
+  // it decides which of the three states the user is actually looking at.
+  const readHealth = assessReadHealth({ pages: decoded.pages, quality: decoded.quality });
+  const classification = { ...(parsed.classification || {}) };
+  if (readHealth.ocrFailed || readHealth.imageUnreadable) {
+    classification.state = 'unreadable';
+    classification.ocrFailed = true;
+    classification.readable = false;
+    classification.remedies = readHealth.remedies;
+    classification.headline = readHealth.ocrFailed
+      ? 'Could not read this invoice. The image or the OCR result did not contain enough readable text to tell what kind of document this is.'
+      : 'This invoice image is not clear enough to read reliably.';
+  } else {
+    classification.state = classification.importable === false && classification.role === 'sales'
+      ? 'sales'
+      : (classification.importable ? 'purchase' : 'unknown');
+    classification.ocrFailed = false;
+    classification.readable = true;
+    classification.remedies = [];
+  }
+
   const validation = validator.buildValidationReport({
     parsed,
     math,
     duplicate,
     serialCheck,
     qualityAssessment: decoded.quality,
+    readHealth,
   });
 
   const supplier = parsed.supplier || {};
@@ -415,7 +691,12 @@ async function extractInvoice(input) {
       documentRetained: false,
     },
     quality: decoded.quality,
+    readHealth,
     documentRole: parsed.documentRole,
+    // The direction decision, in full: which side is us, which signals decided
+    // it, and whether this document may be imported at all.
+    classification,
+    ourRole: parsed.ourRole || null,
     confidence: parsed.confidence,
     supplier: {
       partyName: withBand(supplier.name),
@@ -456,6 +737,10 @@ async function extractInvoice(input) {
       taxableValue: item.taxableValue?.value ?? null,
       lineAmount: item.lineAmount?.value ?? null,
       notes: item.notes || [],
+      // The product's own printed details (model, part number, check number,
+      // warranty) stay attached to the item. They belong to the inventory
+      // record, not to the purchase narration.
+      metadata: item.metadata || {},
       warnings: item.warnings || [],
       confidence: item.confidence,
     })),
@@ -501,6 +786,7 @@ module.exports = {
   serialCheck: (input) => validator.checkDuplicateSerials(input),
   validateMath: validator.validateMath,
   buildValidationReport: validator.buildValidationReport,
+  companyIdentity,
   InvoiceOcrError,
   MAX_FILE_BYTES,
   ACCEPTED_MIME,

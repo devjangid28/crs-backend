@@ -419,6 +419,37 @@ router.post('/invoice-ocr/extract', authenticate, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'The invoice file could not be read.' });
     }
 
+// Who "we" are is decided HERE, from this tenant's own configuration — the store
+    // the session is acting as, plus the tenant-wide business settings. The client
+    // may send what it knows, but it is only ever a hint: an app that has not
+    // loaded its store list yet sends an empty name, and trusting that would
+    // quietly turn one of our own sales invoices into a purchase.
+    //
+    // The store id comes from the session rather than the request body, so the
+    // duplicate and serial checks are scoped to the store the user is really in.
+    const sessionStoreId = req.user && req.user.store_id !== null && req.user.store_id !== undefined
+      && req.user.store_id !== ''
+      ? parseInt(req.user.store_id, 10)
+      : null;
+    const effectiveStoreId = Number.isFinite(sessionStoreId)
+      ? sessionStoreId
+      : (storeId !== null && storeId !== undefined && storeId !== '' ? parseInt(storeId, 10) : null);
+
+    let identity = null;
+    try {
+      identity = await invoiceOcr.companyIdentity.buildCompanyIdentity({
+        storeId: effectiveStoreId,
+        requestCompany: {
+          name: ownCompany.name || ownCompany.companyName || '',
+          gstin: ownCompany.gstin || ownCompany.partyGstin || '',
+        },
+      });
+    } catch (err) {
+      // Failing to read the configuration must never be the reason a scan fails;
+      // the reader then falls back to the client hint and says so.
+      identity = null;
+    }
+
     const result = await invoiceOcr.extractInvoice({
       buffer,
       fileName,
@@ -430,7 +461,8 @@ router.post('/invoice-ocr/extract', authenticate, async (req, res, next) => {
         name: ownCompany.name || ownCompany.companyName || '',
         gstin: ownCompany.gstin || ownCompany.partyGstin || '',
       },
-      storeId: storeId != null && storeId !== '' ? parseInt(storeId, 10) : null,
+      identity,
+      storeId: effectiveStoreId,
       checkDuplicates: checkDuplicates !== false,
       dpi: Number(dpi) > 0 ? Number(dpi) : null,
     });

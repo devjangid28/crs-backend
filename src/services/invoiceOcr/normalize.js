@@ -104,7 +104,14 @@ function parseQty(value) {
 
 // A table cell that should hold a number: an optional currency prefix, digits
 // with Indian or plain grouping, an optional decimal and an optional "%".
-const NUMERIC_CELL_RE = /^(?:rs\.?|inr|₹)\s*\(?-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?\)?%?$|^\(?-?(?:rs\.?|inr|₹)?\s*-?\d+(?:\.\d{1,2})?\)?%?$/i;
+// An amount is very often printed with thousands separators - "1,200.00",
+// "2,350.00". Those were rejected here, because only the currency-prefixed branch
+// allowed commas, so every such amount came back as "no value" and the rate,
+// amount and totals columns read empty even though OCR had read them correctly.
+// Comma grouping is therefore accepted on the bare-number branch too. It stays
+// strict - groups of exactly three digits, only where thousands separators go -
+// so a serial such as "T1N0CV01Z128019" is still not a number.
+const NUMERIC_CELL_RE = /^(?:rs\.?|inr|₹)\s*\(?-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?\)?%?$|^\(?-?(?:rs\.?|inr|₹)?\s*-?\d+(?:,\d{3})*(?:\.\d{1,2})?\)?%?$/i;
 // Some invoices print a bare dash or a bullet in an amount column they did not
 // fill in. That is an empty cell, not a zero and not a number.
 const EMPTY_CELL_RE = /^[-–—.,*\s]*$/;
@@ -203,6 +210,16 @@ function normalizeDate(value) {
     else { day = a; month = b; ambiguous = true; }
   }
 
+  // OCR sometimes fuses a stray mark onto the day, so a date can arrive as
+  // "56-Oct-26" where the day is plainly 5. A day above 31 is never a real day,
+  // and reading its leading digits is the only reading that stays inside the
+  // month. It is marked ambiguous so the reviewer still sees the original.
+  if (day > 31) {
+    const digits = String(day);
+    const leading = Number(digits[0]);
+    if (leading >= 1 && leading <= 9) { day = leading; ambiguous = true; }
+  }
+
   if (!year || !month || !day) return null;
   if (year < 100) year += year > 70 ? 1900 : 2000;
   if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1990 || year > 2100) return null;
@@ -235,6 +252,120 @@ const GST_STATE_CODES = Object.freeze({
   '34': 'Puducherry', '35': 'Andaman and Nicobar Islands', '36': 'Telangana',
   '37': 'Andhra Pradesh', '38': 'Ladakh', '97': 'Other Territory',
 });
+
+// Characters OCR routinely swaps inside a GSTIN. Grouped by resemblance, so a
+// candidate is repaired by trying the members of the group a character belongs
+// to. A repair is only ever accepted when the result passes the real checksum,
+// so this can improve a damaged number but cannot invent one.
+const GSTIN_LOOKALIKES = [
+  '0OQD', '1IL', '2Z', '5S', '6GEB', '8B', '7T', '4AD', '9P', 'UE', 'VY', 'MC', 'KN', 'X',
+];
+
+/** The characters a position could have been misread as, excluding itself. */
+function gstinAlternatives(ch) {
+  const up = ch.toUpperCase();
+  const out = new Set();
+  for (const group of GSTIN_LOOKALIKES) {
+    const g = group.toUpperCase();
+    if (g.includes(up)) for (const m of g.split('')) if (m !== up) out.add(m);
+  }
+  return [...out].slice(0, 3);
+}
+
+/**
+ * Repairs a GSTIN that OCR mangled, but only by way of the checksum.
+ *
+ * Returns `{ value, repaired }`: `value` is a checksum-valid GSTIN, and
+ * `repaired` says whether the characters were changed to get there. When more
+ * than one repair passes, nothing is changed - a genuine ambiguity is reported
+ * rather than guessed at.
+ */
+function repairGstin(value) {
+  const original = normalizeGstin(value);
+  if (!original || original.length !== 15) return { value: original || null, repaired: false };
+  if (validateGstin(original).checksumOk) return { value: original, repaired: false };
+
+  const options = [];
+  for (let i = 0; i < 15; i += 1) {
+    const ch = original[i];
+    const alternatives = gstinAlternatives(ch);
+    options.push(alternatives.length ? [ch, ...alternatives] : [ch]);
+  }
+
+  // At most three characters may be reinterpreted. A GSTIN whose checksum can
+  // also be satisfied by four or five other spellings carries no information
+  // about which one was printed, so the search is deliberately bounded: a repair
+  // is only reported when it is the single reading the arithmetic allows.
+  const MAX_EDITS = 3;
+  const found = [];
+  const walk = (index, acc, edits) => {
+    if (found.length > 1) return;
+    if (index === 15) {
+      const candidate = acc.join('');
+      if (GSTIN_STRUCTURE.test(candidate) && gstinChecksumDigit(candidate.slice(0, 14)) === candidate[14]) {
+        found.push(candidate);
+      }
+      return;
+    }
+    for (const ch of options[index]) {
+      const nextEdits = edits + (ch === original[index] ? 0 : 1);
+      if (nextEdits > MAX_EDITS) continue;
+      acc.push(ch);
+      walk(index + 1, acc, nextEdits);
+      acc.pop();
+    }
+  };
+  walk(0, [], 0);
+  if (found.length !== 1) return { value: original, repaired: false };
+  return { value: found[0], repaired: true };
+}
+
+/**
+ * Resolves a printed state name to its canonical spelling.
+ *
+ * The printed word is matched against the state table by resemblance, so a single
+ * misread letter ("Gujaral" for Gujarat) resolves correctly while a genuinely
+ * different state never does - the match has to be within a couple of edits of
+ * one real state and nothing else. An unrecognised name is returned uppercased
+ * and unchanged rather than guessed at.
+ */
+function normalizeState(value) {
+  const raw = collapseSpaces(value || '').toUpperCase().replace(/\b(STATE|STATE\s*NAME)\s*[:\-]?\s*/g, '').trim();
+  if (!raw) return { value: null, matched: false };
+  const names = [...new Set(Object.values(GST_STATE_CODES))];
+  const exact = names.find((n) => n.toUpperCase() === raw);
+  if (exact) return { value: exact.toUpperCase(), matched: true };
+  const short = raw.split(/\s+/)[0];
+  const exactShort = names.find((n) => n.toUpperCase() === short);
+  if (exactShort) return { value: exactShort.toUpperCase(), matched: true };
+  let best = null;
+  for (const name of names) {
+    const d = editDistance(raw, name.toUpperCase());
+    if (!best || d < best.d) best = { name, d };
+  }
+  const threshold = Math.max(1, Math.floor(raw.length / 4));
+  if (best && best.d <= threshold) return { value: best.name.toUpperCase(), matched: true };
+  return { value: raw, matched: false };
+}
+
+/** Levenshtein distance, used only to recognise a near-miss state name. */
+function editDistance(a, b) {
+  const s = String(a);
+  const t = String(b);
+  const prev = Array.from({ length: t.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= s.length; i += 1) {
+    const row = [i];
+    for (let j = 1; j <= t.length; j += 1) {
+      row[j] = Math.min(
+        prev[j] + 1,
+        row[j - 1] + 1,
+        prev[j - 1] + (s[i - 1] === t[j - 1] ? 0 : 1),
+      );
+    }
+    for (let j = 0; j <= t.length; j += 1) prev[j] = row[j];
+  }
+  return prev[t.length];
+}
 
 /** Uppercases and strips the spaces OCR likes to insert inside a GSTIN. */
 function normalizeGstin(value) {
@@ -382,6 +513,97 @@ function companySimilarity(a, b) {
   return Math.min(1, 0.5 * ratio + 0.5 * coverage);
 }
 
+// ── OCR-tolerant label matching ──────────────────────────────────────────────
+
+/**
+ * Levenshtein distance, abandoned early once it passes `cap`.
+ *
+ * OCR reliably mangles *labels* — "Bill To" comes back as "Bl to", "Invoice No"
+ * as "Involce No", "GSTIN/UIN" as "GSTIN/VIN". A label is short, fixed text
+ * printed in the same typeface on every invoice, so it is the easiest thing on
+ * the page to read exactly and the most damaging to get wrong: miss the label
+ * and the whole block under it is never opened.
+ */
+function levenshtein(a, b, cap = 3) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > cap) return cap + 1;
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    let rowBest = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost);
+      if (current[j] < rowBest) rowBest = current[j];
+    }
+    if (rowBest > cap) return cap + 1;
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+const labelTokens = (text) => collapseSpaces(text)
+  .toLowerCase()
+  .replace(/[^a-z0-9\s]/g, ' ')
+  .split(/\s+/)
+  .filter(Boolean);
+
+/**
+ * The same words as `labelTokens`, but each with where it sits in the original
+ * string.
+ *
+ * The character offsets matter: the caller slices the line to take "everything
+ * beside the label" as the value, and slicing by token number instead cut the
+ * value out of the wrong place entirely.
+ */
+function labelTokensWithPositions(text) {
+  const out = [];
+  const re = /[a-z0-9]+/gi;
+  let m = re.exec(String(text || ''));
+  while (m) {
+    out.push({ word: m[0].toLowerCase(), start: m.index, end: m.index + m[0].length });
+    m = re.exec(String(text || ''));
+  }
+  return out;
+}
+
+/**
+ * Finds a label phrase written as a run of words, tolerating an OCR slip in any
+ * one of them. `phrases` is a list of word-arrays: `[['bill','to'], ['buyer']]`.
+ *
+ * Returns `{ index, length }` as **character** offsets into `text` — the same
+ * shape a regular-expression match gives the caller, so the label's own value
+ * extraction (everything beside it) works identically either way.
+ */
+function findPhrase(text, phrases, { tolerance = 1, maxWords = 0 } = {}) {
+  const tokens = labelTokensWithPositions(text);
+  if (!tokens.length || !phrases || !phrases.length) return null;
+  const limit = maxWords > 0 ? Math.min(maxWords, tokens.length) : tokens.length;
+
+  for (const phrase of phrases) {
+    if (!phrase.length || phrase.length > limit) continue;
+    for (let i = 0; i + phrase.length <= limit; i += 1) {
+      let ok = true;
+      for (let j = 0; j < phrase.length; j += 1) {
+        const seen = tokens[i + j].word;
+        const want = phrase[j];
+        if (seen === want) continue;
+        // A digit read as a letter ("t0" for "to") is the commonest slip of all.
+        const numeric = (s) => s.replace(/0/g, 'o').replace(/1/g, 'l');
+        if (numeric(seen) === numeric(want)) continue;
+        if (Math.abs(seen.length - want.length) > tolerance) { ok = false; break; }
+        if (levenshtein(seen, want, tolerance) > tolerance) { ok = false; break; }
+      }
+      if (ok) {
+        const start = tokens[i].start;
+        const end = tokens[i + phrase.length - 1].end;
+        return { index: start, length: end - start };
+      }
+    }
+  }
+  return null;
+}
+
 module.exports = {
   CONFIDENCE,
   field,
@@ -400,6 +622,8 @@ module.exports = {
   normalizeDate,
   normalizeGstin,
   validateGstin,
+  repairGstin,
+  normalizeState,
   suggestGstinRepairs,
   gstinChecksumDigit,
   GST_STATE_CODES,
@@ -411,4 +635,6 @@ module.exports = {
   companySimilarity,
   companyTokens,
   COMPANY_NOISE,
+  levenshtein,
+  findPhrase,
 };

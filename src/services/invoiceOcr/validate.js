@@ -150,6 +150,23 @@ function validateMath(parsed) {
       });
     }
   }
+  // Also try deriving from CGST+SGST amounts in the totals block.
+  if (recommendedRate === null) {
+    const cgst = isNum(valueOf(totals.cgstAmount)) ? valueOf(totals.cgstAmount) : null;
+    const sgst = isNum(valueOf(totals.sgstAmount)) ? valueOf(totals.sgstAmount) : null;
+    const taxable = effectiveTaxable;
+    if (cgst !== null && sgst !== null && taxable > 0) {
+      const derivedRate = round2(((cgst + sgst) / taxable) * 100);
+      if (derivedRate > 0) {
+        recommendedRate = derivedRate;
+        rateSource = 'derived-from-cgst-sgst';
+      }
+    } else if (cgst !== null && taxable > 0) {
+      // Only CGST found — double it for the full rate.
+      const derivedRate = round2((cgst * 2 / taxable) * 100);
+      if (derivedRate > 0) { recommendedRate = derivedRate; rateSource = 'derived-from-cgst'; }
+    }
+  }
   if (recommendedRate === null && items.length && printedGrand !== null && effectiveTaxable) {
     const derived = round2(((printedGrand - effectiveTaxable) / effectiveTaxable) * 100);
     if (derived > 0) {
@@ -274,9 +291,63 @@ async function checkDuplicateSerials({ serials = [], storeId, excludePurchaseId 
  * Final gate before the form is filled in: everything that makes this invoice
  * unsafe to trust without a human, in one list the UI can render verbatim.
  */
-function buildValidationReport({ parsed, math, duplicate, serialCheck, qualityAssessment, engineNote }) {
+function buildValidationReport({ parsed, math, duplicate, serialCheck, qualityAssessment, engineNote, readHealth }) {
   const blocking = [];
   const warnings = [...(parsed.warnings || [])];
+
+  // ── Was the page read at all?
+  //
+  // This comes first and it is not the same problem as the one below. A document
+  // whose text could not be read has told us nothing about its direction, so it
+  // must never be reported as "this is not a purchase invoice" — the user would
+  // be told their invoice is the wrong kind of document when in fact the camera
+  // simply failed.
+  const unreadable = Boolean(readHealth && (readHealth.ocrFailed || readHealth.imageUnreadable));
+
+  if (unreadable) {
+    blocking.push({
+      code: 'ocr-unreadable',
+      message: 'Could not read this invoice. The image did not yield enough readable text to identify the document.',
+      remedies: readHealth.remedies || [],
+    });
+  }
+
+  // ── Invoice direction is checked next, before any field is trusted.
+  //
+  // A sales invoice is not a purchase with a mistake in it — importing one
+  // creates a supplier that does not exist and pollutes stock with goods that
+  // were never bought. So it blocks rather than warns. The same is true when the
+  // direction could not be established, and when this company appears on both
+  // sides. Nothing is filled in for the user to "confirm" in those cases,
+  // because there is no honest value to confirm.
+  const classification = parsed.classification || null;
+  const role = classification ? classification.role : parsed.documentRole;
+
+  if (role === 'sales') {
+    blocking.push({
+      code: 'document-is-sales-invoice',
+      message: classification?.headline
+        || 'This invoice is issued by this company, so it is a sales invoice and cannot be imported as a purchase.',
+      role,
+      buyerName: classification?.buyerName || null,
+    });
+  } else if (role === 'ambiguous') {
+    blocking.push({
+      code: 'both-sides-look-like-us',
+      message: classification?.headline
+        || 'This company appears on both sides of this invoice. Please review it before importing.',
+      role,
+    });
+  } else if (role === 'unknown' && !unreadable) {
+    // Only meaningful once the page was actually readable. On an unreadable
+    // photo the OCR block above is the honest one to show.
+    blocking.push({
+      code: 'direction-not-determined',
+      message: classification?.headline
+        || 'It could not be determined whether this company is the buyer or the seller on this invoice.',
+      role,
+    });
+  }
 
   for (const issue of math.issues) warnings.push({ code: issue.code, message: issue.message });
 
@@ -294,17 +365,31 @@ function buildValidationReport({ parsed, math, duplicate, serialCheck, qualityAs
 
   if (engineNote) warnings.push({ code: 'engine', message: engineNote });
 
+  // When the direction is not "purchase" the direction message above is the one
+  // the user has to act on. Reporting a missing supplier or missing items on top
+  // of it would just be noise about a document that is not a purchase at all.
+  const isPurchase = role === 'purchase';
+
   if (!parsed.supplier || !parsed.supplier.name.value) {
-    blocking.push({
-      code: 'supplier-missing',
-      message: 'The supplier could not be identified from this invoice. Please select or type the party manually.',
-    });
+    if (isPurchase) {
+      blocking.push({
+        code: 'supplier-missing',
+        message: 'The supplier could not be identified from this invoice. Please select or type the party manually.',
+      });
+    } else {
+      warnings.push({
+        code: 'supplier-not-applicable',
+        message: 'No supplier was read, because this document is not a purchase invoice.',
+      });
+    }
   }
   if (!parsed.items.length) {
-    blocking.push({
-      code: 'items-missing',
-      message: 'No items could be read from this invoice. Please add the items manually.',
-    });
+    if (isPurchase) {
+      blocking.push({
+        code: 'items-missing',
+        message: 'No items could be read from this invoice. Please add the items manually.',
+      });
+    }
   }
   if (!parsed.invoice.number.value) {
     warnings.push({ code: 'invoice-number-missing', message: 'The supplier invoice number could not be read. Please enter it manually.' });
