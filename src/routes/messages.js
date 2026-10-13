@@ -1100,4 +1100,70 @@ router.post('/auto-status', authenticate, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// DELETE /api/messages/:id - Permanently remove a single message
+// Used to take back a wrongly sent message from the chat. The row is deleted
+// outright rather than tombstoned, so it also disappears from the conversation
+// list preview (which is derived from the messages table) and from unread
+// counts. The upload on disk is removed too when the message carried one.
+router.delete('/:id', authenticate, async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || Number.isNaN(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid message id' });
+    }
+
+    const existing = await query('SELECT * FROM messages WHERE id = $1', [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Message not found' });
+    }
+    const msg = existing.rows[0];
+
+    const result = await query('DELETE FROM messages WHERE id = $1', [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'Message not found' });
+    }
+
+    // Best-effort cleanup of the stored upload. The row is already gone, so a
+    // leftover file can never be served by /download/:id; failing to unlink must
+    // not turn a successful delete into an error.
+    if (msg.file_name) {
+      try {
+        const stored = path.join(UPLOAD_DIR, msg.file_name);
+        if (fs.existsSync(stored)) fs.unlinkSync(stored);
+        // Photo sheets keep one file per merged photo next to the merged image.
+        if (String(msg.document_type || '').startsWith('photo_sheet:')) {
+          for (const part of fs.readdirSync(UPLOAD_DIR)) {
+            if (part.startsWith(`${id}_`) && part.endsWith('.jpg')) {
+              try { fs.unlinkSync(path.join(UPLOAD_DIR, part)); } catch (e) { /* best effort */ }
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to remove message upload:', e.message);
+      }
+    }
+
+    await logAudit({
+      action: actions.MESSAGE_DELETED,
+      ticketId: msg.ticket_id,
+      entityType: 'message',
+      entityId: String(id),
+      performedBy: req.user?.full_name || 'Staff',
+      details: { conversationId: msg.conversation_id, type: msg.type, sender: msg.sender },
+    });
+
+    // Tell every open chat to drop the bubble so the web and mobile threads
+    // stay in step without a manual refresh.
+    const io = req.app?.get('io') || req.io;
+    if (io) {
+      io.emit('message_deleted', {
+        messageId: id,
+        conversationId: msg.conversation_id,
+      });
+    }
+
+    res.json({ success: true, message: 'Message deleted successfully', data: { id, conversationId: msg.conversation_id } });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

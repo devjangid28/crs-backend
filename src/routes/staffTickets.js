@@ -3,9 +3,13 @@ const router = express.Router();
 const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 const { recordStatusChange, getStatusHistory } = require('../services/statusHistoryService');
-const { createStatusEvent, getOrCreateConversation, createPdfMessage, updateMessageStatusById } = require('../services/messagingService');
-const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, sendServiceInvoiceTemplate, getConversationIdFromPhone } = require('../services/whatsappService');
-const { generateServiceInvoiceFromHTML } = require('../services/pdfGenerator');
+const serviceInvoiceDispatch = require('../services/serviceInvoiceDispatchService');
+const { createStatusEvent } = require('../services/messagingService');
+const { sendTicketStatusTemplate, sendCollectionLink, sendTextMessage, getConversationIdFromPhone } = require('../services/whatsappService');
+// Exactly the same cascade the web DELETE /api/tickets/:id runs, so a ticket
+// deleted from the phone removes its entries from every linked table just like
+// a deletion made on the web.
+const { deleteTicketCascade, broadcastTicketDeleted } = require('../services/ticketDeleteService');
 
 // Normalize status strings to exact DB enum values (handles casing differences
 // between mobile app, web frontend, and the PostgreSQL enum).
@@ -59,44 +63,28 @@ function normalizeLineItems(raw, fallbackSource) {
   return out;
 }
 
-// Generate (or regenerate) the Service Invoice PDF for a Completed ticket and
-// record it in the conversation history. Fire-and-forget so API stays fast.
-function scheduleServiceInvoiceGeneration(ticketId, status) {
-  if (status !== 'Completed') return;
-  setImmediate(async () => {
-    try {
-      const pdf = await generateServiceInvoiceFromHTML(ticketId);
-      const conv = await getOrCreateConversation(ticketId);
-      const fileMsg = await createPdfMessage({
-        conversationId: conv ? conv.conversationId : null,
-        ticketId,
-        sender: 'System',
-        fileName: pdf.fileName,
-        fileSize: pdf.fileSize,
-        documentType: 'service_invoice',
-        event: 'Service invoice generated',
-      });
-      console.log('Service invoice generated for ticket:', ticketId, pdf.invoiceNumber);
-
-      // Auto-send the approved "service_invoice" template with the PDF attached
-      // so the customer receives their invoice without needing to message first.
-      const tRes = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
-      const ticket = tRes.rows[0];
-      if (ticket && ticket.customer_phone && pdf.filePath) {
-        const forwardResult = await sendServiceInvoiceTemplate(ticket, pdf.filePath).catch(e => {
-          console.error('Auto-send service invoice template failed:', e.message);
-          return null;
-        });
-        if (forwardResult && forwardResult.success && forwardResult.messageId) {
-          await updateMessageStatusById(fileMsg.id, forwardResult.messageId, 'sent');
-        } else if (forwardResult && !forwardResult.success && !forwardResult.skipped) {
-          await updateMessageStatusById(fileMsg.id, null, 'failed');
-        }
-      }
-    } catch (e) {
-      console.error('Auto-generate service invoice failed:', e.message);
+// Generate the Service Invoice PDF for a Completed ticket, record it in the
+// conversation and send it to the customer. Returns the outcome so the status
+// response can tell the staff member whether the customer actually got the bill
+// instead of silently dropping the failure.
+async function runServiceInvoiceGeneration(ticketId, status) {
+  if (status !== 'Completed') return null;
+  try {
+    const result = await serviceInvoiceDispatch.dispatch(ticketId);
+    if (result.delivered) {
+      console.log('Service invoice sent for ticket:', ticketId, result.invoiceNumber);
+    } else if (result.skipped) {
+      console.log('Service invoice generated (WhatsApp disabled):', ticketId, result.invoiceNumber);
+    } else {
+      console.error('Service invoice NOT sent for ticket', ticketId, '-', result.reason);
     }
-  });
+    return result;
+  } catch (e) {
+    // dispatch() is designed not to throw, but a failure here must never take
+    // down the status update the staff member just made.
+    console.error('Service invoice dispatch failed for ticket', ticketId, '-', e.message);
+    return { generated: false, delivered: false, reason: e.message };
+  }
 }
 
 // All staff ticket routes require an authenticated session. The web ticket
@@ -389,8 +377,6 @@ router.put('/:id', async (req, res, next) => {
 
     const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
 
-    scheduleServiceInvoiceGeneration(parseInt(req.params.id), effectiveStatus);
-
     // Handle status change event and WhatsApp template (fire-and-forget)
     if (statusChanged || shouldNotifyPartial) {
       setImmediate(async () => {
@@ -423,7 +409,21 @@ router.put('/:id', async (req, res, next) => {
       });
     }
 
-    res.json({ success: true, message: 'Ticket updated successfully', data: updated.rows[0] });
+    // Awaited (rather than fire-and-forget) so the response can state whether
+    // the customer actually received the invoice. Only a real move INTO
+    // Completed triggers it: re-running this on every field edit of an
+    // already-Completed ticket would bill the customer again each time.
+    // Re-sending stays available on demand via Quick Actions / SEND NOW.
+    const serviceInvoice = statusChanged && effectiveStatus === 'Completed'
+      ? await runServiceInvoiceGeneration(parseInt(req.params.id), effectiveStatus)
+      : null;
+
+    res.json({
+      success: true,
+      message: 'Ticket updated successfully',
+      data: updated.rows[0],
+      serviceInvoice,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
@@ -518,8 +518,6 @@ router.put('/:id/status', async (req, res, next) => {
 
     const updated = await client.query('SELECT * FROM tickets WHERE id = $1', [req.params.id]);
 
-    scheduleServiceInvoiceGeneration(parseInt(req.params.id), status);
-
     // Handle status change: create event and send WhatsApp template (fire-and-forget)
     if (status !== oldStatus || (status === 'Partially Completed' && partialTouched)) {
       setImmediate(async () => {
@@ -552,12 +550,52 @@ router.put('/:id/status', async (req, res, next) => {
       });
     }
 
-    res.json({ success: true, message: 'Status updated successfully', data: updated.rows[0] });
+    // Awaited so the app can tell the staff member the truth about the invoice
+    // instead of reporting a success that silently produced no bill.
+    const serviceInvoice = status !== oldStatus
+      ? await runServiceInvoiceGeneration(parseInt(req.params.id), status)
+      : null;
+
+    res.json({
+      success: true,
+      message: 'Status updated successfully',
+      data: updated.rows[0],
+      serviceInvoice,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
   } finally {
     client.release();
+  }
+});
+
+// DELETE /api/staff/tickets/:id - Delete one of the staff member's tickets
+// and every record linked to it. Uses the same cascade as the web delete route
+// so the entry disappears from all of its tables identically, whichever app the
+// delete came from.
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const existing = await query('SELECT * FROM tickets WHERE id = ?', [req.params.id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    if (!isOwner(existing.rows[0], req.user)) {
+      return res.status(403).json({ success: false, message: 'You do not have access to this ticket' });
+    }
+
+    const { ticket, conversationIds } = await deleteTicketCascade(req.params.id);
+
+    // Let every connected client refresh immediately (messages + dashboard).
+    const io = req.app?.get('io') || req.io;
+    broadcastTicketDeleted(io, req.params.id, ticket, conversationIds);
+
+    res.json({ success: true, message: 'Ticket deleted successfully' });
+  } catch (err) {
+    if (err.statusCode === 404) {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    next(err);
   }
 });
 

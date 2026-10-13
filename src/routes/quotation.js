@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
-const puppeteer = require('puppeteer');
+const { launchBrowser } = require('../services/browserService');
 const { query, getConnection } = require('../config/database');
 const { authenticate } = require('../middleware/auth');
 
@@ -409,10 +409,7 @@ router.get('/:id/download', authenticate, async (req, res, next) => {
       `<body>\n<script>window.__QUOTATION_DATA__ = ${JSON.stringify(quotation)}; window.__QUOT_BG__ = ${JSON.stringify(bgDataUri)};</script>`
     );
 
-    browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
+    browser = await launchBrowser();
 
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });

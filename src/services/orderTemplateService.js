@@ -205,7 +205,10 @@ function populateOrderTemplate(order, components, settings, products) {
   if (products && products.length > 0) {
     let pRows = '';
     products.forEach(function(p, idx) {
-      const lineAmt = (parseFloat(p.amount) || ((parseFloat(p.rate) || 0) * (parseInt(p.quantity, 10) || 1))).toFixed(2);
+      // A stored 0 amount is a real 0 (complimentary line given away free), so
+      // only a missing amount falls back to rate * quantity.
+      const hasAmount = p.amount !== undefined && p.amount !== null && String(p.amount).trim() !== '';
+      const lineAmt = (hasAmount ? (parseFloat(p.amount) || 0) : ((parseFloat(p.rate) || 0) * (parseInt(p.quantity, 10) || 1))).toFixed(2);
       const rate = parseFloat(p.rate || 0).toFixed(2);
       const detail = productDetailLines(p);
       const descHtml = '<div style="font-weight:bold;">' + detail[0] + '</div>' +
@@ -227,8 +230,8 @@ function populateOrderTemplate(order, components, settings, products) {
   // ── FINANCIAL CALCULATIONS ──
   const componentsTotal = components ? components.reduce((sum, c) => sum + componentAmount(c), 0) : 0;
   const productsTotal = products ? products.reduce(function(sum, p) {
-    const stored = parseFloat(p.amount) || 0;
-    if (stored > 0) return sum + stored;
+    const hasAmount = p.amount !== undefined && p.amount !== null && String(p.amount).trim() !== '';
+    if (hasAmount) return sum + (parseFloat(p.amount) || 0);
     return sum + ((parseFloat(p.rate) || 0) * (parseInt(p.quantity, 10) || 1));
   }, 0) : 0;
   const serviceAmt = parseFloat(order.service_amount) || 0;

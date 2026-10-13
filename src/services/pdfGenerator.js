@@ -1,7 +1,7 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer');
+const { launchBrowser } = require('./browserService');
 const { query } = require('../config/database');
 const { generateInwardReceiptHtml } = require('./inwardPdfHtml');
 const { populateInwardTemplate } = require('./inwardTemplateService');
@@ -685,10 +685,7 @@ async function generateInwardReceiptFromHTML(ticketId) {
 
   let html = populateInwardTemplate(ticket, store);
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
@@ -728,10 +725,7 @@ async function generateOrderPdfFromHTML(orderId) {
 
   let html = populateOrderTemplate(order, components, store, products);
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
@@ -779,10 +773,7 @@ async function generateServiceInvoiceFromHTML(ticketId) {
     discount: ticket.discount,
   });
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();

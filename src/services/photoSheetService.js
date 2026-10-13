@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
-const puppeteer = require('puppeteer');
+const { launchBrowser } = require('./browserService');
 
 const TEMPLATE_HTML = path.join(__dirname, '..', 'templates', 'photoSheet.html');
 const SHEET_WIDTH = 1080;
@@ -31,10 +31,7 @@ let browserPromise = null;
 // a new process, which is very noticeable when sending several sheets in a row.
 async function getBrowser() {
   if (!browserPromise) {
-    browserPromise = puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    }).catch((err) => {
+    browserPromise = launchBrowser().catch((err) => {
       // Do not cache a failed launch; the next attempt should retry.
       browserPromise = null;
       throw err;

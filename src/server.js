@@ -258,6 +258,19 @@ const tallyService = require('./services/tallyService');
       await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS specifications JSONB DEFAULT NULL`).catch(() => {});
       // Customer GSTIN (shown on the tax invoice, optional, non-compulsory)
       await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS gstin VARCHAR(50) DEFAULT NULL`).catch(() => {});
+      // Customer State + Pincode (drive the invoice place of supply and decide
+      // between CGST+SGST (in-state) and IGST (out-of-state)).
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS state VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS pincode VARCHAR(10) DEFAULT NULL`).catch(() => {});
+      // Snapshot the buyer state on the invoice so a reprint can pick the right
+      // tax split (CGST+SGST vs IGST) without re-reading the order.
+      await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_state VARCHAR(100) DEFAULT NULL`).catch(() => {});
+      // HSN / SAC code printed per invoice line. It is filled in automatically from
+      // the shop's item master when the device / accessory type is picked, and can
+      // be corrected or added by hand, so it is saved with the line itself.
+      await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS hsn_code VARCHAR(20) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE order_products ADD COLUMN IF NOT EXISTS hsn_code VARCHAR(20) DEFAULT NULL`).catch(() => {});
+      await pool.query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS hsn VARCHAR(20) DEFAULT NULL`).catch(() => {});
       // Persistent sequential invoice number for ASUS store orders (starts at 16)
       await pool.query(`CREATE SEQUENCE IF NOT EXISTS order_invoice_seq START WITH 16 INCREMENT BY 1 CACHE 1`).catch(() => {});
       await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_number INTEGER DEFAULT NULL`).catch(() => {});

@@ -67,6 +67,7 @@ function deviceToProduct(d) {
     warranty: srcVal(d, 'warranty', 'warranty') || undefined,
     partNo: srcVal(d, 'partNo', 'part_no') || undefined,
     checkNo: srcVal(d, 'checkNo', 'check_no') || undefined,
+    hsnCode: srcVal(d, 'hsnCode', 'hsn_code') || undefined,
     series: srcVal(d, 'series', 'series') || undefined,
     accessoryType,
     specifications: specs && typeof specs === 'object' && !Array.isArray(specs) ? specs : undefined,
@@ -117,14 +118,20 @@ function mergeOrderProducts(devices, products) {
   return deviceRows.concat(prodRows);
 }
 
+// Line amount of one product row. A stored 0 is a real 0 (a complimentary
+// line is given away free), so only a MISSING amount falls back to qty * rate.
+function productLineAmount(p) {
+  if (srcVal(p, 'complimentary', 'complimentary')) return 0;
+  const raw = srcVal(p, 'amount', 'amount');
+  if (raw !== undefined && raw !== null && String(raw).trim() !== '') return parseFloat(raw) || 0;
+  const qty = parseInt(srcVal(p, 'quantity', 'quantity'), 10) || 1;
+  const rate = parseFloat(srcVal(p, 'rate', 'rate')) || 0;
+  return qty * rate;
+}
+
 // Compute the summed amount of a merged order-products list.
 function sumOrderProducts(products) {
-  return (Array.isArray(products) ? products : []).reduce((sum, p) => {
-    const qty = parseInt(srcVal(p, 'quantity', 'quantity'), 10) || 1;
-    const rate = parseFloat(srcVal(p, 'rate', 'rate')) || 0;
-    const lineAmt = parseFloat(srcVal(p, 'amount', 'amount')) || (qty * rate);
-    return sum + lineAmt;
-  }, 0);
+  return (Array.isArray(products) ? products : []).reduce((sum, p) => sum + productLineAmount(p), 0);
 }
 
 // Generate order number: ORD-YYYY-MMM-NNNN
@@ -208,7 +215,8 @@ router.get('/', async (req, res, next) => {
         'product_model', op.product_model, 'serial_number', op.serial_number,
         'warranty', op.warranty, 'quantity', op.quantity,
         'rate', op.rate, 'amount', op.amount,
-        'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'specifications', op.specifications
+        'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'hsn_code', op.hsn_code, 'specifications', op.specifications,
+        'complimentary', op.complimentary
       ))
       FROM order_products op WHERE op.order_id = o.id
     ), '[]'::json) AS products
@@ -349,6 +357,7 @@ router.get('/customer-lookup', async (req, res, next) => {
               'check_no', op.check_no,
               'series', op.series,
               'brand', op.brand,
+              'hsn_code', op.hsn_code,
               'specifications', op.specifications
             ))
             FROM order_products op WHERE op.order_id = o.id
@@ -485,7 +494,8 @@ router.get('/:id', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'specifications', op.specifications
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'hsn_code', op.hsn_code, 'specifications', op.specifications,
+          'complimentary', op.complimentary
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products
@@ -521,7 +531,7 @@ router.post('/', async (req, res, next) => {
       deliveryDate, createdBy, components = [], storeId, specifications,
       warranty, accessoryType, customAccessory, partNo, checkNo, remark,
       gstin, financeDownPayment, financeEmi, financeDuration, products = [], devices = [],
-      bookingType
+      bookingType, state, pincode, hsnCode
     } = req.body;
 
     const isBooking = bookingType === 'advanced';
@@ -608,8 +618,8 @@ router.post('/', async (req, res, next) => {
         store_id, subtotal, gst_amount, grand_total, specifications, warranty,
         accessory_type, custom_accessory, part_no, check_no, remark,
         finance_down_payment, finance_emi, finance_duration, gstin, created_at, updated_at, invoice_number,
-        booking_type, booking_status, linked_order_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46)
+        booking_type, booking_status, linked_order_id, state, pincode, hsn_code
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49)
       RETURNING id`,
       [
         orderNumber, customerName, mobileNumber, email || null, addressVal, orderDateVal,
@@ -621,7 +631,9 @@ router.post('/', async (req, res, next) => {
         accessoryType || null, customAccessory || null, partNo || null, checkNo || null, remark || null,
         parseFloat(financeDownPayment) || null, parseFloat(financeEmi) || null,
         parseInt(financeDuration, 10) || null, gstin || null, now, now, invoiceNumber,
-        isBooking ? 'advanced' : null, isBooking ? 'pending' : null, null
+        isBooking ? 'advanced' : null, isBooking ? 'pending' : null, null,
+        state || null, pincode || null,
+        hsnCode || null
       ]
     );
 
@@ -650,14 +662,19 @@ router.post('/', async (req, res, next) => {
       for (const prod of mergedProducts) {
         const qty = parseInt(srcVal(prod, 'quantity', 'quantity'), 10) || 1;
         const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
-        const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
+        // A complimentary line is given away free: its amount is stored as 0
+        // (100% discount) while rate / quantity are kept for the invoice.
+        const isComplimentary = srcVal(prod, 'complimentary', 'complimentary') ? true : false;
+        const lineAmt = isComplimentary
+          ? 0
+          : (parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate));
         const specs = srcVal(prod, 'specifications', 'specifications');
         const specsJson = specs && typeof specs === 'object' && !Array.isArray(specs)
           ? JSON.stringify(Object.fromEntries(Object.entries(specs).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')))
           : null;
         await client.query(
-          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series, specifications, brand)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series, specifications, brand, hsn_code, complimentary)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
           [
             orderId,
             srcVal(prod, 'productName', 'product_name'),
@@ -673,6 +690,8 @@ router.post('/', async (req, res, next) => {
             srcVal(prod, 'series', 'series') || null,
             specsJson,
             srcVal(prod, 'brand', 'brand') || null,
+            srcVal(prod, 'hsnCode', 'hsn_code') || null,
+            isComplimentary,
           ]
         );
       }
@@ -765,7 +784,7 @@ router.post('/', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'specifications', op.specifications
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'hsn_code', op.hsn_code, 'specifications', op.specifications
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products
@@ -932,9 +951,12 @@ router.put('/:id', async (req, res, next) => {
       customAccessory: 'custom_accessory',
       partNo: 'part_no',
       checkNo: 'check_no',
+      hsnCode: 'hsn_code',
       remark: 'remark',
       gstin: 'gstin',
       advancePaymentMode: 'advance_payment_mode',
+      state: 'state',
+      pincode: 'pincode',
       financeDownPayment: 'finance_down_payment',
       financeEmi: 'finance_emi',
       financeDuration: 'finance_duration',
@@ -1001,14 +1023,19 @@ router.put('/:id', async (req, res, next) => {
       for (const prod of mergedProducts) {
         const qty = parseInt(srcVal(prod, 'quantity', 'quantity'), 10) || 1;
         const rate = parseFloat(srcVal(prod, 'rate', 'rate')) || 0;
-        const lineAmt = parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate);
+        // A complimentary line is given away free: its amount is stored as 0
+        // (100% discount) while rate / quantity are kept for the invoice.
+        const isComplimentary = srcVal(prod, 'complimentary', 'complimentary') ? true : false;
+        const lineAmt = isComplimentary
+          ? 0
+          : (parseFloat(srcVal(prod, 'amount', 'amount')) || (qty * rate));
         const specs = srcVal(prod, 'specifications', 'specifications');
         const specsJson = specs && typeof specs === 'object' && !Array.isArray(specs)
           ? JSON.stringify(Object.fromEntries(Object.entries(specs).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')))
           : null;
         await client.query(
-          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series, specifications, brand)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          `INSERT INTO order_products (order_id, product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series, specifications, brand, hsn_code, complimentary)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
           [
             req.params.id,
             srcVal(prod, 'productName', 'product_name'),
@@ -1024,6 +1051,8 @@ router.put('/:id', async (req, res, next) => {
             srcVal(prod, 'series', 'series') || null,
             specsJson,
             srcVal(prod, 'brand', 'brand') || null,
+            srcVal(prod, 'hsnCode', 'hsn_code') || null,
+            isComplimentary,
           ]
         );
       }
@@ -1044,7 +1073,8 @@ router.put('/:id', async (req, res, next) => {
           'product_model', op.product_model, 'serial_number', op.serial_number,
           'warranty', op.warranty, 'quantity', op.quantity,
           'rate', op.rate, 'amount', op.amount,
-          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'specifications', op.specifications
+          'accessory_type', op.accessory_type, 'part_no', op.part_no, 'check_no', op.check_no, 'series', op.series, 'brand', op.brand, 'hsn_code', op.hsn_code, 'specifications', op.specifications,
+          'complimentary', op.complimentary
         ))
         FROM order_products op WHERE op.order_id = o.id
       ), '[]'::json) AS products

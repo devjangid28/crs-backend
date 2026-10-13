@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer');
+const { launchBrowser } = require('./browserService');
 const { query } = require('../config/database');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs/invoice-orders');
@@ -8,6 +8,11 @@ if (!fs.existsSync(PDF_DIR)) fs.mkdirSync(PDF_DIR, { recursive: true });
 
 function isAsusStore(name) {
   return String(name || '').toLowerCase().includes('asus');
+}
+
+function isBlueChipStore(name) {
+  const storeName = String(name || '').toLowerCase();
+  return storeName.includes('blue') && !storeName.includes('asus');
 }
 
 // Assembled desktops (Blue Chips) are stored as one order_products row per part,
@@ -35,6 +40,15 @@ function fmtDate(d) {
 
 const scodes = { 'Gujarat':'24','Maharashtra':'27','Rajasthan':'08','Madhya Pradesh':'23','Karnataka':'29','Tamil Nadu':'33','Delhi':'07','Uttar Pradesh':'09','West Bengal':'19','Haryana':'06','Punjab':'03','Bihar':'10','Odisha':'21','Telangana':'36','Kerala':'32','Andhra Pradesh':'37','Chhattisgarh':'22','Jharkhand':'20','Uttarakhand':'05','Himachal Pradesh':'02','Assam':'18','Goa':'30','Sikkim':'11' };
 const stateCode = (s) => scodes[s] || '24';
+
+// A serial number only identifies a physical item when it is a real value.
+// Placeholders like "N/A" are used for accessories that have no serial, and
+// must NOT be treated as an identity - otherwise every accessory row collapses
+// into a single invoice line.
+function isRealSerial(s) {
+  const v = String(s == null ? '' : s).trim().toLowerCase();
+  return v !== '' && v !== 'n/a' && v !== 'na' && v !== '-' && v !== 'none' && v !== 'nil' && v !== 'not applicable';
+}
 
 const ones = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten','Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen'];
 const tensArr = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
@@ -138,7 +152,7 @@ function buildOrderInvoiceItems(order, components, products) {
       partNo: orderPartNo,
       checkNo: orderCheckNo,
       tax: 18,
-      hsn: '',
+      hsn: String(order.hsn_code || '').trim(),
       batch: '',
       warranty: orderWarranty,
       discount: 0,
@@ -179,6 +193,9 @@ function buildOrderInvoiceItems(order, components, products) {
     const prodAcc = prod.accessory_type || '';
     const prodSeries = (prod.series || '').toString().trim();
     const isAssembled = isAssembledPart(prod);
+    // An accessory line belongs to the accessory, not to the device it was sold
+    // with, so it must never borrow the device's part / check / serial number.
+    const isAccessoryRow = prodName.trim().toLowerCase() === 'accessories' || !!String(prodAcc || '').trim();
     const baseName = prodName.trim()
       ? (prodAcc && prodAcc !== 'Accessories' ? `${prodName} - ${prodAcc}` : prodName)
       : (prodAcc ? `Accessories - ${prodAcc}` : 'Accessories');
@@ -187,9 +204,13 @@ function buildOrderInvoiceItems(order, components, products) {
     const lineName = (prodSeries && !isAssembled) ? `${baseName} - ${prodSeries}` : baseName;
     const prodQty = parseInt(prod.quantity, 10) || 1;
     const prodRate = parseFloat(prod.rate) || 0;
-    const prodAmt = parseFloat(prod.amount) || 0;
-    const total = prodAmt > 0 ? prodAmt : (prodRate * prodQty);
-    const serial = String(prod.serial_number || '').trim();
+    // A stored 0 amount is a real 0 (complimentary line given away free), so
+    // only a missing amount falls back to rate * quantity.
+    const hasAmt = prod.amount !== undefined && prod.amount !== null && String(prod.amount).trim() !== '';
+    const total = hasAmt ? (parseFloat(prod.amount) || 0) : (prodRate * prodQty);
+    // Only a real serial number collapses duplicate rows; placeholder serials
+    // (N/A) fall back to the name/brand/model key so every row is printed.
+    const serial = isRealSerial(prod.serial_number) ? String(prod.serial_number).trim() : '';
     if (!lineName.trim() && total <= 0) return;
     // The brand is part of the line identity so two parts of the same type with
     // different brands (e.g. two SSDs) are never collapsed into one row.
@@ -198,18 +219,19 @@ function buildOrderInvoiceItems(order, components, products) {
       name: lineName,
       description: '',
       qty: total > 0 ? prodQty : 1,
-      price: total > 0 ? (prodRate > 0 ? prodRate : total) : 0,
+      price: prodRate > 0 ? prodRate : (total > 0 ? total : 0),
       total,
       brand: prod.brand || '',
-      serialNumber: prod.serial_number || '',
-      modelNo: prod.product_model || '',
-      partNo: prod.part_no || orderPartNo,
-      checkNo: prod.check_no || orderCheckNo,
+      serialNumber: isAccessoryRow ? (prod.serial_number || '') : (prod.serial_number || orderSerial),
+      modelNo: isAccessoryRow ? (prod.product_model || '') : (prod.product_model || orderModel),
+      partNo: isAccessoryRow ? (prod.part_no || '') : (prod.part_no || orderPartNo),
+      checkNo: isAccessoryRow ? (prod.check_no || '') : (prod.check_no || orderCheckNo),
       tax: 18,
-      hsn: '',
+      hsn: String(prod.hsn_code || '').trim(),
       batch: '',
       warranty: prod.warranty || '',
       discount: 0,
+      isFree: !!prod.complimentary || (total <= 0 && prodRate > 0),
     };
     if (isAssembled && !productsMap.has(ASSEMBLED_HEADING_KEY)) {
       // Zero-value marker row printed above the first assembled part.
@@ -261,7 +283,7 @@ function buildOrderInvoiceItems(order, components, products) {
       partNo: orderPartNo,
       checkNo: orderCheckNo,
       tax: 18,
-      hsn: '',
+      hsn: String(order.hsn_code || '').trim(),
       batch: '',
       warranty: orderWarranty,
       discount: 0,
@@ -273,6 +295,7 @@ function buildOrderInvoiceItems(order, components, products) {
 function buildInvoiceHTML(order, components, store, products) {
   const taxRate = 18;
   const isAsus = isAsusStore(store.store_name);
+  const isBlueChip = isBlueChipStore(store.store_name);
 
   const items = buildOrderInvoiceItems(order, components, products);
 
@@ -280,15 +303,18 @@ function buildInvoiceHTML(order, components, store, products) {
   // tax columns and never add it on top of the amount again.
   const lineTotals = items.map((i) => {
     if (i && i.isHeading) {
-      return { qty: 0, rate: 0, disc: 0, taxable: 0, cgst: 0, sgst: 0, total: 0, heading: true };
+      return { qty: 0, rate: 0, disc: 0, discPct: 0, taxable: 0, cgst: 0, sgst: 0, total: 0, heading: true };
     }
     const qty = parseInt(i.qty) || 1;
     const rate = parseFloat(i.price) || 0;
-    const disc = parseFloat(i.discount || 0);
+    // A free line keeps its real rate for display but is discounted by 100% so
+    // the taxable value and the invoice totals stay exactly as before.
+    const disc = i.isFree ? rate : parseFloat(i.discount || 0);
+    const discPct = rate > 0 ? Math.round((disc / rate) * 1000) / 10 : 0;
     const lineIncl = Math.max(0, (rate - disc) * qty);
     const taxable = lineIncl / (1 + taxRate / 100);
     const tax = lineIncl - taxable;
-    return { qty, rate, disc, taxable, cgst: tax / 2, sgst: tax / 2, total: lineIncl };
+    return { qty, rate, disc, discPct, taxable, cgst: tax / 2, sgst: tax / 2, total: lineIncl };
   });
 
   const taxableValue = lineTotals.reduce((s, l) => s + l.taxable, 0);
@@ -312,12 +338,16 @@ function buildInvoiceHTML(order, components, store, products) {
   const custName = order.customer_name || 'Walk-in Customer';
   const custAddr = order.address || '';
   const remark = order.remark || '';
-  const custState = state || 'Gujarat';
+  // Place of supply / buyer state comes from the order (what the staff entered
+  // on the form), falling back to the store state, then Gujarat.
+  const custState = String(order.state || '').trim() || state || 'Gujarat';
   const custPhone = order.mobile_number || '';
   const custEmail = order.email || '';
   const custGstin = order.gstin || '';
-  const custPin = order.pincode || pincode || '';
-  const custCity = city || 'Vadodara';
+  const custPin = order.pincode || '';
+  const custCity = order.city || '';
+  // Out-of-state supply => IGST @18% (single tax) instead of CGST 9% + SGST 9%.
+  const interState = String(custState).trim().toLowerCase() !== String(state || 'Gujarat').trim().toLowerCase()
 
   const terms = order.payment_type || 'Cash';
   const orderNumber = order.order_number || '';
@@ -338,9 +368,16 @@ function buildInvoiceHTML(order, components, store, products) {
   const advancePaid = parseFloat(order.advance_payment) || 0;
   const advanceMode = order.advance_payment_mode || '';
   const balanceDue = Math.max(0, grandTotal - advancePaid);
-  // The order invoice represents a completed sale, so it always shows the
-  // payment as fully settled regardless of any advance recorded.
-  const payStatus = 'Paid Fully';
+  // Mirror the order's real payment status instead of always claiming it is
+  // settled, so a part-paid / unpaid order cannot print a wrong status.
+  const orderPayStatus = String(order.payment_status || '').trim();
+  const payStatus = orderPayStatus || (balanceDue <= 0 ? 'Paid Fully' : 'Partially Paid');
+  // Settled orders print the status as a green pill so it reads at a glance;
+  // anything still owing stays amber so it is not mistaken for a paid sale.
+  const isFullyPaid = payStatus.toLowerCase().includes('paid') && !payStatus.toLowerCase().includes('part');
+  const payStatusTone = isFullyPaid
+    ? { bg: '#e8f5e9', fg: '#1b5e20', border: '#2e7d32' }
+    : { bg: '#fff8e1', fg: '#8a6100', border: '#f9a825' };
   // Date the advance was paid: the booking/order date when an advance was
   // received, otherwise today's date.
   const advanceDate = fmtDate(advancePaid > 0 ? (order.advance_paid_date || order.order_date || order.created_at || new Date()) : new Date());
@@ -358,8 +395,34 @@ function buildInvoiceHTML(order, components, store, products) {
     asusWebsite = 'www.bccsgroup.in';
   }
 
-  const declarationTerms = store.terms_conditions ||
-    'We declare that this Invoice shows the actual price of the goods described and that all particulars are true and correct. Interest @24% Condition: Subject to Vadodara Jurisdiction. Material once sold will be taken back or exchanged only under company policy. Warranty: 12 months against mfg defects as per terms of payment. For asus regulations to claim in after please go onto www.asus.com/in within 7 days of the invoice date & pay. SUBJECT TO ASUS TOLL FREE NO: 1800-2090-365 JURISDICTION';
+  const invoiceDeclaration = 'We declare that this Invoice shows the actual price of the goods described and that all particulars are true and correct.';
+  const asusTermsAndConditions = [
+    ['Jurisdiction', 'All disputes shall be subject to the exclusive jurisdiction of Vadodara, Gujarat, subject to applicable law.'],
+    ['Return & Exchange', 'As per company policy and applicable law.'],
+    ['Delayed Payment', 'Interest at 24% p.a. on overdue payments, subject to applicable law.'],
+    ['Warranty', '12-month warranty as per applicable OEM terms. Register at https://www.asus.com/in within 7 days, where applicable.'],
+    ['DOA Claims', 'Subject to authorized service centre verification and OEM policy; report within 7 working days.'],
+    ['Liability', 'Limited to net invoice value, excluding indirect losses, to the extent permitted by law.'],
+    ['Delivery', 'Report physical damage or missing items within 24 hours of delivery.'],
+    ['Warranty Disclaimer', 'Manufacturer warranty is governed by OEM terms; statutory rights remain unaffected.'],
+    ['Ownership', 'Title remains with the Seller until full payment, subject to applicable law.'],
+    ['Force Majeure', 'Neither party is liable for delays caused by events beyond reasonable control.'],
+  ];
+  const blueChipTermsAndConditions = [
+    ['Jurisdiction', 'All disputes shall be subject to the exclusive jurisdiction of Vadodara, Gujarat, subject to applicable law.'],
+    ['Return & Exchange', 'As per company policy and applicable law.'],
+    ['Delayed Payment', 'Interest at 24% p.a. on overdue payments, subject to applicable law.'],
+    ['Warranty', '1-Year warranty as per applicable OEM terms.'],
+    ['DOA Claims', 'Subject to authorized service centre verification and OEM policy; report within 7 working days.'],
+    ['Liability', 'Limited to net invoice value, excluding indirect losses, to the extent permitted by law.'],
+    ['Delivery', 'Report physical damage or missing items within 24 hours of delivery.'],
+    ['Warranty Disclaimer', 'Manufacturer warranty is governed by OEM terms; statutory rights remain unaffected.'],
+    ['Ownership', 'Title remains with the Seller until full payment, subject to applicable law.'],
+    ['Force Majeure', 'Neither party is liable for delays caused by events beyond reasonable control.'],
+  ];
+  const declarationTerms = isAsus || isBlueChip
+    ? invoiceDeclaration
+    : store.terms_conditions || invoiceDeclaration;
 
   // Embed the stamp & sign as an inline data URI so puppeteer renders it without a server.
   const stampPath = path.join(__dirname, '../../public/stamp-sign.jpg');
@@ -378,12 +441,14 @@ function buildInvoiceHTML(order, components, store, products) {
     const lt = lineTotals[idx] || { qty: 1, taxable: 0, cgst: 0, sgst: 0, total: 0 };
     if (item && item.isHeading) {
       return `<tr>
-      <td colspan="11" style="border:1px solid #777;padding:3px 5px;background:#f5f5f5;font-weight:bold">${esc(item.name || '')}</td>
+      <td colspan="${interState ? 10 : 12}" style="border:1px solid #777;padding:3px 5px;background:#f5f5f5;font-weight:bold">${esc(item.name || '')}</td>
     </tr>`;
     }
     itemSerialNo += 1;
     const qty = lt.qty;
-    const rate = lt.taxable / qty;
+    // The printed rate is the item's real stored rate, not the discounted
+    // taxable value, so a free line still shows its price next to 100% Disc.
+    const rate = lt.rate;
     const itemTaxRate = item.tax || taxRate;
     // HSN/SAC is only printed when one was actually recorded for the line -
     // there is no hardcoded default, so an unentered HSN never shows a code.
@@ -399,17 +464,22 @@ function buildInvoiceHTML(order, components, store, products) {
       item.batch ? `<div>Batch: ${esc(item.batch)}</div>` : '',
       item.description ? `<div style="font-size:7.5px">${esc(item.description)}</div>` : '',
     ].filter(Boolean).join('');
+    const itemTaxCells = interState
+      ? `<td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemTaxRate}%</td>
+         <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.cgst + lt.sgst)}</td>`
+      : `<td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemTaxRate / 2}%</td>
+         <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.cgst)}</td>
+         <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemTaxRate / 2}%</td>
+         <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.sgst)}</td>`;
     return `<tr>
       <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemSerialNo}</td>
       <td style="border:1px solid #777;padding:2px 4px;vertical-align:top">${descLines}</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${esc(hsn)}</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${qty} Qty</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(rate)}</td>
+      <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${lt.discPct > 0 ? lt.discPct + '%' : ''}</td>
       <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.taxable)}</td>
-      <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemTaxRate / 2}%</td>
-      <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.cgst)}</td>
-      <td style="border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:top">${itemTaxRate / 2}%</td>
-      <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top">${fmtINR(lt.sgst)}</td>
+      ${itemTaxCells}
       <td style="border:1px solid #777;padding:2px 3px;text-align:right;vertical-align:top;font-weight:bold">${fmtINR(lt.total)}</td>
     </tr>`;
   }).join('');
@@ -419,16 +489,128 @@ function buildInvoiceHTML(order, components, store, products) {
     if (item && item.isHeading) return '';
     const lt = lineTotals[idx] || { taxable: 0, cgst: 0, sgst: 0 };
     const itr = item.tax || taxRate;
+    const taxCols = interState
+      ? `<td style="border:1px solid #777;text-align:center">${itr}%</td>
+         <td style="border:1px solid #777;text-align:right">${fmtINR(lt.cgst + lt.sgst)}</td>`
+      : `<td style="border:1px solid #777;text-align:center">${itr / 2}%</td>
+         <td style="border:1px solid #777;text-align:right">${fmtINR(lt.cgst)}</td>
+         <td style="border:1px solid #777;text-align:center">${itr / 2}%</td>
+         <td style="border:1px solid #777;text-align:right">${fmtINR(lt.sgst)}</td>`;
     return `<tr>
       <td style="border:1px solid #777;text-align:center">${esc(String(item.hsn || '').trim() || '-')}</td>
       <td style="border:1px solid #777;text-align:right">${fmtINR(lt.taxable)}</td>
-      <td style="border:1px solid #777;text-align:center">${itr / 2}%</td>
-      <td style="border:1px solid #777;text-align:right">${fmtINR(lt.cgst)}</td>
-      <td style="border:1px solid #777;text-align:center">${itr / 2}%</td>
-      <td style="border:1px solid #777;text-align:right">${fmtINR(lt.sgst)}</td>
+      ${taxCols}
       <td style="border:1px solid #777;text-align:right">${fmtINR(lt.cgst + lt.sgst)}</td>
     </tr>`;
   }).join('');
+
+  const itemHeaderRow = interState
+    ? `<tr style="background:#f5f5f5">
+  <th style="border:1px solid #777;width:3%;text-align:center">Sl No.</th>
+  <th style="border:1px solid #777;width:33%;text-align:center">Description of Goods</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">HSN/SAC</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">Quantity</th>
+  <th style="border:1px solid #777;width:8%;text-align:center">Rate (Excl. Tax)</th>
+  <th style="border:1px solid #777;width:5%;text-align:center">Disc %</th>
+  <th style="border:1px solid #777;width:9%;text-align:center">Taxable Value</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">IGST %</th>
+  <th style="border:1px solid #777;width:9%;text-align:center">IGST Amt</th>
+  <th style="border:1px solid #777;width:10%;text-align:center">Amount</th>
+</tr>`
+    : `<tr style="background:#f5f5f5">
+  <th style="border:1px solid #777;width:3%;text-align:center">Sl No.</th>
+  <th style="border:1px solid #777;width:28%;text-align:center">Description of Goods</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">HSN/SAC</th>
+  <th style="border:1px solid #777;width:6%;text-align:center">Quantity</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">Rate (Excl. Tax)</th>
+  <th style="border:1px solid #777;width:5%;text-align:center">Disc %</th>
+  <th style="border:1px solid #777;width:8%;text-align:center">Taxable Value</th>
+  <th style="border:1px solid #777;width:5%;text-align:center">CGST %</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">CGST Amt</th>
+  <th style="border:1px solid #777;width:5%;text-align:center">SGST %</th>
+  <th style="border:1px solid #777;width:7%;text-align:center">SGST Amt</th>
+  <th style="border:1px solid #777;width:9%;text-align:center">Amount</th>
+</tr>`;
+
+  const itemSpacerRow = interState
+    ? `<tr>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;height:35mm"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;vertical-align:top;padding:3px 5px"><div style="font-size:7.5px;line-height:1.5">${remark ? 'Remark: ' + esc(remark) : ''}</div></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+</tr>`
+    : `<tr>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;height:35mm"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777;vertical-align:top;padding:3px 5px"><div style="font-size:7.5px;line-height:1.5">${remark ? 'Remark: ' + esc(remark) : ''}</div></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
+</tr>`;
+
+  const itemTotalRow = interState
+    ? `<tr>
+  <td colspan="5" style="border:1px solid #777;padding:2px 4px;font-weight:bold">Total</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(taxableValue)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(totalTax)}</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">&#8377;${fmtINR(grandTotal)}</td>
+</tr>`
+    : `<tr>
+  <td colspan="5" style="border:1px solid #777;padding:2px 4px;font-weight:bold">Total</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(taxableValue)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(cgstAmount)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(sgstAmount)}</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">&#8377;${fmtINR(grandTotal)}</td>
+</tr>`;
+
+  const taxSummaryHeader = interState
+    ? `<tr style="background:#f5f5f5">
+  <th style="border:1px solid #777;width:14%;text-align:center">HSN/SAC</th>
+  <th style="border:1px solid #777;width:24%;text-align:center">Taxable Value</th>
+  <th style="border:1px solid #777;width:14%;text-align:center">IGST Rate</th>
+  <th style="border:1px solid #777;width:24%;text-align:center">IGST Amount</th>
+  <th style="border:1px solid #777;width:24%;text-align:center">Total Tax Amount</th>
+</tr>`
+    : `<tr style="background:#f5f5f5">
+  <th style="border:1px solid #777;width:10%;text-align:center">HSN/SAC</th>
+  <th style="border:1px solid #777;width:18%;text-align:center">Taxable Value</th>
+  <th style="border:1px solid #777;width:9%;text-align:center">CGST Rate</th>
+  <th style="border:1px solid #777;width:14%;text-align:center">CGST Amount</th>
+  <th style="border:1px solid #777;width:9%;text-align:center">SGST Rate</th>
+  <th style="border:1px solid #777;width:14%;text-align:center">SGST Amount</th>
+  <th style="border:1px solid #777;width:14%;text-align:center">Total Tax Amount</th>
+</tr>`;
+
+  const taxSummaryTotalRow = interState
+    ? `<tr style="font-weight:bold;background:#f5f5f5">
+  <td style="border:1px solid #777;padding:2px 3px">Total</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(taxableValue)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(totalTax)}</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(totalTax)}</td>
+</tr>`
+    : `<tr style="font-weight:bold;background:#f5f5f5">
+  <td style="border:1px solid #777;padding:2px 3px">Total</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(taxableValue)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(cgstAmount)}</td>
+  <td style="border:1px solid #777"></td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(sgstAmount)}</td>
+  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(totalTax)}</td>
+</tr>`;
 
   return `<!DOCTYPE html><html><head><title>Invoice ${orderNumber}</title>
 <style>
@@ -475,7 +657,7 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Mode/Terms of Payment</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(terms)}${isFinance ? '<br/><span style="font-size:6.5px">Finance: Down ' + fmtINR(financeDown) + ' + EMI ' + fmtINR(financeEmi) + '/mo for ' + financeDur + ' months</span>' : ''}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Reference No. &amp; Date</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(orderNumber)} / ${invoiceDate}</td></tr>
       <tr><td style="border-bottom:1px solid #777;border-right:1px solid #777;padding:2px 4px" class="lbl">Buyer's Order No.</td><td style="border-bottom:1px solid #777;padding:2px 4px">${esc(orderNumber)}</td></tr>
-      <tr><td style="border-right:1px solid #777;padding:2px 4px" class="lbl">Destination</td><td style="padding:2px 4px">${esc(custCity)}</td></tr>
+      <tr><td style="border-right:1px solid #777;padding:2px 4px" class="lbl">Destination</td><td style="padding:2px 4px">${esc(custState)}${custPin ? ' - ' + esc(custPin) : ''}</td></tr>
     </table>
   </td>
 </tr>
@@ -487,7 +669,7 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
     <div style="font-size:8px;line-height:1.6">
       <div class="bold">${esc(custName)}</div>
       ${custAddr ? `<div>${esc(custAddr)}</div>` : ''}
-      ${custCity ? `<div>${esc(custCity)}${custPin ? ' - ' + esc(custPin) : ''}</div>` : ''}
+      ${(custCity || custPin) ? `<div>${[esc(custCity), esc(custPin)].filter(Boolean).join(' - ')}</div>` : ''}
       <div>State: ${esc(custState)}, Code: ${stateCode(custState)}</div>
       ${custGstin ? `<div>GSTIN/UIN: ${esc(custGstin)}</div>` : ''}
       ${custPhone ? `<div>Contact: ${esc(custPhone)}</div>` : ''}
@@ -499,7 +681,7 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
     <div style="font-size:8px;line-height:1.6">
       <div class="bold">${esc(custName)}</div>
       ${custAddr ? `<div>${esc(custAddr)}</div>` : ''}
-      ${custCity ? `<div>${esc(custCity)}${custPin ? ' - ' + esc(custPin) : ''}</div>` : ''}
+      ${(custCity || custPin) ? `<div>${[esc(custCity), esc(custPin)].filter(Boolean).join(' - ')}</div>` : ''}
       <div>State: ${esc(custState)}, Code: ${stateCode(custState)}</div>
       ${custGstin ? `<div>GSTIN/UIN: ${esc(custGstin)}</div>` : ''}
       ${custPhone ? `<div>Contact: ${esc(custPhone)}</div>` : ''}
@@ -511,44 +693,12 @@ td,th{font-size:8px;padding:2px 3px;vertical-align:top}
 </table>
 <table style="width:100%;border:1px solid #777;border-top:none">
 <thead>
-<tr style="background:#f5f5f5">
-  <th style="border:1px solid #777;width:3%;text-align:center">Sl No.</th>
-  <th style="border:1px solid #777;width:28%;text-align:center">Description of Goods</th>
-  <th style="border:1px solid #777;width:7%;text-align:center">HSN/SAC</th>
-  <th style="border:1px solid #777;width:6%;text-align:center">Quantity</th>
-  <th style="border:1px solid #777;width:8%;text-align:center">Rate (Excl. Tax)</th>
-  <th style="border:1px solid #777;width:9%;text-align:center">Taxable Value</th>
-  <th style="border:1px solid #777;width:5%;text-align:center">CGST %</th>
-  <th style="border:1px solid #777;width:7%;text-align:center">CGST Amt</th>
-  <th style="border:1px solid #777;width:5%;text-align:center">SGST %</th>
-  <th style="border:1px solid #777;width:7%;text-align:center">SGST Amt</th>
-  <th style="border:1px solid #777;width:9%;text-align:center">Amount</th>
-</tr>
+${itemHeaderRow}
 </thead>
 <tbody>
-${itemRows || '<tr><td colspan="11" style="border:1px solid #777;padding:2px 3px;text-align:center">No items</td></tr>'}
-<tr>
-  <td style="border-left:1px solid #777;border-right:1px solid #777;height:35mm"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777;vertical-align:top;padding:3px 5px"><div style="font-size:7.5px;line-height:1.5">${remark ? 'Remark: ' + esc(remark) : ''}</div></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-  <td style="border-left:1px solid #777;border-right:1px solid #777"></td>
-</tr>
-<tr>
-  <td colspan="5" style="border:1px solid #777;padding:2px 4px;font-weight:bold">Total</td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(taxableValue)}</td>
-  <td style="border:1px solid #777"></td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(cgstAmount)}</td>
-  <td style="border:1px solid #777"></td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">${fmtINR(sgstAmount)}</td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right;font-weight:bold">&#8377;${fmtINR(grandTotal)}</td>
-</tr>
+${itemRows || `<tr><td colspan="${interState ? 9 : 11}" style="border:1px solid #777;padding:2px 3px;text-align:center">No items</td></tr>`}
+${itemSpacerRow}
+${itemTotalRow}
 </tbody>
 </table>
 <div style="border:1px solid #777;border-top:none;padding:3px 5px;display:flex;justify-content:space-between">
@@ -557,27 +707,11 @@ ${itemRows || '<tr><td colspan="11" style="border:1px solid #777;padding:2px 3px
 </div>
 <table style="width:100%;border:1px solid #777;border-top:none">
 <thead>
-<tr style="background:#f5f5f5">
-  <th style="border:1px solid #777;width:10%;text-align:center">HSN/SAC</th>
-  <th style="border:1px solid #777;width:18%;text-align:center">Taxable Value</th>
-  <th style="border:1px solid #777;width:9%;text-align:center">CGST Rate</th>
-  <th style="border:1px solid #777;width:14%;text-align:center">CGST Amount</th>
-  <th style="border:1px solid #777;width:9%;text-align:center">SGST Rate</th>
-  <th style="border:1px solid #777;width:14%;text-align:center">SGST Amount</th>
-  <th style="border:1px solid #777;width:14%;text-align:center">Total Tax Amount</th>
-</tr>
+${taxSummaryHeader}
 </thead>
 <tbody>
-${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align:center">No items</td></tr>'}
-<tr style="font-weight:bold;background:#f5f5f5">
-  <td style="border:1px solid #777;padding:2px 3px">Total</td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(taxableValue)}</td>
-  <td style="border:1px solid #777"></td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(cgstAmount)}</td>
-  <td style="border:1px solid #777"></td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(sgstAmount)}</td>
-  <td style="border:1px solid #777;padding:2px 3px;text-align:right">${fmtINR(totalTax)}</td>
-</tr>
+${taxSummaryRows || `<tr><td colspan="${interState ? 5 : 7}" style="border:1px solid #777;text-align:center">No items</td></tr>`}
+${taxSummaryTotalRow}
 </tbody>
 </table>
 <div style="border:1px solid #777;border-top:none;padding:2px 5px;font-size:7.5px">
@@ -594,11 +728,11 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
   <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Total Amount:</span> &#8377;${fmtINR(grandTotal)}</td>
   <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Advance Paid:</span> &#8377;${fmtINR(advancePaid)}</td>
   <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Payment Mode:</span> ${esc(advanceMode || terms || '-')}</td>
-  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Balance Due:</span> &#8377;${fmtINR(balanceDue)}</td>
+  <td style="border:1px solid #777;padding:2px 4px"><span class="lbl">Balance Amount:</span> &#8377;${fmtINR(balanceDue)}</td>
 </tr>
 <tr style="font-size:8px">
   <td style="border:1px solid #777;padding:2px 4px" colspan="2"><span class="lbl">Advance Payment Date:</span> ${advanceDate || '-'}</td>
-  <td style="border:1px solid #777;padding:2px 4px" colspan="2"><span class="lbl">Payment Status:</span> ${esc(payStatus)}</td>
+  <td style="border:1px solid #777;padding:2px 4px" colspan="2"><span class="lbl">Payment Status:</span> <span style="display:inline-block;padding:1px 10px;border-radius:11px;font-weight:bold;font-size:9px;letter-spacing:0.3px;background:${payStatusTone.bg};color:${payStatusTone.fg};border:1px solid ${payStatusTone.border}">${esc(payStatus)}</span></td>
 </tr>
 </tbody>
 </table>
@@ -616,25 +750,20 @@ ${taxSummaryRows || '<tr><td colspan="7" style="border:1px solid #777;text-align
   </td>
   <td style="width:65%;padding:3px 5px;vertical-align:top">
     <div style="font-weight:bold;font-size:8px;border-bottom:1px solid #777;margin-bottom:2px;padding-bottom:1px">Declaration</div>
-    <div style="font-size:7.5px;line-height:1.6">${esc(declarationTerms)}</div>
+    <div style="font-size:7.5px;line-height:1.6;white-space:pre-line">${esc(declarationTerms)}</div>
   </td>
 </tr>
 </table>
 <table style="width:100%;border:1px solid #777;border-top:none">
 <tr>
   <td style="width:70%;border-right:1px solid #777;padding:4px 6px;vertical-align:top">
-    <div style="font-weight:bold;font-size:8px;margin-bottom:3px">${isAsus ? 'ASUS PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -' : 'BLUE CHIP PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -'}</div>
+    <div style="font-weight:bold;font-size:8px;margin-bottom:3px">${isAsus || isBlueChip ? 'TERMS &amp; CONDITIONS' : 'BLUE CHIP PRODUCT INSPECTION &amp; CUSTOMER ACKNOWLEDGEMENT: -'}</div>
     <div style="font-size:7.5px;line-height:1.6">
-      ${isAsus ? `
-      <div><b>1. Product Opening &amp; Demonstration</b><br/>The ASUS product has been opened and demonstrated in the presence of the customer.</div>
-      <div><b>2. Product Inspection</b><br/>The customer has thoroughly inspected and checked the product. No issues or defects were found at the time of inspection.</div>
-      <div><b>3. Extended Warranty Information</b><br/>The ASUS Promoter has explained the available Extended Warranty options and applicable terms &amp; conditions to the customer.</div>
-      <div><b>4. Customer Support</b><br/>For any assistance or support, the customer may contact the ASUS Exclusive Store during working hours at +91 99049 91114.</div>
-      <div><b>5. Store Availability</b><br/>The ASUS Exclusive Store is open 7 days a week for customer assistance and support.</div>
-      <div><b>6. DOA (DEAD ON ARRIVAL) POLICY</b><br/>In case of a DOA (Dead on Arrival) claim, the product is eligible for DOA consideration only within 7 working days from the date of invoice, subject to the applicable ASUS DOA Policy.</div>
-      <div>The system must first be submitted to an authorized ASUS Service Centre for inspection and verification. The final decision regarding DOA eligibility and replacement will be made by ASUS/its authorized Service Centre based on their inspection and approval.</div>
-      <div>The store will not be responsible for the approval or rejection of any DOA replacement. All DOA claims and replacements will be governed strictly by the applicable ASUS Policy and its terms &amp; conditions.</div>
-      ` : `
+      ${isAsus
+        ? asusTermsAndConditions.map(([label, text], index) => `<div><b>${index + 1}. ${esc(label)}:</b> ${esc(text)}</div>`).join('')
+        : isBlueChip
+          ? blueChipTermsAndConditions.map(([label, text], index) => `<div><b>${index + 1}. ${esc(label)}:</b> ${esc(text)}</div>`).join('')
+          : `
       <div><b>1. Product Opening &amp; Demonstration</b><br/>The product has been opened and demonstrated in the presence of the customer.</div>
       <div><b>2. Product Inspection</b><br/>The customer has thoroughly inspected and checked the product. No issues or defects were found at the time of inspection.</div>
       <div><b>3. Extended Warranty Information</b><br/>The Blue Chip team has explained the available Extended Warranty options and applicable terms &amp; conditions to the customer.</div>
@@ -681,7 +810,7 @@ async function generateOrderInvoicePdf(orderId) {
   const components = compRes.rows || [];
 
   const prodRes = await query(
-    `SELECT product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series
+    `SELECT product_name, product_model, serial_number, warranty, quantity, rate, amount, accessory_type, part_no, check_no, series, hsn_code, complimentary
      FROM order_products WHERE order_id = $1 ORDER BY id`,
     [orderId]
   );
@@ -695,10 +824,7 @@ async function generateOrderInvoicePdf(orderId) {
 
   const html = buildInvoiceHTML(order, components, store, products);
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0' });

@@ -5,7 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer');
+const { launchBrowser } = require('./browserService');
 const { query } = require('../config/database');
 
 const PDF_DIR = path.join(__dirname, '../../uploads/pdfs/booking-challans');
@@ -420,10 +420,7 @@ async function generateBookingChallanPdf(orderId) {
 
   const html = buildBookingChallanHtml(order, products, store);
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0' });

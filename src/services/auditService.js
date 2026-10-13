@@ -4,6 +4,7 @@ const actions = {
   PDF_GENERATED: 'pdf_generated',
   PDF_VIEWED: 'pdf_viewed',
   MESSAGE_SENT: 'message_sent',
+  MESSAGE_DELETED: 'message_deleted',
   TRACKING_VIEWED: 'tracking_viewed',
   COLLECTION_STARTED: 'collection_started',
   COLLECTION_CONFIRMED: 'collection_confirmed',
