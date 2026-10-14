@@ -11,6 +11,7 @@
     "restart": "powershell -ExecutionPolicy Bypass -File ./restart.ps1",
     "dev": "nodemon src/server.js",
     "migrate": "node src/migrations/init.js",
+    "outbox-worker": "node src/workers/outboxWorker.js",
     "test": "echo \"No tests configured\" && exit 0"
   },
   "dependencies": {
