@@ -2,10 +2,13 @@
 node_modules/
 
 # Environment variables
+# Ignore .env and EVERY .env.* variant (.env.backup, .env.tally-backup, ...).
+# Those variants previously slipped past the plain `.env` rule and were
+# committed with live credentials.
 .env
-.env.local
-.env.production
-# .env.example is meant to be committed (template)
+.env.*
+# .env.example is the sanitised template and must stay tracked
+!.env.example
 
 # Firebase service account keys - NEVER commit these
 serviceAccountKey.json
@@ -38,6 +41,10 @@ Thumbs.db
 *.db
 *.sqlite
 *.sql
+
+# Migration 045 is the currently-active migration and must stay tracked, or a
+# fresh clone cannot build the schema. Every other *.sql remains ignored.
+!/src/migrations/045_whatsapp_outbox.sql
 
 # Uploads (user-generated content)
 uploads/*
